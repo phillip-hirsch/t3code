@@ -5,8 +5,8 @@
 //!
 //! The Repositories and Writing & review rows write through the settings scope. Discovery,
 //! sign-in, tokens, accounts and host fields are per environment (`server.updateSettings` on the
-//! environment discovery ran against). The web's secret-provider picker beside token fields
-//! belongs to Settings › Secrets; here a token is always a typed value.
+//! environment discovery ran against). Token and host credential fields offer the secret
+//! providers the environment can read from (`SecretSourceInput`).
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -30,15 +30,18 @@ use serde_json::{Map, Value, json};
 
 use super::super::fields::textarea_body;
 use super::super::model_select::{generates_text, muted, resolve_text_generation};
+use super::super::providers::writing_providers;
 use super::super::widgets::{
     ROW_SELECT_MIN_WIDTH, SelectWidth, SettingRow, SettingsView, section_with_action, settings_section, switch,
 };
 use crate::app::Workspace;
-use crate::app::pages::settings::connections::logic::SETTINGS_WRITE;
-use crate::model::ModelSelection;
+
+use crate::model::{ModelSelection, Provider};
 use crate::rpc::RpcClient;
+use crate::settings::scope;
 use crate::theme::{Tokens, tokens};
 
+const SIGN_IN_START: &str = "sourceControl.signInStart";
 const MERGE_METHODS: &[(&str, &str)] =
     &[("last", "Last selected"), ("merge", "Merge"), ("squash", "Squash and merge"), ("rebase", "Rebase and merge")];
 
@@ -83,10 +86,10 @@ struct Credentials {
     app_sign_in: Option<AppSignIn>,
 }
 
-struct AppSignIn {
-    app_name: &'static str,
-    host: &'static str,
-    install_url: &'static str,
+pub(in crate::app) struct AppSignIn {
+    pub(in crate::app) app_name: &'static str,
+    pub(in crate::app) host: &'static str,
+    pub(in crate::app) install_url: &'static str,
     revoke_url: &'static str,
 }
 
@@ -118,6 +121,13 @@ const HOSTS: &[HostDefinition] = &[
                 revoke_url: "https://github.com/settings/apps/authorizations",
             }),
         }),
+        fields: &[],
+    },
+    HostDefinition {
+        kind: "cursor-origin",
+        label: "Cursor Origin",
+        icon: "icons/app/source-control/cursor-origin.svg",
+        credentials: None,
         fields: &[],
     },
     HostDefinition {
@@ -213,6 +223,12 @@ fn host(kind: &str) -> Option<&'static HostDefinition> {
     HOSTS.iter().find(|host| host.kind == kind)
 }
 
+/// `kind`'s forge app sign-in, with the host a pull request means when it names none (`publicHost`).
+pub(in crate::app) fn app_sign_in_of(kind: &str) -> Option<(&'static str, &'static AppSignIn)> {
+    let credentials = host(kind)?.credentials.as_ref()?;
+    Some((credentials.public_host, credentials.app_sign_in.as_ref()?))
+}
+
 /// `Option<string>` on the wire: `{"_tag": "Some", "value": …}`.
 fn some(value: &Value) -> Option<&str> {
     (value["_tag"] == "Some").then(|| value["value"].as_str()).flatten()
@@ -221,6 +237,23 @@ fn some(value: &Value) -> Option<&str> {
 /// A saved credential: a non-empty (redacted) literal, or a secret reference.
 fn has_secret(value: &Value) -> bool {
     value.as_str().map_or(!value.is_null(), |text| !text.is_empty())
+}
+
+/// The token draft's secret reference: one picked over this host's saved token (`key`), else the
+/// saved token when it is a reference.
+fn token_reference(picked: Option<&(String, Option<Value>)>, key: &str, saved: &Value) -> Option<Value> {
+    match picked {
+        Some((picked_over, reference)) if picked_over == key => reference.clone(),
+        _ => crate::app::pages::settings::secret_source::as_reference(saved).cloned(),
+    }
+}
+
+/// What Save sends: the reference, else the typed token; `None` when there is nothing to save.
+fn submission(typed: &str, reference: Option<&Value>) -> Option<Value> {
+    match reference {
+        Some(reference) => Some(reference.clone()),
+        None => Some(typed.trim()).filter(|typed| !typed.is_empty()).map(Value::from),
+    }
 }
 
 /// `redactedPlaceholder`: the same length and punctuation, other characters scrambled stably.
@@ -334,6 +367,9 @@ struct SourceControlState {
     token_saved: bool,
     token_host: Entity<InputState>,
     token: Entity<InputState>,
+    /// A secret reference picked for the token (or `None`, back to a typed one), with the host
+    /// and saved token it was picked over: it applies only while they are unchanged.
+    token_reference: Option<(String, Option<Value>)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -365,6 +401,7 @@ impl SourceControlState {
             token_saved: false,
             token_host,
             token,
+            token_reference: None,
             _subscriptions: subscriptions,
         }
     }
@@ -1076,15 +1113,14 @@ impl Workspace {
         card.into_any_element()
     }
 
-    /// `sourceControl.signInStart`'s permission (`settings:write`) on the settings environment,
-    /// which sign-out shares.
+    /// `startSignIn.permissionAtom` on the settings environment, which sign-out shares.
     fn can_sign_in(&self) -> bool {
-        self.settings_environment().is_some_and(|environment| self.environment_grants(&environment, SETTINGS_WRITE))
+        self.settings_environment().is_some_and(|env| self.env_permits(&env, SIGN_IN_START, &Value::Null))
     }
 
     /// `signIn`: start the device flow, show its code, then wait for the user to approve it.
     fn start_sign_in(&mut self, state: &Entity<SourceControlState>, input: Value, cx: &mut Context<Self>) {
-        if !self.can_sign_in() {
+        if !self.settings_environment().is_some_and(|env| self.env_permits(&env, SIGN_IN_START, &input)) {
             return;
         }
         let Some(client) = self.settings_client() else { return };
@@ -1094,7 +1130,7 @@ impl Workspace {
         });
         let state = state.clone();
         cx.spawn(async move |this, cx| {
-            let started = client.request("sourceControl.signInStart", input.clone()).await;
+            let started = client.request(SIGN_IN_START, input.clone()).await;
             let prompt = match started {
                 Ok(prompt) => prompt,
                 Err(error) => {
@@ -1257,11 +1293,15 @@ impl Workspace {
             (state.token_host.clone(), state.token.clone(), state.saving)
         };
         let typed_host = host_input.read(cx).value().trim().to_lowercase();
-        let draft = token_input.read(cx).value().trim().to_owned();
-        let is_saved = has_secret(&tokens_map[&typed_host]);
-        if state.read(cx).token_saved != is_saved {
-            state.update(cx, |state, _| state.token_saved = is_saved);
-            let placeholder = if is_saved { "Stored secret, enter a new value to replace" } else { "Not set" };
+        let saved_token = tokens_map[&typed_host].clone();
+        let is_saved = has_secret(&saved_token);
+        let source_key = json!([typed_host, saved_token]).to_string();
+        let reference = token_reference(state.read(cx).token_reference.as_ref(), &source_key, &saved_token);
+        let draft = submission(&token_input.read(cx).value(), reference.as_ref());
+        let configured = is_saved && !saved_token.is_object();
+        if state.read(cx).token_saved != configured {
+            state.update(cx, |state, _| state.token_saved = configured);
+            let placeholder = if configured { "Stored secret, enter a new value to replace" } else { "Not set" };
             token_input.update(cx, |input, cx| input.set_placeholder(placeholder, window, cx));
         }
         let saved_hosts: Vec<String> = tokens_map
@@ -1271,14 +1311,14 @@ impl Workspace {
         let link_host = if typed_host.is_empty() { credentials.public_host.to_owned() } else { typed_host.clone() };
         let save = {
             let (state, tokens_map) = (state.clone(), tokens_map);
-            move |this: &mut Self, host: String, token: String, cx: &mut Context<Self>| {
+            move |this: &mut Self, host: String, token: Value, cx: &mut Context<Self>| {
                 state.update(cx, |state, cx| {
                     state.saving = true;
                     cx.notify();
                 });
                 // The whole map: other tokens' redaction markers keep their values.
                 let mut tokens = tokens_map.as_object().cloned().unwrap_or_default();
-                tokens.insert(host, json!(token));
+                tokens.insert(host, token);
                 let state = state.clone();
                 this.update_environment_settings(
                     json!({ "sourceControlHosts": { kind: { "tokens": tokens } } }),
@@ -1286,6 +1326,7 @@ impl Workspace {
                     move |this, ok, cx| {
                         state.update(cx, |state, _| state.saving = false);
                         if ok {
+                            state.update(cx, |state, _| state.token_reference = None);
                             this.clear_token_draft(&state, cx);
                             this.rescan(&state, cx);
                         }
@@ -1295,7 +1336,26 @@ impl Workspace {
         };
         let remove = save.clone();
         let remove_host = typed_host.clone();
-        let can_save = !typed_host.is_empty() && !draft.is_empty() && !saving;
+        let can_save = !typed_host.is_empty() && draft.is_some() && !saving;
+        let token_field = {
+            let state = state.downgrade();
+            crate::app::pages::settings::secret_source::secret_source_input(
+                format!("{kind}-token"),
+                "GitHub token",
+                reference.as_ref(),
+                &self.settings_secret_sources(),
+                saving,
+                || Input::new(&token_input).small().disabled(saving).into_any_element(),
+                move |secret, _, cx| {
+                    let _ = state.update(cx, |state, cx| {
+                        state.token_reference = Some((source_key.clone(), secret));
+                        cx.notify();
+                    });
+                },
+                window,
+                cx,
+            )
+        };
         v_flex()
             .gap(px(12.))
             .child({
@@ -1329,14 +1389,7 @@ impl Workspace {
                         div().w(px(192.)).child(Input::new(&host_input).small().disabled(saving)),
                         &t,
                     ))
-                    .child(
-                        field_label(
-                            "Token",
-                            div().flex_1().child(Input::new(&token_input).small().disabled(saving)),
-                            &t,
-                        )
-                        .flex_1(),
-                    ),
+                    .child(field_label("Token", h_flex().flex_1().child(token_field.row()), &t).flex_1()),
             )
             .child(
                 h_flex()
@@ -1362,7 +1415,7 @@ impl Workspace {
                                         .label("Remove")
                                         .disabled(saving)
                                         .on_click(cx.listener(move |this, _, _, cx| {
-                                            remove(this, remove_host.clone(), String::new(), cx);
+                                            remove(this, remove_host.clone(), json!(""), cx);
                                         })),
                                 )
                             })
@@ -1373,8 +1426,8 @@ impl Workspace {
                                     .label("Save")
                                     .disabled(!can_save)
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        if can_save {
-                                            save(this, typed_host.clone(), draft.clone(), cx);
+                                        if let Some(draft) = draft.clone().filter(|_| can_save) {
+                                            save(this, typed_host.clone(), draft, cx);
                                         }
                                     })),
                             ),
@@ -1648,18 +1701,74 @@ impl Workspace {
                 }
             };
             let input = if field.secret {
-                let placeholder =
-                    if has_secret(stored) { "Stored secret, enter a new value to replace" } else { "Not set" };
-                self.secret_field(&format!("{kind}-{key}"), placeholder, window, cx, commit)
+                let reference = crate::app::pages::settings::secret_source::as_reference(stored);
+                let placeholder = if has_secret(stored) && reference.is_none() {
+                    "Stored secret, enter a new value to replace"
+                } else {
+                    "Not set"
+                };
+                let input = self.secret_field(&format!("{kind}-{key}"), placeholder, window, cx, commit);
+                let write = {
+                    let (state, workspace) = (state.clone(), cx.weak_entity());
+                    move |value: Value, cx: &mut gpui_kit::App| {
+                        let state = state.clone();
+                        let _ = workspace.update(cx, |this, cx| {
+                            this.update_environment_settings(
+                                json!({ "sourceControlHosts": { kind: { key: value } } }),
+                                cx,
+                                move |this, ok, cx| {
+                                    if ok {
+                                        this.rescan(&state, cx);
+                                    }
+                                },
+                            );
+                        });
+                    }
+                };
+                let write = Rc::new(write);
+                let parts = {
+                    let write = write.clone();
+                    crate::app::pages::settings::secret_source::secret_source_input(
+                        format!("{kind}-{key}"),
+                        field.title,
+                        reference,
+                        &self.settings_secret_sources(),
+                        false,
+                        || input.element(),
+                        move |secret, _, cx| write(secret.unwrap_or_else(|| json!("")), cx),
+                        window,
+                        cx,
+                    )
+                };
+                h_flex()
+                    .w(px(384.))
+                    .items_start()
+                    .gap(px(8.))
+                    .child(parts.row())
+                    .when(has_secret(stored), |el| {
+                        el.child(
+                            Button::new(SharedString::from(format!("clear-{kind}-{key}")))
+                                .ghost()
+                                .small()
+                                .size(px(28.))
+                                .text_color(t.muted_foreground)
+                                .icon(Icon::new(Lucide::X).with_size(px(14.)))
+                                .tooltip(format!("Clear {}", field.title))
+                                .on_click(move |_, _, cx| write(json!(""), cx)),
+                        )
+                    })
+                    .into_any_element()
             } else {
                 let text = stored.as_str().unwrap_or_default();
                 self.text_field(&format!("{kind}-{key}"), text, field.placeholder, false, None, window, cx, commit)
+                    .sized(px(384.))
+                    .into_any_element()
             };
             column = column.child(
                 v_flex()
                     .gap(px(6.))
                     .child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(t.foreground).child(field.title))
-                    .child(input.sized(px(384.)))
+                    .child(input)
                     .child(div().max_w(px(672.)).text_xs().text_color(t.muted_foreground).child(field.description)),
             );
         }
@@ -1740,25 +1849,52 @@ impl Workspace {
             },
         );
 
+        // The models resolve on the settings environment's target, against that environment's
+        // providers and settings.
+        let environment = self.settings_environment();
+        let target = settings_target(&view.targets, environment.as_deref());
+        let project_id = target.and_then(|target| target.project_id.as_deref());
+        let selection = |key: &str| -> Option<ModelSelection> {
+            let value = target.map_or_else(|| view.value(key), |target| target.settings.get(key));
+            serde::Deserialize::deserialize(value).ok()
+        };
+        let stored_text = selection("textGenerationModelSelection");
+        let writer = selection("sourceControlWriterModelSelection");
+        // Text generators may write source control text, but never review guides.
+        let generators =
+            self.text_generation_targets(environment.as_ref(), &[writer.as_ref(), stored_text.as_ref()], cx);
+        self.refresh_picker_extra("writer-model", &generators);
+        let generator_config = |id: &str| self.settings_info().settings.get("textGenerators").get(id).cloned();
         let providers = &self.settings_info().providers;
-        let usable: Vec<&crate::model::Provider> =
-            providers.iter().filter(|p| p.is_selectable() && generates_text(p)).collect();
-        let stored_text: Option<ModelSelection> =
-            serde::Deserialize::deserialize(view.value("textGenerationModelSelection")).ok();
-        let default_selection = resolve_text_generation(stored_text.as_ref(), providers);
-        let writer: Option<ModelSelection> =
-            serde::Deserialize::deserialize(view.value("sourceControlWriterModelSelection")).ok();
-        let writer_usable = writer.as_ref().filter(|w| usable.iter().any(|p| p.instance_id == w.instance_id));
-        let active = resolve_text_generation(writer_usable.or(stored_text.as_ref()), providers);
-        let can_dedicate =
-            default_selection.as_ref().is_some_and(|s| usable.iter().any(|p| p.instance_id == s.instance_id));
+        let configured = self.settings_info().settings.get("textGenerators");
+        let writer_providers = project_writers(
+            writing_providers(providers, configured, &generators),
+            &self.settings_info().settings,
+            project_id,
+        );
+        let runs = |list: &[&Provider], s: &ModelSelection| {
+            list.iter().any(|p| p.instance_id == s.instance_id && p.is_selectable() && generates_text(p))
+        };
+        let default_selection = resolve_text_generation(stored_text.as_ref(), &writer_providers);
+        let writer_usable = writer.as_ref().filter(|w| runs(&writer_providers, w));
+        let active = resolve_text_generation(writer_usable.or(stored_text.as_ref()), &writer_providers);
+        let can_dedicate = default_selection.as_ref().is_some_and(|s| runs(&writer_providers, s));
         let guides = view.bool("reviewGuidesEnabled");
         let guide_control = (guides && connected).then(|| {
-            let guide: Option<ModelSelection> =
-                serde::Deserialize::deserialize(view.value("reviewGuideModelSelection")).ok();
+            let guide = selection("reviewGuideModelSelection");
             let mixed = view.mixed(&["reviewGuideModelSelection"]);
-            let guide_usable = guide.as_ref().filter(|g| usable.iter().any(|p| p.instance_id == g.instance_id));
-            let guide_selection = guide_usable.cloned().or_else(|| active.clone());
+            let guide_selection = review_guide_selection(
+                &self.settings_info().settings,
+                project_id,
+                providers,
+                [guide.as_ref(), writer.as_ref(), stored_text.as_ref()],
+            );
+            let can_guide = guide_selection.is_some();
+            // Turning it on starts from the writer, unless that is a text generator.
+            let seed = match &active {
+                Some(active) if generator_config(&active.instance_id).is_some() => guide_selection.clone(),
+                active => active.clone(),
+            };
             self.dedicated_model_control(
                 DedicatedModel {
                     id: "review-guide-model",
@@ -1767,11 +1903,12 @@ impl Workspace {
                     on: guide.is_some(),
                     mixed,
                     switch_mixed: mixed,
-                    selection: guide_selection.filter(|_| (guide.is_some() || mixed) && can_dedicate),
-                    enable_with: active.clone(),
+                    selection: guide_selection.filter(|_| (guide.is_some() || mixed) && can_guide),
+                    enable_with: seed,
                     check_enable: true,
-                    dimmed: guide.is_none() && !can_dedicate,
+                    dimmed: guide.is_none() && !can_guide,
                     note: None,
+                    extra: None,
                 },
                 cx,
             )
@@ -1792,6 +1929,7 @@ impl Workspace {
                     check_enable: false,
                     dimmed: false,
                     note,
+                    extra: Some(generators.clone()),
                 },
                 cx,
             )
@@ -1825,7 +1963,7 @@ impl Workspace {
             rows.push(row(
                 self,
                 SettingRow::new("review-guide-model")
-                    .description("Model that reads a pull request to write its review guide. It reads the change itself over many steps, so a stronger model helps. Off uses the source control writer model.")
+                    .description("Must be a coding agent: it reads the pull request over many steps. Off uses the writer model, or Codex or Claude if that model is a text generator.")
                     .setting("reviewGuideModelSelection")
                     .control(control),
             ));
@@ -1941,6 +2079,7 @@ impl Workspace {
             check_enable,
             dimmed,
             note,
+            extra,
         } = row;
         let set = move |this: &mut Self, value: Value, window: &mut Window, cx: &mut Context<Self>| {
             this.update_settings(json!({ key: value }), window, cx);
@@ -1959,11 +2098,12 @@ impl Workspace {
             .gap(px(8.))
             .children(note)
             .when_some(selection, |el, selection| {
-                el.child(self.model_picker(
+                el.child(self.model_picker_among(
                     id,
                     Some(&selection),
                     mixed.then_some("Mixed"),
                     generates_text,
+                    extra,
                     cx,
                     move |this, pick, window, cx| {
                         let pick = ModelSelection { options: None, ..pick };
@@ -1971,9 +2111,15 @@ impl Workspace {
                     },
                 ))
                 .when(!mixed, |el| {
-                    el.children(self.traits_picker(traits_id, &selection, cx, move |this, pick, window, cx| {
-                        set(this, pick.to_json(), window, cx);
-                    }))
+                    el.children(self.traits_picker(
+                        traits_id,
+                        &selection,
+                        crate::model_label::selects_plan_agent(&selection),
+                        cx,
+                        move |this, pick, window, cx| {
+                            set(this, pick.to_json(), window, cx);
+                        },
+                    ))
                 })
             })
             .child(switch(&id.into(), on && !switch_mixed, switch_mixed).on_click(cx.listener(
@@ -2002,7 +2148,8 @@ fn vcs_icon(kind: &str) -> Option<&'static str> {
 
 /// A host or VCS mark at 18px: GitHub's is one color and follows the text, the rest are drawn as is.
 fn source_control_icon(path: &'static str, t: &Tokens) -> AnyElement {
-    if path.ends_with("/github.svg") {
+    // GitHub's and Cursor's marks are one color and follow the text.
+    if path.ends_with("/github.svg") || path.ends_with("/cursor-origin.svg") {
         svg().path(path).size(px(18.)).text_color(t.foreground.opacity(0.8)).into_any_element()
     } else {
         img(path).size(px(18.)).into_any_element()
@@ -2107,6 +2254,47 @@ struct DedicatedModel {
     check_enable: bool,
     dimmed: bool,
     note: Option<gpui_kit::Div>,
+    /// `Some` for a writing picker: the text generators it offers beside the coding agents.
+    extra: Option<Rc<[Provider]>>,
+}
+
+/// The writing providers `project_id` may run (`resolveTextGenerationSelectionEnabled`): a text
+/// generator by its own switch, a coding agent by the project's provider overrides.
+fn project_writers<'a>(
+    mut writers: Vec<&'a Provider>,
+    settings: &crate::settings::Settings,
+    project_id: Option<&str>,
+) -> Vec<&'a Provider> {
+    writers.retain(|p| scope::text_generation_selection_enabled(settings, project_id, &p.instance_id));
+    writers
+}
+
+/// `resolveReviewGuideModelSelection` over the coding agents `project_id` may run: the guide's
+/// own agent, else the writer while it runs, else the text generation model, each kept only if
+/// an agent. Selections are `[guide, writer, text generation]`.
+fn review_guide_selection(
+    settings: &crate::settings::Settings,
+    project_id: Option<&str>,
+    providers: &[Provider],
+    [guide, writer, text]: [Option<&ModelSelection>; 3],
+) -> Option<ModelSelection> {
+    let generator = |id: &str| settings.get("textGenerators").get(id);
+    let agents: Vec<&Provider> =
+        providers.iter().filter(|p| scope::provider_instance_enabled(settings, project_id, &p.instance_id)).collect();
+    let runs = |s: &&ModelSelection| {
+        agents.iter().any(|p| p.instance_id == s.instance_id && p.is_selectable() && generates_text(p))
+    };
+    let guide = guide.filter(|g| generator(&g.instance_id).is_none()).filter(runs);
+    let writer = writer.filter(|w| match generator(&w.instance_id) {
+        Some(generator) => generator["enabled"] != false,
+        None => runs(w),
+    });
+    resolve_text_generation(guide.or(writer).or(text), &agents)
+}
+
+/// `useSettingsScope().target`: the target on the settings environment, else the first.
+fn settings_target<'t>(targets: &'t [scope::Target], environment: Option<&str>) -> Option<&'t scope::Target> {
+    targets.iter().find(|t| Some(t.environment_id.as_str()) == environment).or(targets.first())
 }
 
 /// `styleFieldMixed`: the selected targets differ in one writing-style field.
@@ -2133,6 +2321,62 @@ mod tests {
         assert!(style_field_mixed(&targets, "customInstructions"));
         assert!(!style_field_mixed(&targets[..1], "customInstructions"));
         assert!(!style_field_mixed(&[], "mode"));
+    }
+
+    #[test]
+    fn writer_and_review_guide_skip_agents_the_project_turned_off() {
+        let settings = crate::settings::Settings::layered(
+            &Default::default(),
+            &json!({
+                "textGenerators": {"gen": {"kind": "openaiCompatible", "baseUrl": "https://api.test", "enabled": true}},
+                "projectSettingsOverrides": {"p": {"providerInstances": {"codex": {"enabled": false}}}}
+            }),
+        );
+        let providers: Vec<Provider> = serde_json::from_value(json!([
+            {"instanceId": "codex", "driver": "codex", "enabled": true, "status": "ready", "models": [{"slug": "gpt"}]},
+            {"instanceId": "claudeAgent", "driver": "claudeAgent", "enabled": true, "status": "ready",
+                "models": [{"slug": "claude-haiku-5-5"}]}
+        ]))
+        .unwrap();
+        let generators: Vec<Provider> = serde_json::from_value(json!([
+            {"instanceId": "gen", "driver": "openai", "enabled": true, "status": "ready", "models": [{"slug": "m"}]}
+        ]))
+        .unwrap();
+        let pick = |instance: &str, model: &str| ModelSelection {
+            instance_id: instance.into(),
+            model: model.into(),
+            options: None,
+        };
+        let (generator, codex) = (pick("gen", "m"), pick("codex", "gpt"));
+        let guide = |project: Option<&str>, selections: [Option<&ModelSelection>; 3]| {
+            review_guide_selection(&settings, project, &providers, selections).map(|s| s.instance_id)
+        };
+        assert_eq!(guide(None, [None, Some(&generator), None]).as_deref(), Some("codex"));
+        assert_eq!(guide(Some("p"), [None, Some(&generator), None]).as_deref(), Some("claudeAgent"));
+        assert_eq!(guide(Some("p"), [Some(&codex), None, None]).as_deref(), Some("claudeAgent"), "the guide's own");
+        assert_eq!(guide(Some("p"), [None, Some(&codex), None]).as_deref(), Some("claudeAgent"), "the writer");
+
+        let writers = |project: Option<&str>| {
+            let all = writing_providers(&providers, settings.get("textGenerators"), &generators);
+            project_writers(all, &settings, project).iter().map(|p| p.instance_id.clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(writers(None), ["codex", "claudeAgent", "gen"]);
+        assert_eq!(writers(Some("p")), ["claudeAgent", "gen"]);
+
+        // A grouped scope lists the remote checkout first; the settings environment's own is used.
+        let target = |environment: &str, project: &str| scope::Target {
+            environment_id: environment.into(),
+            project_id: Some(project.into()),
+            settings: settings.clone(),
+            sources: Default::default(),
+        };
+        let targets = [target("remote", "r"), target("primary", "p")];
+        let project = |environment| settings_target(&targets, environment).and_then(|t| t.project_id.as_deref());
+        assert_eq!(project(Some("primary")), Some("p"));
+        assert_eq!(guide(project(Some("primary")), [None, Some(&generator), None]).as_deref(), Some("claudeAgent"));
+        assert_eq!(writers(project(Some("primary"))), ["claudeAgent", "gen"]);
+        assert_eq!(project(Some("elsewhere")), Some("r"), "else the first target");
+        assert_eq!(project(None), Some("r"));
     }
 
     #[test]

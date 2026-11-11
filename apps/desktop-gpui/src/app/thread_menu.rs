@@ -66,16 +66,15 @@ pub(super) fn hosted_thread_link(environment_id: &str, thread_id: &str) -> Strin
 }
 
 impl Workspace {
-    fn title_thread_id(&self) -> Option<String> {
-        let Some(Target::Thread { id, .. }) = &self.target else { return None };
-        Some(id.clone())
+    fn title_thread(&self) -> Option<crate::model::ScopedId> {
+        self.target.as_ref().and_then(Target::thread_key)
     }
 
     /// A click on the title: the menu after the double-click interval; the chevron opens it at once.
     pub(super) fn click_title(&mut self, click_count: usize, now: bool, window: &mut Window, cx: &mut Context<Self>) {
         if click_count >= 2 {
             self.title.pending = None;
-            if let Some(id) = self.title_thread_id() {
+            if let Some(id) = self.title_thread() {
                 self.start_rename(&id, MenuOrigin::Title, window, cx);
             }
             return;
@@ -128,7 +127,7 @@ impl Workspace {
     }
 
     fn open_thread_menu(&mut self, at: Option<Point<Pixels>>, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(model) = self.title_thread_id().and_then(|id| self.thread_menu(&id, MenuOrigin::Title, cx)) else {
+        let Some(model) = self.title_thread().and_then(|id| self.thread_menu(&id, MenuOrigin::Title, cx)) else {
             return;
         };
         let view = cx.weak_entity();

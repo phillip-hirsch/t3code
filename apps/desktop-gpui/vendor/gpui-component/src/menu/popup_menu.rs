@@ -74,6 +74,8 @@ pub enum PopupMenuItem {
         action: Option<Box<dyn Action>>,
         render: Box<dyn Fn(&mut Window, &mut App) -> AnyElement + 'static>,
         handler: Option<Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>>,
+        /// Drawn on the previous item's row (see [`PopupMenuItem::inline`]).
+        inline: bool,
     },
     /// A submenu item that opens another popup menu.
     Submenu {
@@ -114,7 +116,24 @@ impl PopupMenuItem {
             action: None,
             render: Box::new(move |window, cx| builder(window, cx).into_any_element()),
             handler: None,
+            inline: false,
         }
+    }
+
+    /// Draw this element item at the end of the previous item's row, as its own
+    /// stop for the arrow keys; the row highlights as one while either is.
+    ///
+    /// Only works for [`PopupMenuItem::ElementItem`].
+    pub fn inline(mut self) -> Self {
+        if let PopupMenuItem::ElementItem { inline, .. } = &mut self {
+            *inline = true;
+        }
+        self
+    }
+
+    #[inline]
+    fn is_inline(&self) -> bool {
+        matches!(self, PopupMenuItem::ElementItem { inline: true, .. })
     }
 
     /// Create a new submenu item that opens another popup menu.
@@ -968,7 +987,7 @@ impl PopupMenu {
     fn set_selected_index(&mut self, ix: usize, cx: &mut Context<Self>) {
         if self.selected_index != Some(ix) {
             self.selected_index = Some(ix);
-            self.scroll_handle.scroll_to_item(ix);
+            self.scroll_handle.scroll_to_item(self.row_of(ix));
             cx.notify();
         }
     }
@@ -1283,15 +1302,83 @@ impl PopupMenu {
         };
     }
 
+    /// The drawn row holding item `ix`: inline items share their leader's.
+    fn row_of(&self, ix: usize) -> usize {
+        self.menu_items
+            .iter()
+            .take(ix + 1)
+            .filter(|item| !item.is_inline())
+            .count()
+            .saturating_sub(1)
+    }
+
+    /// The items drawn one row each, an item followed by inline ones sharing a row.
+    fn render_rows(
+        &self,
+        options: RenderOptions,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let count = self.menu_items.len();
+        let radius = match self.size {
+            Size::Small => options.radius.half(),
+            _ => options.radius,
+        };
+        let mut rows = Vec::new();
+        let mut ix = 0;
+        while ix < count {
+            let item = &self.menu_items[ix];
+            // Ignore last separator
+            if ix + 1 == count && item.is_separator() {
+                break;
+            }
+            let end = (ix + 1..count)
+                .find(|&next| !self.menu_items[next].is_inline())
+                .unwrap_or(count);
+            if end == ix + 1 {
+                rows.push(
+                    self.render_item(ix, item, options, false, window, cx)
+                        .into_any_element(),
+                );
+            } else {
+                let selected = self.selected_index.is_some_and(|s| (ix..end).contains(&s));
+                let accent = cx.theme().tokens.accent;
+                rows.push(
+                    h_flex()
+                        .id(("menu-row", ix))
+                        .w_full()
+                        .min_w_0()
+                        .rounded(radius)
+                        .hover(move |this| this.bg(accent))
+                        .when(selected, move |this| this.bg(accent))
+                        .children((ix..end).map(|at| {
+                            self.render_item(at, &self.menu_items[at], options, true, window, cx)
+                                .map(|this| {
+                                    if at == ix {
+                                        this.flex_1().min_w_0()
+                                    } else {
+                                        this.flex_none()
+                                    }
+                                })
+                        }))
+                        .into_any_element(),
+                );
+            }
+            ix = end;
+        }
+        rows
+    }
+
     fn render_item(
         &self,
         ix: usize,
         item: &PopupMenuItem,
         options: RenderOptions,
+        in_row: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> MenuItemElement {
-        let has_left_icon = options.has_left_icon;
+        let has_left_icon = options.has_left_icon && !item.is_inline();
         let is_left_check = options.check_side.is_left() && item.is_checked();
         let right_check_icon = if options.check_side.is_right() && item.is_checked() {
             Some(Icon::new(IconName::Check).xsmall())
@@ -1323,6 +1410,7 @@ impl PopupMenu {
             .rounded(radius)
             .items_center()
             .selected(selected)
+            .in_row(in_row)
             .on_hover(cx.listener(move |this, hovered, window, cx| {
                 if *hovered {
                     // Pointing elsewhere closes the open submenu; take back
@@ -1563,7 +1651,6 @@ impl Render for PopupMenu {
         }
 
         let view = cx.entity().clone();
-        let items_count = self.menu_items.len();
 
         let max_height = self.max_height.unwrap_or_else(|| {
             let window_half_height = window.window_bounds().get_bounds().size.height * 0.5;
@@ -1622,14 +1709,7 @@ impl Render for PopupMenu {
                             .overflow_y_scroll()
                             .track_scroll(&self.scroll_handle)
                     })
-                    .children(
-                        self.menu_items
-                            .iter()
-                            .enumerate()
-                            // Ignore last separator
-                            .filter(|(ix, item)| !(*ix + 1 == items_count && item.is_separator()))
-                            .map(|(ix, item)| self.render_item(ix, item, options, window, cx)),
-                    )
+                    .children(self.render_rows(options, window, cx))
                     .on_prepaint(move |bounds, _, cx| {
                         view.update(cx, |menu, cx| {
                             let width_changed = menu.bounds.size.width != bounds.size.width;

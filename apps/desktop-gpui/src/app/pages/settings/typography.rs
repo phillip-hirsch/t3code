@@ -360,12 +360,9 @@ fn render_preview(
             // `render_diff` sizes rows from the rem and the code font; Pierre pads the code 8px
             // below its last row.
             let row = fonts.interface_size * fonts.code_size / 16. * 1.6;
-            // `--code-background`: `color-mix(in srgb, var(--card) 90%, var(--background))`.
-            let code_background = t.background.blend(t.card.opacity(0.9));
             let preview = Diff::new(diff)
                 .header_visible(false)
                 .border_0()
-                .bg(code_background)
                 .hunk_separator(DiffHunkSeparator::LineInfo)
                 .change_indicator(DiffChangeIndicator::Bars)
                 .h(px(8. + row * DIFF_PREVIEW_ROWS))
@@ -384,7 +381,7 @@ fn render_preview(
                 .mt(px(4.))
                 .mb(px(8.))
                 .overflow_hidden()
-                .bg(code_background)
+                .bg(t.code_background)
                 .child(diff_preview_header(fonts, t, scheme))
                 .child(preview)
                 .into_any_element()
@@ -531,9 +528,7 @@ fn terminal_preview(fonts: &Fonts, t: &Tokens) -> AnyElement {
     let theme = TerminalTheme::new(t);
     let ansi = |index: usize| theme.palette[index];
     let (red, green, yellow, blue, cyan) = (ansi(1), ansi(2), ansi(3), ansi(4), ansi(6));
-    // SGR 2, as the terminal grid dims its foreground.
-    let fg = theme.foreground;
-    let faint = gpui_kit::hsla(fg.h, fg.s, fg.l * 0.66, fg.a);
+    let faint = theme.faint_foreground();
     let prompt = [
         bold("→", Some(green)),
         plain(" "),
@@ -614,7 +609,7 @@ fn terminal_preview(fonts: &Fonts, t: &Tokens) -> AnyElement {
         .font_family(fonts.terminal)
         .text_size(px(fonts.terminal_size))
         .line_height(line_height)
-        .text_color(fg)
+        .text_color(theme.foreground)
         .children(lines.into_iter().map(|runs| {
             h_flex().whitespace_nowrap().min_h(line_height).children(runs.into_iter().map(|run| {
                 div()

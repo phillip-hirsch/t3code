@@ -117,9 +117,11 @@ pub fn patch_detail(detail: &Detail, reply: &Reply) -> (Option<Detail>, bool) {
     (Some(next), reread)
 }
 
-/// `samePullRequest`: a missing host is not a wildcard.
+/// `samePullRequest`: a missing host is not a wildcard, and a project id names a project only
+/// within its environment.
 fn same(entry: &Entry, reference: &Reference) -> bool {
-    entry.project_id == reference.project_id
+    entry.environment_id == reference.environment_id
+        && entry.project_id == reference.project_id
         && reference.host.as_ref().is_some_and(|host| host.eq_ignore_ascii_case(&entry.host))
         && entry.repository.eq_ignore_ascii_case(&reference.repository)
         && entry.number == reference.number
@@ -210,11 +212,18 @@ mod tests {
         }))
         .unwrap();
         entry.updated_ms = parse_ms(updated);
+        entry.environment_id = "a".into();
         Rc::new(entry)
     }
 
     fn reference(number: u64) -> Reference {
-        Reference { project_id: "p".into(), host: Some("GitHub.com".into()), repository: "O/R".into(), number }
+        Reference {
+            environment_id: "a".into(),
+            project_id: "p".into(),
+            host: Some("GitHub.com".into()),
+            repository: "O/R".into(),
+            number,
+        }
     }
 
     #[test]
@@ -235,6 +244,9 @@ mod tests {
         let reply = json!({"state": "closed", "title": "Renamed", "updatedAt": "2026-01-04T00:00:00Z"});
         let reply = Reply::read(&reply).unwrap();
         let all = Listing { state: "all", draft: None };
+        let elsewhere = Reference { environment_id: "b".into(), ..reference(1) };
+        assert_eq!(patch_entries(&all, &mut entries, &elsewhere, &reply), ListPatch::Refresh, "another server's row");
+        assert_eq!(entries[0].title, "T");
         assert_eq!(patch_entries(&all, &mut entries, &reference(1), &reply), ListPatch::Patched);
         assert_eq!((entries[0].number, entries[0].title.as_str(), entries[0].state), (1, "Renamed", State::Closed));
         let open = Listing { state: "open", draft: None };

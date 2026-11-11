@@ -9,12 +9,40 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{Target, Workspace, new_id};
+use crate::model::ScopedId;
 use crate::rpc::{RpcClient, RpcError, StreamEvent};
 use crate::theme::Tokens;
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct LineTotals {
+    #[serde(default)]
+    pub insertions: u64,
+    #[serde(default)]
+    pub deletions: u64,
+}
+
+/// One `workingTree.files` entry; `path` is relative to the worktree root.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkingTreeFile {
+    pub path: String,
+    #[serde(default)]
+    pub insertions: u64,
+    #[serde(default)]
+    pub deletions: u64,
+}
+
+/// `workingTree`: the uncommitted changes and their totals.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkingTree {
+    /// The absolute worktree root every `files[].path` is relative to; absent when the server
+    /// could not resolve it.
+    #[serde(default)]
+    pub root_path: Option<String>,
+    #[serde(default)]
+    pub files: Vec<WorkingTreeFile>,
     #[serde(default)]
     pub insertions: u64,
     #[serde(default)]
@@ -35,6 +63,9 @@ pub struct BranchChanges {
 pub struct SourceControlProvider {
     #[serde(default)]
     pub kind: String,
+    /// The host's display name ("GitHub Self-Hosted"), when the server names it.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 /// `VcsStatusLocalResult`.
@@ -53,7 +84,7 @@ pub struct VcsLocal {
     #[serde(default)]
     pub has_working_tree_changes: bool,
     #[serde(default)]
-    pub working_tree: LineTotals,
+    pub working_tree: WorkingTree,
     #[serde(default)]
     pub branch_changes: Option<BranchChanges>,
 }
@@ -64,6 +95,10 @@ pub struct ChangeRequest {
     pub number: u64,
     pub url: String,
     pub state: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub is_draft: bool,
 }
 
 /// `VcsStatusRemoteResult`; a missing remote part reads as all zeros (`mergeGitStatusParts`).
@@ -113,7 +148,7 @@ impl VcsStatus {
     pub fn pr_label(&self) -> &'static str {
         match self.local.source_control_provider.as_ref().map(|p| p.kind.as_str()) {
             Some("gitlab") => "MR",
-            Some("github" | "gitcafe" | "forgejo" | "bitbucket" | "azure-devops") => "PR",
+            Some("github" | "cursor-origin" | "gitcafe" | "forgejo" | "bitbucket" | "azure-devops") => "PR",
             _ => "change request",
         }
     }
@@ -392,6 +427,22 @@ pub fn deletion_color(tokens: &Tokens, scheme: DiffColorScheme) -> Hsla {
     .into()
 }
 
+/// `--diff-addition`: `--success` (emerald 500), or the blue-orange scheme's blue.
+pub fn addition_base_color(tokens: &Tokens, scheme: DiffColorScheme) -> Hsla {
+    match scheme {
+        DiffColorScheme::RedGreen => rgb(0x00bc7d).into(),
+        DiffColorScheme::BlueOrange => addition_color(tokens, scheme),
+    }
+}
+
+/// `--diff-deletion`: `--destructive`, or the blue-orange scheme's orange.
+pub fn deletion_base_color(tokens: &Tokens, scheme: DiffColorScheme) -> Hsla {
+    match scheme {
+        DiffColorScheme::RedGreen => tokens.error,
+        DiffColorScheme::BlueOrange => deletion_color(tokens, scheme),
+    }
+}
+
 /// `Intl.NumberFormat("en-US")` for a count.
 pub fn group_thousands(value: u64) -> String {
     let digits = value.to_string();
@@ -457,18 +508,35 @@ pub(super) struct GitRequest {
     pub commit_message: Option<String>,
     /// `featureBranch`: check out a new branch named from the changes, then run the action there.
     pub feature_branch: bool,
+    /// `filePaths`: commit only these; `None` commits every change.
+    pub file_paths: Option<Vec<String>>,
 }
 
 impl GitRequest {
     pub(super) fn new(action: &'static str) -> Self {
-        Self { action, commit_message: None, feature_branch: false }
+        Self { action, commit_message: None, feature_branch: false, file_paths: None }
+    }
+
+    /// The `git.runStackedAction` input for `cwd`, without the thread and project it ran for.
+    fn input(&self, action_id: String, cwd: &str) -> Value {
+        let mut input = json!({"actionId": action_id, "cwd": cwd, "action": self.action});
+        if let Some(message) = &self.commit_message {
+            input["commitMessage"] = message.clone().into();
+        }
+        if self.feature_branch {
+            input["featureBranch"] = true.into();
+        }
+        if let Some(paths) = &self.file_paths {
+            input["filePaths"] = paths.clone().into();
+        }
+        input
     }
 }
 
 /// The thread (with the branch it had when the action started) or draft a git action ran for.
 enum BranchOwner {
     Thread { id: String, env: SharedString, branch: Option<String> },
-    Draft(String),
+    Draft(Target),
 }
 
 /// The open target's status subscription; it follows the git cwd and its environment.
@@ -495,8 +563,22 @@ impl VcsWatch {
         self.env.as_deref() == env && self.cwd.as_deref() == Some(cwd)
     }
 
-    fn checkout(&self) -> Option<Checkout> {
+    pub(super) fn checkout(&self) -> Option<Checkout> {
         Some((self.env.clone(), self.cwd.clone()?))
+    }
+
+    /// Marks an action started on `checkout`, watched or not; false while one already runs there.
+    pub(super) fn start_on(&mut self, checkout: Checkout, label: impl Into<SharedString>) -> bool {
+        if self.running.contains_key(&checkout) {
+            return false;
+        }
+        self.running.insert(checkout, label.into());
+        true
+    }
+
+    /// Whether an action runs on `checkout`.
+    pub(super) fn is_running(&self, checkout: &Checkout) -> bool {
+        self.running.contains_key(checkout)
     }
 
     /// The watched checkout's git action in flight.
@@ -506,9 +588,8 @@ impl VcsWatch {
 
     /// Marks an action started on the watched checkout; `None` while one already runs there.
     pub(super) fn start(&mut self, label: impl Into<SharedString>) -> Option<Checkout> {
-        let checkout = self.checkout().filter(|checkout| !self.running.contains_key(checkout))?;
-        self.running.insert(checkout.clone(), label.into());
-        Some(checkout)
+        let checkout = self.checkout()?;
+        self.start_on(checkout.clone(), label).then_some(checkout)
     }
 
     fn progress(&mut self, checkout: &Checkout, label: SharedString) {
@@ -537,14 +618,12 @@ impl Workspace {
     /// `gitCwd`: the thread's worktree (a draft's picked existing worktree), else its project root.
     pub(super) fn git_cwd(&self) -> Option<String> {
         let worktree = match self.target.as_ref()? {
-            Target::Thread { id, .. } => self
+            Target::Thread { env, id } => self
                 .shell
-                .threads
-                .iter()
-                .find(|thread| &thread.id == id)
+                .thread(&ScopedId::new(env.clone(), id.as_str()))
                 .and_then(|thread| thread.worktree_path.clone())
                 .or_else(|| self.open_projection().and_then(|p| p.thread.worktree_path.clone())),
-            Target::Draft { project_id, .. } => self.draft_workspace.existing_worktree(project_id).map(str::to_owned),
+            Target::Draft { .. } => self.draft_workspace.existing_worktree(self.target.as_ref()).map(str::to_owned),
         };
         worktree.or_else(|| self.target_project().map(|project| project.workspace_root.clone()))
     }
@@ -613,6 +692,45 @@ impl Workspace {
         self.vcs.env.as_deref().is_some_and(|env| self.env_grants(env, SOURCE_CONTROL_WRITE))
     }
 
+    /// `permissionAtom` for the `git.runStackedAction` `request` would send from the open target.
+    pub(super) fn permits_git_action(&self, request: &GitRequest) -> bool {
+        let (Some(env), Some(cwd)) = (self.vcs.env.as_deref(), self.vcs.cwd.as_deref()) else { return false };
+        self.env_permits(env, "git.runStackedAction", &self.git_action_input(request, String::new(), cwd))
+    }
+
+    /// `permissionAtom` for a one-shot git RPC on the watched checkout.
+    pub(super) fn permits_vcs_request(&self, method: &str) -> bool {
+        let (Some(env), Some(cwd)) = (self.vcs.env.as_deref(), self.vcs.cwd.as_deref()) else { return false };
+        self.env_permits(env, method, &json!({"cwd": cwd}))
+    }
+
+    /// `permissionAtom` for `sourceControl.publishRepository` on the watched checkout.
+    pub(super) fn permits_publish(&self) -> bool {
+        self.permits_vcs_request("sourceControl.publishRepository")
+    }
+
+    /// `permissionAtom` for what the quick action sends; a hint sends nothing but still needs write.
+    pub(super) fn permits_quick_action(&self, kind: &QuickKind) -> bool {
+        match kind {
+            QuickKind::Run(action) => self.permits_git_action(&GitRequest::new(action)),
+            QuickKind::Pull => self.permits_vcs_request("vcs.pull"),
+            QuickKind::Publish => self.permits_publish(),
+            QuickKind::Hint(_) => self.can_write_source_control(),
+        }
+    }
+
+    /// The `git.runStackedAction` input for `request` on `cwd`, for the open thread and project.
+    fn git_action_input(&self, request: &GitRequest, action_id: String, cwd: &str) -> Value {
+        let mut input = request.input(action_id, cwd);
+        if let Some(Target::Thread { id, .. }) = &self.target {
+            input["threadId"] = id.clone().into();
+        }
+        if let Some(project) = self.target_project() {
+            input["projectId"] = project.id.clone().into();
+        }
+        input
+    }
+
     /// `canChangeThreadBranch`: a feature branch also moves a server thread to it.
     pub(super) fn can_change_thread_branch(&self) -> bool {
         self.can_write_source_control()
@@ -624,7 +742,7 @@ impl Workspace {
 
     /// `runGitActionWithToast`: a push or PR from the default ref asks first.
     pub(super) fn request_git_action(&mut self, request: GitRequest, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.can_write_source_control() {
+        if !self.permits_git_action(&request) {
             return;
         }
         let status = self.vcs.status.as_ref();
@@ -639,24 +757,12 @@ impl Workspace {
     /// `git.runStackedAction` on the watched checkout, past the default-ref prompt. The grants are
     /// checked again, since they can change while a dialog is open.
     pub(super) fn run_git_action(&mut self, request: GitRequest, cx: &mut Context<Self>) {
-        if !self.can_write_source_control() || (request.feature_branch && !self.can_change_thread_branch()) {
+        if !self.permits_git_action(&request) || (request.feature_branch && !self.can_change_thread_branch()) {
             return;
         }
         let Some(client) = self.vcs_client() else { return };
         let Some(checkout) = self.vcs.start("Starting source control action...") else { return };
-        let mut input = json!({"actionId": new_id(), "cwd": checkout.1, "action": request.action});
-        if let Some(message) = request.commit_message {
-            input["commitMessage"] = message.into();
-        }
-        if request.feature_branch {
-            input["featureBranch"] = true.into();
-        }
-        if let Some(Target::Thread { id, .. }) = &self.target {
-            input["threadId"] = id.clone().into();
-        }
-        if let Some(project) = self.target_project() {
-            input["projectId"] = project.id.clone().into();
-        }
+        let input = self.git_action_input(&request, new_id(), &checkout.1);
         let owner = self.branch_owner();
         let origin = self.target.clone();
         let stream = client.stream("git.runStackedAction", input);
@@ -679,7 +785,7 @@ impl Workspace {
                         }
                         _ => {}
                     },
-                    StreamEvent::End(Err(error)) => outcome = Err(error.to_string()),
+                    StreamEvent::End(Err(error)) => outcome = Err(error.message()),
                     StreamEvent::End(Ok(())) => break,
                 }
             }
@@ -698,14 +804,14 @@ impl Workspace {
     fn branch_owner(&self) -> Option<BranchOwner> {
         match self.target.as_ref()? {
             Target::Thread { id, env } => {
-                let shell = self.shell.threads.iter().find(|thread| &thread.id == id);
+                let shell = self.shell.thread(&ScopedId::new(env.clone(), id.as_str()));
                 let branch = match shell {
                     Some(thread) => thread.branch.clone(),
                     None => self.open_projection().and_then(|p| p.thread.branch.clone()),
                 };
                 Some(BranchOwner::Thread { id: id.clone(), env: env.clone(), branch })
             }
-            Target::Draft { project_id, .. } => Some(BranchOwner::Draft(project_id.clone())),
+            draft @ Target::Draft { .. } => Some(BranchOwner::Draft(draft.clone())),
         }
     }
 
@@ -716,16 +822,16 @@ impl Workspace {
             BranchOwner::Thread { id, env, branch: had } => {
                 let fields = branch_metadata_patch(&branch, had.as_deref());
                 if let Some(fields) = fields.filter(|_| self.can_operate(&env)) {
-                    self.thread_command("thread.metadata.update", &id, fields, cx);
+                    self.thread_command("thread.metadata.update", &crate::model::ScopedId::new(env, id), fields, cx);
                 }
             }
-            BranchOwner::Draft(project_id) => self.set_draft_branch(&project_id, branch, cx),
+            BranchOwner::Draft(draft) => self.set_draft_branch(&draft, branch, cx),
         }
     }
 
     /// A one-shot git RPC (`vcs.init`, `vcs.pull`) on the current cwd.
     pub(super) fn run_vcs_request(&mut self, method: &'static str, label: &'static str, cx: &mut Context<Self>) {
-        if !self.can_write_source_control() {
+        if !self.permits_vcs_request(method) {
             return;
         }
         let Some(client) = self.vcs_client() else { return };
@@ -977,6 +1083,46 @@ mod tests {
             Some(json!({"branch": "t3/fix-login", "expectedBranch": null}))
         );
         assert_eq!(branch_metadata_patch("main", Some("main")), None);
+    }
+
+    #[test]
+    fn a_commit_request_sends_only_what_it_was_given() {
+        assert_eq!(
+            GitRequest::new("commit").input("a".into(), "/repo"),
+            json!({"actionId": "a", "cwd": "/repo", "action": "commit"})
+        );
+        let picked = GitRequest {
+            commit_message: Some("Fix login".into()),
+            feature_branch: true,
+            file_paths: Some(vec!["src/a.rs".into(), "README.md".into()]),
+            ..GitRequest::new("commit")
+        };
+        assert_eq!(
+            picked.input("b".into(), "/repo"),
+            json!({
+                "actionId": "b", "cwd": "/repo", "action": "commit", "commitMessage": "Fix login",
+                "featureBranch": true, "filePaths": ["src/a.rs", "README.md"],
+            })
+        );
+    }
+
+    #[test]
+    fn the_working_tree_carries_its_files_and_root() {
+        let tree = json!({
+            "rootPath": "/repo",
+            "files": [{"path": "src/a.rs", "insertions": 3, "deletions": 1}, {"path": "b.md", "insertions": 0, "deletions": 2}],
+            "insertions": 3, "deletions": 3,
+        });
+        let parsed = status(local(true, json!({"workingTree": tree})), Value::Null).local.working_tree;
+        assert_eq!(parsed.root_path.as_deref(), Some("/repo"));
+        assert_eq!(
+            parsed.files,
+            [
+                WorkingTreeFile { path: "src/a.rs".into(), insertions: 3, deletions: 1 },
+                WorkingTreeFile { path: "b.md".into(), insertions: 0, deletions: 2 },
+            ]
+        );
+        assert_eq!((parsed.insertions, parsed.deletions), (3, 3));
     }
 
     #[test]

@@ -5,15 +5,16 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui_kit::assets::IconName;
+use gpui_kit::base::FocusTrapElement as _;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, AppContext as _, Context, ElementId, Entity, FontWeight, InteractiveElement as _, IntoElement,
-    KeyDownEvent, ListAlignment, ListState, ParentElement as _, ScrollStrategy, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Task, UniformListScrollHandle, Window, div, list,
-    prelude::FluentBuilder as _, px, uniform_list,
+    AnyElement, AppContext as _, Context, ElementId, Entity, FocusHandle, Focusable as _, FontWeight,
+    InteractiveElement as _, IntoElement, KeyDownEvent, ListAlignment, ListState, ParentElement as _, ScrollStrategy,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task, UniformListScrollHandle, Window,
+    div, list, prelude::FluentBuilder as _, px, uniform_list,
 };
 use serde_json::json;
 
@@ -68,6 +69,8 @@ struct Search {
 pub(in crate::app) struct FileOverlay {
     pub(in crate::app) mode: OverlayMode,
     input: Entity<InputState>,
+    /// The dialog's focus trap: Tab and Shift+Tab cycle inside it, as the palette's do.
+    trap: FocusHandle,
     /// The palette's query when it opened this; Esc restores it.
     parent_query: Option<String>,
     target: Option<ProjectTarget>,
@@ -151,10 +154,11 @@ impl Workspace {
                 this.run_file_search(cx);
             }
         });
+        let trap = cx.focus_handle();
         if target.is_some() {
             input.update(cx, |input, cx| input.focus(window, cx));
         } else {
-            self.focus.focus(window, cx);
+            trap.focus(window, cx);
         }
         let endpoint = target.as_ref().and_then(|t| self.env_endpoint(&t.checkout.env).cloned());
         let (access, access_task) = match endpoint {
@@ -177,6 +181,7 @@ impl Workspace {
         self.files.overlay = Some(FileOverlay {
             mode,
             input,
+            trap,
             parent_query,
             target,
             access,
@@ -198,6 +203,25 @@ impl Workspace {
         });
         self.run_file_search(cx);
         cx.notify();
+    }
+
+    /// `useActiveProjectTarget` is live on the web: after navigating, the search answers for the
+    /// new checkout. The file picker keeps its query; the content search remounts on the new key.
+    fn retarget_file_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(overlay) = &self.files.overlay else { return };
+        if overlay.target == self.project_target() {
+            return;
+        }
+        let (mode, parent_query) = (overlay.mode, overlay.parent_query.clone());
+        let query = (mode == OverlayMode::Files).then(|| overlay.query(cx));
+        self.open_file_overlay(mode, parent_query, window, cx);
+        if let Some(query) = query.filter(|q| !q.is_empty())
+            && let Some(overlay) = &self.files.overlay
+        {
+            let input = overlay.input.clone();
+            input.update(cx, |input, cx| input.set_value(query, window, cx));
+            self.run_file_search(cx);
+        }
     }
 
     pub(in crate::app) fn close_file_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -338,7 +362,9 @@ impl Workspace {
 
     /// Opens the highlighted row: a file, or a hit at its line.
     fn open_overlay_selection(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(overlay) = &self.files.overlay else { return };
+        let Some(overlay) = self.files.overlay.as_ref().filter(|o| o.target == self.project_target()) else {
+            return;
+        };
         let opened = match overlay.mode {
             OverlayMode::Files => overlay.picks.get(index).map(|pick| (pick.path.clone(), None)),
             OverlayMode::Content => {
@@ -359,8 +385,11 @@ impl Workspace {
             OverlayMode::Files => overlay.picks.len(),
             OverlayMode::Content => overlay.matches.len(),
         };
+        // The web's input owns the list keys; a focused option toggle takes Enter itself.
+        let in_input = overlay.input.focus_handle(cx).is_focused(window);
         match event.keystroke.key.as_str() {
             "escape" => self.file_overlay_back(window, cx),
+            "up" | "down" | "enter" if !in_input => return,
             "up" | "down" if count > 0 => {
                 overlay.highlight = if event.keystroke.key == "down" {
                     (overlay.highlight + 1) % count
@@ -393,6 +422,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
+        self.retarget_file_overlay(window, cx);
         let overlay = self.files.overlay.as_ref()?;
         let tokens = *crate::theme::tokens(cx);
         let (fg, muted) = (tokens.foreground, tokens.muted_foreground);
@@ -463,6 +493,7 @@ impl Workspace {
             .child(hint(&["Enter"], "Open file"))
             .child(hint(&["Esc"], "Back"));
         let height = window.viewport_size().height;
+        let trap = overlay.trap.clone();
         let panel = v_flex()
             .id("file-overlay")
             .w_full()
@@ -484,7 +515,8 @@ impl Workspace {
             )
             .child(input_row)
             .child(div().flex_1().min_h_0().flex().flex_col().child(body))
-            .child(footer);
+            .child(footer)
+            .focus_trap("file-overlay-trap", &trap);
         Some(
             div()
                 .id("file-overlay-backdrop")
@@ -565,6 +597,7 @@ impl Workspace {
                       option: fn(&mut FileOverlay) -> &mut bool| {
             div()
                 .id(id)
+                .when(enabled, |el| crate::app::chat::focusable(el, tokens))
                 .h(px(24.))
                 .min_w(px(28.))
                 .px(px(6.))

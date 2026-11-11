@@ -1,6 +1,7 @@
 //! The lines at the end of the timeline (`ThreadNow.tsx`, `ThreadStatusLine.tsx`) and
 //! their actions (`useThreadLifecycle.tsx`, `useForceStopThread.ts`).
 
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -15,8 +16,10 @@ use gpui_kit::{
 };
 use serde_json::{Value, json};
 
-use super::{Target, Workspace, new_id};
+use super::side_chat::ChatPane;
+use super::{Workspace, new_id};
 use crate::inbox::{self, Facts};
+use crate::model::{ScopedId, ThreadShell};
 use crate::theme::Tokens;
 use crate::thread_now::{self, NowLine, StatusLine};
 use crate::timeline::Row;
@@ -24,39 +27,73 @@ use crate::timeline::Row;
 /// `BACKGROUND_WORK_STOP_RETRY_AFTER_MS`: the Claude adapter forces a stuck query closed after 10 s.
 const BACKGROUND_STOP_RETRY: Duration = Duration::from_secs(10);
 
+/// A thread's environment and id; ids repeat across environments.
+type Key = (SharedString, String);
+
 #[derive(Default)]
 pub(super) struct NowUi {
+    /// The open thread's footer; a side chat's is on its view.
+    main: NowFooter,
+    /// Threads a Force stop is in flight for.
+    force_stopping: HashSet<Key>,
+    /// The background Stops sent, by thread; each stays pending while its tasks run.
+    background_stops: HashMap<Key, BackgroundStop>,
+    /// Threads a wake or un-settle is in flight for.
+    status_busy: HashSet<Key>,
+}
+
+/// One chat's footer lines and the clock that moves their labels.
+#[derive(Default)]
+pub(super) struct NowFooter {
     lines: Vec<Rc<NowLine>>,
-    /// The thread a Force stop is in flight for.
-    force_stopping: Option<String>,
-    /// The thread and tasks a background Stop was sent for; it stays pending while they run.
-    background_stop: Option<(String, Vec<String>, bool)>,
-    /// A wake or un-settle in flight, by thread.
-    status_busy: Option<String>,
     _clock: Option<Task<()>>,
+}
+
+struct BackgroundStop {
+    task_ids: Vec<String>,
+    accepted: bool,
     _retry: Option<Task<()>>,
 }
 
+impl NowUi {
+    /// `isBackgroundWorkStopPending` for one thread, given the tasks its shell still lists: an
+    /// accepted Stop stays pending while its tasks run.
+    fn background_stop_pending<'a>(&self, key: &Key, listed: impl IntoIterator<Item = &'a str>) -> bool {
+        let Some(stop) = self.background_stops.get(key) else { return false };
+        !stop.accepted || listed.into_iter().any(|task| stop.task_ids.iter().any(|id| id == task))
+    }
+}
+
 impl Workspace {
-    /// The open thread's lines, in the web's order: what needs you, its work, its goal, its status.
-    fn now_lines(&self) -> Vec<Rc<NowLine>> {
-        let (Some(Target::Thread { id: thread_id, .. }), Some(projection)) =
-            (&self.target, self.thread.as_ref().and_then(|t| t.state.projection.as_ref()))
-        else {
+    fn now_shell(&self, (env, thread_id): &Key) -> Option<&ThreadShell> {
+        self.shell.thread(&ScopedId::new(env.clone(), thread_id))
+    }
+
+    fn now_footer_mut(&mut self, pane: ChatPane) -> Option<&mut NowFooter> {
+        match pane {
+            ChatPane::Main => Some(&mut self.now.main),
+            ChatPane::Side => self.side_chat.view.as_mut().map(|view| &mut view.now),
+        }
+    }
+
+    /// The pane's lines, in the web's order: what needs you, its work, its goal, its status.
+    fn now_lines(&self, pane: ChatPane) -> Vec<Rc<NowLine>> {
+        let (Some(key), Some(projection)) = (self.pane_thread(pane), self.pane_projection(pane)) else {
             return Vec::new();
         };
-        let Some(shell) = self.shell.threads.iter().find(|t| &t.id == thread_id) else { return Vec::new() };
+        let Some(shell) = self.now_shell(&key) else { return Vec::new() };
+        let (env, thread_id) = (&key.0, &key.1);
         let working = projection.is_running();
         let stop = thread_now::run_stop(&projection.runs, &projection.turn_items);
         // The interrupt path also accepts a completed run while its provider still has background work.
         let tasks = if working { &[][..] } else { &shell.pending_background_tasks[..] };
         let stop = stop.filter(|stop| !stop.background || !tasks.is_empty());
-        let children = inbox::child_thread_inputs(&self.shell.threads, thread_id);
+        let children = inbox::child_thread_inputs(&self.shell.threads, env, thread_id);
         let parent_awaiting = shell.pending_runtime_request.is_some() || !projection.pending_approvals().is_empty();
         let child_input = (!children.is_empty() && !parent_awaiting).then(|| NowLine::ChildInput {
             title: thread_now::child_inputs_title(&children).into(),
             approvals: thread_now::has_pending_approval(children[0]),
-            children: children.iter().map(|c| (c.id.clone().into(), c.title.clone().into())).collect(),
+            children: children.iter().map(|c| (ScopedId::of_thread(c), c.title.clone().into())).collect(),
         });
         let background = thread_now::background_work(tasks, &projection.turn_items).map(NowLine::Background);
         let (attention, work) = match stop {
@@ -68,12 +105,12 @@ impl Workspace {
         let now = super::sidebar::now_ms();
         let facts = Facts::new(shell, &Default::default());
         let status = if facts.is_snoozed(now) {
-            // The usage-limit notice shows this snooze and its Wake now.
+            // The open thread's usage-limit notice shows this snooze and its Wake now.
             shell
                 .snoozed_until
                 .as_deref()
                 .and_then(crate::timestamp::parse_ms)
-                .filter(|_| !self.limit_recovery_holds_snooze())
+                .filter(|_| pane == ChatPane::Side || !self.limit_recovery_holds_snooze())
                 .map(|until_ms| StatusLine::Snoozed { until_ms })
         } else if shell.settled_override.as_deref() == Some("settled") {
             Some(StatusLine::Settled { at_ms: shell.settled_at.as_deref().and_then(crate::timestamp::parse_ms) })
@@ -85,54 +122,70 @@ impl Workspace {
         [attention, work, goal, status.map(NowLine::Status)].into_iter().flatten().map(Rc::new).collect()
     }
 
-    /// The footer rows; also restarts the clock that moves their labels.
-    pub(super) fn now_rows(&mut self, cx: &mut Context<Self>) -> Vec<Row> {
-        let lines = self.now_lines();
-        if lines != self.now.lines {
-            self.now.lines = lines;
-            self.now._clock = None;
+    /// The pane's footer rows; also restarts the clock that moves their labels.
+    pub(super) fn now_rows(&mut self, pane: ChatPane, cx: &mut Context<Self>) -> Vec<Row> {
+        let lines = self.now_lines(pane);
+        let Some(footer) = self.now_footer_mut(pane) else { return Vec::new() };
+        if lines != footer.lines {
+            footer.lines = lines;
+            footer._clock = None;
             let now = super::sidebar::now_ms();
-            let next = self.now.lines.iter().find_map(|line| match line.as_ref() {
+            let next = footer.lines.iter().find_map(|line| match line.as_ref() {
                 NowLine::Status(status) => status.label(now).1,
                 _ => None,
             });
             if let Some(delay) = next {
-                self.now._clock = Some(cx.spawn(async move |this, cx| {
+                // A side chat's clock goes with its view, so it never refreshes another thread.
+                footer._clock = Some(cx.spawn(async move |this, cx| {
                     cx.background_executor().timer(Duration::from_millis(delay.max(1000).unsigned_abs())).await;
                     let _ = this.update(cx, |this, cx| {
-                        this.now.lines.clear();
-                        this.refresh_rows(cx);
+                        if let Some(footer) = this.now_footer_mut(pane) {
+                            footer.lines.clear();
+                        }
+                        this.refresh_pane_rows(pane, cx);
                         cx.notify();
                     });
                 }));
             }
         }
-        self.now.lines.iter().map(|line| Row::Now(line.clone())).collect()
+        footer.lines.iter().map(|line| Row::Now(line.clone())).collect()
     }
 
-    /// Recomputes the footer after a shell update and splices it in when it changed, or when the
+    /// Recomputes the footers after a shell update and splices one in when it changed, or when the
     /// recovery notice moved to another run and the limit rows it hides change with it.
     pub(super) fn sync_now(&mut self, cx: &mut Context<Self>) {
-        if self.now_lines() != self.now.lines || self.usage_limit_notice_run() != self.rows_notice_run {
+        if self.now_lines(ChatPane::Main) != self.now.main.lines
+            || self.usage_limit_notice_run() != self.rows_notice_run
+        {
             self.refresh_rows(cx);
         }
+        if self.side_chat.view.as_ref().is_some_and(|view| self.now_lines(ChatPane::Side) != view.now.lines) {
+            self.refresh_side_chat_rows(cx);
+        }
+    }
+
+    /// `canForceStop`: the environment supports it and this connection may operate there.
+    fn can_force_stop(&self, environment: &str) -> bool {
+        self.server_info().capability("threadForceStop")
+            && self.env_permits(environment, "orchestration.forceStopThread", &Value::Null)
     }
 
     /// `useForceStopThread`: for an agent that no longer answers Stop.
-    fn force_stop(&mut self, run_id: SharedString, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(client), Some(Target::Thread { id: thread_id, .. })) = (self.client(), self.target.clone()) else {
-            return;
-        };
-        if !self.server_info().capability("threadForceStop") || self.now.force_stopping.is_some() {
+    fn force_stop(&mut self, pane: ChatPane, run_id: SharedString, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((client, env, thread_id)) = self.pane_client(pane, cx) else { return };
+        if !self.can_force_stop(&env) {
             return;
         }
-        self.now.force_stopping = Some(thread_id.clone());
+        let key = (env, thread_id.clone());
+        if !self.now.force_stopping.insert(key.clone()) {
+            return;
+        }
         cx.notify();
         let input = json!({"threadId": thread_id, "runId": run_id});
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("orchestration.forceStopThread", input).await;
             let _ = this.update_in(cx, |this, window, cx| {
-                this.now.force_stopping = None;
+                this.now.force_stopping.remove(&key);
                 match result {
                     Err(error) => window.push_notification(
                         Notification::error(error.to_string()).title("Could not force stop the agent"),
@@ -151,41 +204,47 @@ impl Workspace {
     }
 
     /// Stops the background work a finished run left running (`handleStopBackgroundWork`).
-    fn stop_background_work(&mut self, cx: &mut Context<Self>) {
-        let Some(Target::Thread { id: thread_id, .. }) = self.target.clone() else { return };
-        if self.background_stop_pending(&thread_id) {
+    fn stop_background_work(&mut self, pane: ChatPane, cx: &mut Context<Self>) {
+        let Some(key) = self.pane_thread(pane) else { return };
+        if self.background_stop_pending(&key) {
             return;
         }
-        let Some(shell) = self.shell.threads.iter().find(|t| t.id == thread_id) else { return };
+        let Some(shell) = self.now_shell(&key) else { return };
+        let (env, thread_id) = key.clone();
         let task_ids = shell.pending_background_tasks.iter().map(|t| t.task_id.clone()).collect();
         let command = if self.server_info().capability("threadStop") {
             json!({"type": "thread.stop", "commandId": new_id(), "threadId": thread_id})
         } else {
-            let Some(run) = self.open_projection().and_then(|p| p.runs.last()) else { return };
+            let Some(run) = self.pane_projection(pane).and_then(|p| p.runs.last()) else { return };
             json!({"type": "run.interrupt", "commandId": new_id(), "threadId": thread_id, "runId": run.id, "holdQueue": true})
         };
-        let Some(client) = self.client() else { return };
-        self.now.background_stop = Some((thread_id.clone(), task_ids, false));
+        let Some((client, ..)) = self.pane_client(pane, cx) else { return };
+        let stop = BackgroundStop { task_ids, accepted: false, _retry: None };
+        self.now.background_stops.insert(key.clone(), stop);
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = client.request("orchestration.dispatchCommand", command).await;
             let _ = this.update(cx, |this, cx| {
                 match result {
                     Err(error) => {
-                        this.now.background_stop = None;
-                        this.error = Some(error.to_string().into());
+                        this.now.background_stops.remove(&key);
+                        if this.pane_shows(pane, &env, &thread_id) {
+                            this.error = Some(error.to_string().into());
+                        }
                     }
                     Ok(_) => {
-                        if let Some(stop) = this.now.background_stop.as_mut() {
-                            stop.2 = true;
-                        }
-                        this.now._retry = Some(cx.spawn(async move |this, cx| {
+                        let retry_key = key.clone();
+                        let retry = cx.spawn(async move |this, cx| {
                             cx.background_executor().timer(BACKGROUND_STOP_RETRY).await;
                             let _ = this.update(cx, |this, cx| {
-                                this.now.background_stop = None;
+                                this.now.background_stops.remove(&retry_key);
                                 cx.notify();
                             });
-                        }));
+                        });
+                        if let Some(stop) = this.now.background_stops.get_mut(&key) {
+                            stop.accepted = true;
+                            stop._retry = Some(retry);
+                        }
                     }
                 }
                 cx.notify();
@@ -194,25 +253,18 @@ impl Workspace {
         .detach();
     }
 
-    /// `isBackgroundWorkStopPending`: an accepted Stop stays pending while its tasks are listed.
-    fn background_stop_pending(&self, thread_id: &str) -> bool {
-        let Some((stopped, task_ids, accepted)) = &self.now.background_stop else { return false };
-        if stopped != thread_id {
-            return false;
-        }
-        let tasks = self.shell.threads.iter().find(|t| t.id == thread_id).map(|t| &t.pending_background_tasks[..]);
-        !accepted || tasks.unwrap_or_default().iter().any(|task| task_ids.contains(&task.task_id))
+    fn background_stop_pending(&self, key: &Key) -> bool {
+        let tasks = self.now_shell(key).map(|t| &t.pending_background_tasks[..]);
+        self.now.background_stop_pending(key, tasks.unwrap_or_default().iter().map(|t| t.task_id.as_str()))
     }
 
     /// `sendStandaloneCommand`: a `/goal` command sent as its own message.
-    fn send_goal_command(&mut self, text: &'static str, failure: &'static str, cx: &mut Context<Self>) {
-        let (Some(client), Some(Target::Thread { id: thread_id, .. })) = (self.client(), self.target.clone()) else {
-            return;
-        };
-        if self.sending {
+    fn send_goal_command(&mut self, pane: ChatPane, text: &'static str, failure: &'static str, cx: &mut Context<Self>) {
+        if self.pane_sending(pane) {
             return;
         }
-        let running = self.open_projection().is_some_and(super::super::model::ThreadProjection::is_running);
+        let Some((client, env, thread_id)) = self.pane_client(pane, cx) else { return };
+        let running = self.pane_projection(pane).is_some_and(super::super::model::ThreadProjection::is_running);
         let mut command = json!({
             "type": "message.dispatch",
             "commandId": new_id(),
@@ -225,13 +277,15 @@ impl Workspace {
             "dispatchMode": {"type": "start_immediately"},
             "deliveryIntent": if running { "steer" } else { "auto" },
         });
-        if let Some(model) = &self.model_override {
+        if let Some(model) = self.pane_model(pane) {
             command["modelSelection"] = model.to_json();
         }
         cx.spawn(async move |this, cx| {
             if client.request("orchestration.dispatchCommand", command).await.is_err() {
                 let _ = this.update(cx, |this, cx| {
-                    this.error = Some(failure.into());
+                    if this.pane_shows(pane, &env, &thread_id) {
+                        this.error = Some(failure.into());
+                    }
                     cx.notify();
                 });
             }
@@ -240,14 +294,14 @@ impl Workspace {
     }
 
     /// Wake now / Un-settle from the status line, with the web's failure toasts.
-    fn change_status(&mut self, kind: &'static str, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(client), Some(Target::Thread { id: thread_id, .. })) = (self.client(), self.target.clone()) else {
-            return;
-        };
-        if self.now.status_busy.is_some() {
+    fn change_status(&mut self, pane: ChatPane, kind: &'static str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((client, env, thread_id)) = self.pane_client(pane, cx) else { return };
+        let key = (env, thread_id);
+        if self.now.status_busy.contains(&key) {
             return;
         }
-        let Some(shell) = self.shell.threads.iter().find(|t| t.id == thread_id) else { return };
+        let Some(shell) = self.now_shell(&key) else { return };
+        let thread_id = &key.1;
         // A snooze the usage-limit recovery set is undone through the recovery itself.
         let recovery = shell.limit_recovery.as_ref();
         let recovery_snooze = kind == "thread.unsnooze"
@@ -263,12 +317,12 @@ impl Workspace {
             None => json!({"type": kind, "commandId": new_id(), "threadId": thread_id, "reason": "user"}),
         };
         let title = if kind == "thread.unsnooze" { "Failed to wake thread" } else { "Failed to un-settle thread" };
-        self.now.status_busy = Some(thread_id);
+        self.now.status_busy.insert(key.clone());
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("orchestration.dispatchCommand", command).await;
             let _ = this.update_in(cx, |this, window, cx| {
-                this.now.status_busy = None;
+                this.now.status_busy.remove(&key);
                 if let Err(error) = result {
                     window.push_notification(Notification::error(error.to_string()).title(title), cx);
                 }
@@ -279,11 +333,11 @@ impl Workspace {
     }
 
     /// `useAcknowledgeThreadWoke`: marks the thread visited at the time it woke.
-    fn acknowledge_open_thread_woke(&mut self, woke_at: SharedString, cx: &mut Context<Self>) {
-        let Some(Target::Thread { id: thread_id, .. }) = self.target.clone() else { return };
+    fn acknowledge_pane_woke(&mut self, pane: ChatPane, woke_at: SharedString, cx: &mut Context<Self>) {
+        let Some((client, _, thread_id)) = self.pane_client(pane, cx) else { return };
         let command =
             json!({"type": "thread.visit", "commandId": new_id(), "threadId": thread_id, "visitedAt": woke_at});
-        self.dispatch(command, cx);
+        self.dispatch_in_order(client, vec![command], cx);
     }
 }
 
@@ -404,6 +458,7 @@ fn notice_details(title: SharedString, detail: Option<String>, t: &Tokens) -> An
 /// One `ThreadNowLine` or `ThreadStatusLine`: icon, title and detail, then actions.
 pub(super) fn now_row(
     line: &NowLine,
+    pane: ChatPane,
     this: &WeakEntity<Workspace>,
     lane_width: f32,
     t: &Tokens,
@@ -412,21 +467,20 @@ pub(super) fn now_row(
 ) -> AnyElement {
     let Some(workspace) = this.upgrade() else { return div().into_any_element() };
     let workspace = workspace.read(cx);
-    let thread_id = match &workspace.target {
-        Some(Target::Thread { id, .. }) => id.clone(),
-        _ => String::new(),
-    };
+    let key = workspace.pane_thread(pane).unwrap_or_default();
     let (fg, muted) = (t.foreground, t.muted_foreground);
-    let act = |f: fn(&mut Workspace, &mut Window, &mut Context<Workspace>)| {
+    let act = |f: fn(&mut Workspace, ChatPane, &mut Window, &mut Context<Workspace>)| {
         let this = this.clone();
         move |window: &mut Window, cx: &mut App| {
-            let _ = this.update(cx, |workspace, cx| f(workspace, window, cx));
+            let _ = this.update(cx, |workspace, cx| f(workspace, pane, window, cx));
         }
     };
-    let open = |id: SharedString| {
+    let open = |child: ScopedId| {
         let this = this.clone();
         move |window: &mut Window, cx: &mut App| {
-            let _ = this.update(cx, |workspace, cx| workspace.select_thread(id.to_string(), window, cx));
+            let _ = this.update(cx, |workspace, cx| {
+                workspace.select_thread_in(child.env.clone(), child.id.clone(), window, cx);
+            });
         }
     };
     let mut actions: Vec<AnyElement> = Vec::new();
@@ -443,7 +497,7 @@ pub(super) fn now_row(
                 h_flex().flex_wrap().gap(px(4.)).children(children.iter().enumerate().map(|(index, (id, name))| {
                     let label = if index + 1 < children.len() { format!("{name},") } else { name.to_string() };
                     inline_button(
-                        ElementId::Name(format!("now-child:{id}").into()),
+                        ElementId::Name(format!("now-child:{}:{}", id.env, id.id).into()),
                         label,
                         muted,
                         fg,
@@ -461,15 +515,15 @@ pub(super) fn now_row(
         }
         NowLine::RunStop(stop) => {
             actions.push(clock(stop.requested_at_ms, &mut texts));
-            if stop.unresponsive && workspace.server_info().capability("threadForceStop") {
-                let stopping = workspace.now.force_stopping.as_deref() == Some(thread_id.as_str());
+            if stop.unresponsive && workspace.can_force_stop(&key.0) {
+                let stopping = workspace.now.force_stopping.contains(&key);
                 let run_id = stop.run_id.clone();
                 let this = this.clone();
                 let label = if stopping { "Force stopping..." } else { "Force stop" };
                 texts.push((label.into(), FontWeight::MEDIUM));
                 actions.push(inline_button("now-force-stop", label, fg, fg, stopping, move |window, cx| {
                     let run_id = run_id.clone();
-                    let _ = this.update(cx, |workspace, cx| workspace.force_stop(run_id, window, cx));
+                    let _ = this.update(cx, |workspace, cx| workspace.force_stop(pane, run_id, window, cx));
                 }));
             }
             if stop.unresponsive {
@@ -487,11 +541,13 @@ pub(super) fn now_row(
             if let Some(start_ms) = work.started_at_ms {
                 actions.push(clock(start_ms, &mut texts));
             }
+            // A provider's background subagent lives on its parent's environment.
             if let Some(child) = &work.open_thread {
                 texts.push(("Open".into(), FontWeight::MEDIUM));
-                actions.push(inline_button("now-open-background", "Open", muted, fg, false, open(child.clone())));
+                let child = ScopedId::new(key.0.clone(), child.as_ref());
+                actions.push(inline_button("now-open-background", "Open", muted, fg, false, open(child)));
             }
-            let stopping = workspace.background_stop_pending(&thread_id);
+            let stopping = workspace.background_stop_pending(&key);
             let label = if stopping { "Stopping..." } else { "Stop" };
             texts.push((label.into(), FontWeight::MEDIUM));
             actions.push(inline_button(
@@ -500,13 +556,14 @@ pub(super) fn now_row(
                 fg,
                 fg,
                 stopping,
-                act(|w, _, cx| w.stop_background_work(cx)),
+                act(|w, pane, _, cx| w.stop_background_work(pane, cx)),
             ));
             let icon = if work.commands_only { IconName::Terminal } else { IconName::CircleDashed };
             (icon, muted, work.title.clone(), work.description.clone().map(|d| div().child(d).into_any_element()))
         }
         NowLine::Goal(goal) => {
-            let working = workspace.open_projection().is_some_and(super::super::model::ThreadProjection::is_running);
+            let working =
+                workspace.pane_projection(pane).is_some_and(super::super::model::ThreadProjection::is_running);
             if goal.can_resume && !working {
                 texts.extend([("Resume".into(), FontWeight::MEDIUM), ("·".into(), FontWeight::NORMAL)]);
                 actions.push(inline_button(
@@ -515,7 +572,7 @@ pub(super) fn now_row(
                     fg,
                     fg,
                     false,
-                    act(|w, _, cx| w.send_goal_command("/goal resume", "Failed to resume goal.", cx)),
+                    act(|w, pane, _, cx| w.send_goal_command(pane, "/goal resume", "Failed to resume goal.", cx)),
                 ));
                 actions.push(div().child("·").into_any_element());
             }
@@ -526,12 +583,12 @@ pub(super) fn now_row(
                 muted,
                 fg,
                 false,
-                act(|w, _, cx| w.send_goal_command("/goal clear", "Failed to clear goal.", cx)),
+                act(|w, pane, _, cx| w.send_goal_command(pane, "/goal clear", "Failed to clear goal.", cx)),
             ));
             (IconName::Target, muted, goal.title.clone(), Some(div().child(goal.objective.clone()).into_any_element()))
         }
         NowLine::Status(status) => {
-            let busy = workspace.now.status_busy.as_deref() == Some(thread_id.as_str());
+            let busy = workspace.now.status_busy.contains(&key);
             let (label, _) = status.label(super::sidebar::now_ms());
             let (icon, action): (IconName, AnyElement) = match status {
                 StatusLine::Snoozed { .. } => (
@@ -542,7 +599,7 @@ pub(super) fn now_row(
                         fg,
                         fg,
                         busy,
-                        act(|w, window, cx| w.change_status("thread.unsnooze", window, cx)),
+                        act(|w, pane, window, cx| w.change_status(pane, "thread.unsnooze", window, cx)),
                     ),
                 ),
                 StatusLine::Settled { .. } => (
@@ -553,7 +610,7 @@ pub(super) fn now_row(
                         fg,
                         fg,
                         busy,
-                        act(|w, window, cx| w.change_status("thread.unsettle", window, cx)),
+                        act(|w, pane, window, cx| w.change_status(pane, "thread.unsettle", window, cx)),
                     ),
                 ),
                 StatusLine::Woke { woke_at } => {
@@ -562,7 +619,7 @@ pub(super) fn now_row(
                         IconName::AlarmClock,
                         inline_button("now-status", "Dismiss", fg, fg, false, move |_, cx| {
                             let woke_at = woke_at.clone();
-                            let _ = this.update(cx, |w, cx| w.acknowledge_open_thread_woke(woke_at, cx));
+                            let _ = this.update(cx, |w, cx| w.acknowledge_pane_woke(pane, woke_at, cx));
                         }),
                     )
                 }
@@ -621,4 +678,23 @@ pub(super) fn now_row(
             .when(!actions.is_empty(), |row| row.child(h_flex().flex_none().ml(px(6.)).gap(px(10.)).children(actions))),
     )
     .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn background_stops_are_pending_per_thread() {
+        let mut ui = NowUi::default();
+        let key = |env: &str, id: &str| (SharedString::from(env.to_owned()), id.to_owned());
+        let stop = |accepted| BackgroundStop { task_ids: vec!["t1".into()], accepted, _retry: None };
+        ui.background_stops.insert(key("a", "main"), stop(true));
+        ui.background_stops.insert(key("a", "side"), stop(false));
+        assert!(ui.background_stop_pending(&key("a", "main"), ["t1"]), "its task still runs");
+        assert!(!ui.background_stop_pending(&key("a", "main"), ["t2"]), "its tasks ended");
+        assert!(ui.background_stop_pending(&key("a", "side"), []), "not accepted yet");
+        assert!(!ui.background_stop_pending(&key("a", "other"), ["t1"]), "another thread's Stop is not this one's");
+        assert!(!ui.background_stop_pending(&key("b", "side"), []), "nor is the same id's on another environment");
+    }
 }

@@ -90,10 +90,10 @@ use super::{
 use crate::linux::{
     DOUBLE_CLICK_INTERVAL, LinuxCommon, LinuxKeyboardLayout, PIPE_READ_TIMEOUT, SCROLL_LINES,
     capslock_from_xkb, cursor_style_to_icon_names, get_xkb_compose_state, is_within_click_distance,
-    keystroke_from_xkb, keystroke_underlying_dead_key, modifiers_from_xkb, new_xkb_context,
-    open_uri_internal, read_fd_with_timeout, reveal_path_internal,
+    keystroke_from_xkb, keystroke_underlying_dead_key, modifiers_from_xkb, native_key_from_xkb,
+    new_xkb_context, open_uri_internal, read_fd_with_timeout, reveal_path_internal,
     wayland::{
-        clipboard::{Clipboard, DataOffer, FILE_LIST_MIME_TYPE, TEXT_MIME_TYPES},
+        clipboard::{Clipboard, DataOffer, FILE_LIST_MIME_TYPE, HTML_MIME_TYPE, TEXT_MIME_TYPES},
         cursor::Cursor,
         serial::{ActivationContext, Serial, SerialKind, SerialTracker},
         to_shape,
@@ -105,10 +105,10 @@ use gpui::{
     AnyWindowHandle, Bounds, Capslock, CursorStyle, DevicePixels, ExternalDragPayload,
     FileDragPaths, FileDropEvent, ForegroundExecutor, GraphicalEnvironment, KeyDownEvent,
     KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent,
-    MouseExitEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, Pixels, PlatformDisplay,
-    PlatformFrameSignal, PlatformInput, PlatformKeyboardLayout, PlatformWindow, Point, ScrollDelta,
-    ScrollEvent, ScrollSource, SharedString, Size, TouchPhase, WindowButtonLayout, WindowKind,
-    WindowParams, point, px, size,
+    MouseExitEvent, MouseMoveEvent, MouseUpEvent, NativeKey, NavigationDirection, Pixels,
+    PlatformDisplay, PlatformFrameSignal, PlatformInput, PlatformKeyboardLayout, PlatformWindow,
+    Point, ScrollDelta, ScrollEvent, ScrollSource, SharedString, Size, TouchPhase,
+    WindowButtonLayout, WindowKind, WindowParams, point, px, size,
 };
 use gpui_wgpu::{CompositorGpuHint, GpuContext};
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
@@ -394,6 +394,8 @@ pub(crate) struct WaylandClientState {
     repeat: KeyRepeat,
     pub modifiers: Modifiers,
     pub capslock: Capslock,
+    /// What the last key event said about its key besides the keystroke.
+    pub native_key: NativeKey,
     axis_source: AxisSource,
     pub mouse_location: Option<Point<Pixels>>,
     continuous_scroll_delta: Option<Point<Pixels>>,
@@ -1117,6 +1119,7 @@ impl WaylandConnection {
                 platform: false,
             },
             capslock: Capslock { on: false },
+            native_key: NativeKey::default(),
             scroll_event_received: false,
             axis_source: AxisSource::Wheel,
             mouse_location: None,
@@ -1468,6 +1471,7 @@ impl WaylandConnection {
             return;
         };
         if state.mouse_focused_window.is_some() || state.keyboard_focused_window.is_some() {
+            let offers_html = item.html().is_some();
             state.clipboard.set(item);
             let Some(serial) = state.serial_tracker.selection_serial() else {
                 log::warn!(
@@ -1479,6 +1483,9 @@ impl WaylandConnection {
                 .create_data_source(&state.globals.qh, DataSourceKind::Clipboard);
             for mime_type in TEXT_MIME_TYPES {
                 data_source.offer(mime_type.to_string());
+            }
+            if offers_html {
+                data_source.offer(HTML_MIME_TYPE.to_string());
             }
             data_source.offer(state.clipboard.self_mime());
             data_device.set_selection(Some(&data_source), serial.as_raw());
@@ -2178,11 +2185,13 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                 let keymap_state = state.keymap_state.as_ref().unwrap();
                 let keycode = Keycode::from(key + MIN_KEYCODE);
                 let keysym = keymap_state.key_get_one_sym(keycode);
+                let native_key = native_key_from_xkb(keymap_state, keycode);
 
                 match key_state {
                     wl_keyboard::KeyState::Pressed if !keysym.is_modifier_key() => {
                         let mut keystroke =
                             keystroke_from_xkb(keymap_state, state.modifiers, keycode);
+                        state.native_key = native_key;
                         if let Some(mut compose) = state.compose_state.take() {
                             compose.feed(keysym);
                             match compose.status() {
@@ -2261,6 +2270,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                                         state.keyboard_focused_window.as_ref().unwrap().clone();
 
                                     drop(state);
+                                    client.borrow_mut().native_key = native_key;
                                     focused_window.handle_input(input.clone());
 
                                     // If the new scheduled time is in the past the event will repeat as soon as possible
@@ -2276,6 +2286,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                         let input = PlatformInput::KeyUp(KeyUpEvent {
                             keystroke: keystroke_from_xkb(keymap_state, state.modifiers, keycode),
                         });
+                        state.native_key = native_key;
 
                         if state.repeat.current_keycode == Some(keycode) {
                             state.repeat.current_keycode = None;
@@ -2319,6 +2330,7 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for WaylandClientStatePtr {
                 };
 
                 if let Some(commit_text) = text {
+                    state.native_key = NativeKey::default();
                     drop(state);
                     // IBus Intercepts keys like `a`, `b`, but those keys are needed for vim mode.
                     // We should only send ASCII characters to Zed, otherwise a user could remap a letter like `か` or `相`.

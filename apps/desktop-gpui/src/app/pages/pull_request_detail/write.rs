@@ -75,20 +75,27 @@ pub(in crate::app) struct ReviewDraft {
     next_id: u64,
 }
 
-/// A line comment being written under its line in the Code tab.
+/// A line comment being written under its line in the Code tab or a guide excerpt.
 pub(super) struct LineDraft {
     pub(super) path: String,
     old_path: Option<String>,
     position: Position,
     start: Option<Position>,
+    /// The picked lines as picked, which a handoff to an agent quotes whole.
+    pub(super) picked: (Point, Point),
+    /// The guide excerpt it was opened under; `None` in the Code tab.
+    pub(super) excerpt: Option<String>,
     input: Entity<TextareaState>,
 }
 
 impl LineDraft {
-    pub(super) fn anchor(&self) -> (crate::pull_request_diff::Side, u64) {
+    pub(super) fn anchor(&self) -> Point {
         self.position.anchor()
     }
 }
+
+/// A diff line: its side and number.
+pub(super) type Point = (crate::pull_request_diff::Side, u64);
 
 /// An edit in progress: a comment (`kind` is its endpoint) or the description.
 struct Editing {
@@ -108,6 +115,8 @@ struct Picker {
     kind: PickerKind,
     search: Entity<InputState>,
     candidates: Option<Result<Value, String>>,
+    /// The candidates read in flight; a newer read replaces it, so an older answer never lands last.
+    _candidates: Option<Task<()>>,
     pending: Option<String>,
     /// The reviewer query once typing settles.
     debounced: String,
@@ -115,6 +124,8 @@ struct Picker {
     /// The host's answers past the first page, by query (`reviewerSearch`), and those in flight.
     searches: HashMap<String, Result<Value, String>>,
     searching: HashSet<String>,
+    /// Bumped when a pick makes the searches stale, so one still in flight is dropped.
+    searches_epoch: u64,
     /// The candidate the arrow keys rest on, which Enter picks; the first after each keystroke.
     highlight: Option<usize>,
     scroll: ScrollHandle,
@@ -140,7 +151,10 @@ pub(super) struct WriteState {
     replies: HashMap<String, Entity<TextareaState>>,
     editing: Option<Editing>,
     saving: bool,
-    thread_pending: bool,
+    /// The title's own save, apart from the description's and comments' (`PullRequestTitleEditor`).
+    title_saving: bool,
+    /// Conversations whose resolve or reply is in flight, each on its own like the web's cards.
+    thread_pending: HashSet<String>,
     /// Reactions pressed and not yet read back, by subject and content.
     pub(super) reactions: HashMap<(String, String), bool>,
     reaction_picker: Option<String>,
@@ -218,6 +232,19 @@ fn summary_shortcut_verdict(
 /// Forgejo needs a summary to request changes (`reviewSummaryRequired`).
 fn summary_required(provider: &str) -> bool {
     provider == "forgejo"
+}
+
+/// A conversation's Fix waits while that conversation's resolve or reply is in flight.
+fn finding_pending(write: &WriteState, finding: &logic::Finding) -> bool {
+    matches!(finding, logic::Finding::Thread(thread) if write.thread_pending.contains(&thread.id))
+}
+
+/// Where a line draft opens: path, old path, anchor, range start, picked lines and excerpt.
+type DraftPlace = (String, Option<String>, Position, Option<Position>, (Point, Point), Option<String>);
+
+/// `canCommentOnLines`: the host takes line comments and this viewer may write them.
+pub(super) fn pr_can_comment(detail: &Detail) -> bool {
+    detail.capabilities.review.inline_comment && detail.viewer_permissions.comment
 }
 
 fn text_of(input: &Entity<TextareaState>, cx: &App) -> String {
@@ -305,7 +332,20 @@ impl Workspace {
         cx: &mut Context<Self>,
         done: impl FnOnce(&mut Workspace, &str, bool, &mut Window, &mut Context<Workspace>) + 'static,
     ) {
-        let (Some(client), Some(key)) = (self.pull_request_client(), self.shown_pr_key()) else { return };
+        let Some(key) = self.shown_pr_key() else { return };
+        // Offline, the write fails like any other, so the caller's pending marks clear.
+        let Some(client) = self.pull_request_client() else {
+            toast_error(window, cx, failure, "The pull request's environment is not connected.");
+            done(self, &key, false, window, cx);
+            cx.notify();
+            return;
+        };
+        // The write grant can be lost while an editor or form stays open (`permissionAtom`).
+        if !self.pr_panel_permits(&key, method, Some(&input)) {
+            done(self, &key, false, window, cx);
+            cx.notify();
+            return;
+        }
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request(method, input).await;
             let _ = this.update_in(cx, |this, window, cx| {
@@ -807,38 +847,91 @@ impl Workspace {
         cx.notify();
     }
 
-    // Line comments in the Code tab.
+    // Line comments in the Code tab and the guide's excerpts.
 
-    /// `beginComment`: a line or selection gets a draft under its last line.
+    /// `beginComment` in the Code tab: a line or selection gets a draft under its last line.
     pub(super) fn begin_pr_line_comment(
         &mut self,
         path: String,
-        start: (crate::pull_request_diff::Side, u64),
-        end: (crate::pull_request_diff::Side, u64),
+        start: Point,
+        end: Point,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(panel) = self.pull_requests.panel.as_ref() else { return };
-        let Some(detail) = panel.detail.clone() else { return };
+        let Some(detail) = panel.detail.as_ref() else { return };
         let Some(code) = panel.code.as_ref() else { return };
-        if code.commit_selected() || panel.write.draft.is_some() {
-            return;
-        }
-        if !(detail.capabilities.review.inline_comment && detail.viewer_permissions.comment) {
+        if code.commit_selected() || panel.write.draft.is_some() || !pr_can_comment(detail) {
             return;
         }
         let ranged = detail.capabilities.review.range_comment == Some(true);
         let Some(file) = code.patch(&path) else { return };
         let old_path = file.old_path.clone().filter(|old| *old != path);
-        let Some((position, start)) = crate::pull_request_diff::review_anchor(file, start, end, ranged) else { return };
-        let input = cx.new(|cx| TextareaState::new(window, cx).rows(3).placeholder("Leave a comment"));
+        let Some((position, first)) = crate::pull_request_diff::review_anchor(file, start, end, ranged) else { return };
+        let draft = (path, old_path, position, first, (start, end), None);
+        self.open_pr_line_draft(draft, "Leave a comment", window, cx);
+    }
+
+    /// `ExcerptDiff`'s `beginComment`: lines picked in a guide excerpt get a draft that goes to
+    /// the review, or only to an agent when this viewer may not comment.
+    pub(super) fn begin_pr_excerpt_comment(
+        &mut self,
+        excerpt: String,
+        path: String,
+        picked: (Point, Point),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let can_ask = self.pr_can_ask();
+        let Some(panel) = self.pull_requests.panel.as_ref() else { return };
+        let Some(detail) = panel.detail.as_ref() else { return };
+        let can_comment = pr_can_comment(detail);
+        if panel.write.draft.is_some() || !(can_comment || can_ask) {
+            return;
+        }
+        let ranged = detail.capabilities.review.range_comment == Some(true);
+        let Some(file) = panel.guide_diff.file(&path) else { return };
+        let old_path = file.old_path.clone().filter(|old| *old != path);
+        let Some((position, first)) = crate::pull_request_diff::review_anchor(file, picked.0, picked.1, ranged) else {
+            return;
+        };
+        let placeholder = if can_comment { "Add a comment…" } else { "Ask the agent about these lines…" };
+        self.open_pr_line_draft((path, old_path, position, first, picked, Some(excerpt)), placeholder, window, cx);
+    }
+
+    fn open_pr_line_draft(
+        &mut self,
+        (path, old_path, position, start, picked, excerpt): DraftPlace,
+        placeholder: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = cx.new(|cx| TextareaState::new(window, cx).rows(3).placeholder(placeholder));
         input.update(cx, |input, cx| input.focus(window, cx));
-        let sub = watch(&input, Some(|this, _, cx| this.add_pr_line_comment(cx)), window, cx);
+        let sub = watch(&input, Some(Self::submit_pr_line_draft), window, cx);
         if let Some(write) = self.pr_write() {
-            write.draft = Some(LineDraft { path, old_path, position, start, input });
+            write.draft = Some(LineDraft { path, old_path, position, start, picked, excerpt, input });
             write._watch.extend(sub);
         }
         cx.notify();
+    }
+
+    pub(super) fn cancel_pr_line_draft(&mut self, cx: &mut Context<Self>) {
+        if let Some(write) = self.pr_write() {
+            write.draft = None;
+        }
+        cx.notify();
+    }
+
+    /// The draft's own submit: the review, or an agent where the viewer may only ask.
+    fn submit_pr_line_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(panel) = self.pull_requests.panel.as_ref() else { return };
+        let comments = panel.detail.as_ref().is_some_and(|d| pr_can_comment(d));
+        if comments {
+            self.add_pr_line_comment(cx);
+        } else if panel.write.draft.as_ref().is_some_and(|d| d.excerpt.is_some()) {
+            self.send_pr_draft_to_agent(window, cx);
+        }
     }
 
     fn add_pr_line_comment(&mut self, cx: &mut Context<Self>) {
@@ -864,26 +957,73 @@ impl Workspace {
         cx.notify();
     }
 
-    /// "Add to agent": the drafted lines and request go to a new thread instead of the review.
+    /// "Add to agent" and "Ask agent": the picked lines, quoted from the file's diff, and the
+    /// request go to an agent instead of the review (`finishSelection`, `askAgent`).
     fn send_pr_draft_to_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(draft) = self.pr_write().and_then(|w| w.draft.take()) else { return };
+        let Some(panel) = self.pull_requests.panel.as_ref() else { return };
+        let (Some(detail), Some(draft)) = (panel.detail.as_ref(), panel.write.draft.as_ref()) else { return };
         let request = text_of(&draft.input, cx);
-        let lines = match (draft.start.map(Position::anchor), draft.position.anchor()) {
-            (Some((_, from)), (_, to)) if from != to => format!("L{from}-L{to}"),
-            (_, (side, line)) => {
-                format!("L{line}{}", if side == crate::pull_request_diff::Side::Left { " (before)" } else { "" })
-            }
+        if request.trim().is_empty() {
+            return;
+        }
+        let ((start, end), number, path) = (draft.picked, detail.number, draft.path.as_str());
+        let (producer, section_id, section_title, file) = match &draft.excerpt {
+            None => (
+                format!("pull-request-selection:{path}:{}:{}", start.1, end.1),
+                format!("pull-request:{number}"),
+                format!("PR #{number} review"),
+                panel.code.as_ref().and_then(|code| code.patch(path)),
+            ),
+            Some(_) => (
+                format!("pull-request-guide:{path}:{}:{}", start.1, end.1),
+                format!("pull-request-guide:{path}"),
+                "Review guide".to_owned(),
+                panel.guide_diff.file(path),
+            ),
         };
-        self.add_pr_selection_to_agent(draft.path, lines, request, window, cx);
+        let section = crate::review_comment::Section { id: &section_id, title: &section_title };
+        let context_id = crate::composer_context::kind_scoped_id(crate::review_comment::KIND, &producer);
+        let rows = file.map(crate::pull_request_diff::file_rows).unwrap_or_default();
+        let record = crate::review_comment::diff_comment(&context_id, &section, path, &rows, start, end, &request);
+        let (keep_guide, key, input) = (draft.excerpt.is_some(), panel.reference.key(), draft.input.clone());
+        let Some(record) = record else {
+            toast_error(window, cx, "Could not add these lines", "The diff changed. Pick the lines again.");
+            return;
+        };
+        // Cleared only once the request landed: this tab's own draft, which may be parked by then.
+        if self.add_pr_selection_to_agent(record, &request, keep_guide, window, cx)
+            && let Some(write) = self.pr_write_of(&key).filter(|w| w.draft.as_ref().is_some_and(|d| d.input == input))
+        {
+            write.draft = None;
+            cx.notify();
+        }
     }
 
-    /// `DiffCommentAnnotation kind="draft"`.
+    /// `DiffCommentAnnotation kind="draft"`: in the Code tab "Add to review" with "Add to agent"
+    /// beside it; in an excerpt "Ask agent" beside it, or alone when the viewer may not comment.
     pub(super) fn render_pr_line_draft(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let draft = self.pull_requests.panel.as_ref()?.write.draft.as_ref()?;
+        let panel = self.pull_requests.panel.as_ref()?;
+        let draft = panel.write.draft.as_ref()?;
+        let can_comment = panel.detail.as_ref().is_some_and(|d| pr_can_comment(d));
         let (_, line) = draft.position.anchor();
         let empty = text_of(&draft.input, cx).trim().is_empty();
+        let in_guide = draft.excerpt.is_some();
+        let agent_label = if in_guide { "Ask agent" } else { "Add to agent" };
+        let agent = (can_comment && (!in_guide || self.pr_can_ask())).then(|| {
+            xs_outline("pr-draft-agent", t)
+                .disabled(empty)
+                .child(agent_label)
+                .on_click(cx.listener(|this, _, window, cx| this.send_pr_draft_to_agent(window, cx)))
+        });
+        let submit = Button::new("pr-draft-add")
+            .primary()
+            .xsmall()
+            .disabled(empty)
+            .child(if can_comment { "Add to review" } else { agent_label })
+            .on_click(cx.listener(|this, _, window, cx| this.submit_pr_line_draft(window, cx)));
         Some(
             v_flex()
+                .id("pr-draft")
                 .mx(px(12.))
                 .my(px(8.))
                 .p(px(12.))
@@ -893,6 +1033,13 @@ impl Workspace {
                 .border_color(Hsla { a: t.border.a * 0.7, ..t.border })
                 .bg(t.background)
                 .shadow_sm()
+                .font_family(theme::FONT_SANS)
+                .capture_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, _, cx| {
+                    if event.keystroke.key == "escape" {
+                        cx.stop_propagation();
+                        this.cancel_pr_line_draft(cx);
+                    }
+                }))
                 .child(
                     div()
                         .text_xs()
@@ -901,33 +1048,18 @@ impl Workspace {
                         .child(format!("{}:{line}", draft.path)),
                 )
                 .child(Textarea::new(&draft.input))
-                .children(self.render_pr_completions(&draft.input, t, cx))
+                .children(can_comment.then(|| self.render_pr_completions(&draft.input, t, cx)).flatten())
                 .child(
                     h_flex()
                         .justify_end()
                         .gap(px(8.))
-                        .child(ghost_button("pr-draft-cancel", t).child("Cancel").on_click(cx.listener(
-                            |this, _, _, cx| {
-                                if let Some(write) = this.pr_write() {
-                                    write.draft = None;
-                                }
-                                cx.notify();
-                            },
-                        )))
                         .child(
-                            xs_outline("pr-draft-agent", t)
-                                .disabled(empty)
-                                .child("Add to agent")
-                                .on_click(cx.listener(|this, _, window, cx| this.send_pr_draft_to_agent(window, cx))),
+                            ghost_button("pr-draft-cancel", t)
+                                .child("Cancel")
+                                .on_click(cx.listener(|this, _, _, cx| this.cancel_pr_line_draft(cx))),
                         )
-                        .child(
-                            Button::new("pr-draft-add")
-                                .primary()
-                                .xsmall()
-                                .disabled(empty)
-                                .child("Add to review")
-                                .on_click(cx.listener(|this, _, _, cx| this.add_pr_line_comment(cx))),
-                        ),
+                        .children(agent)
+                        .child(submit),
                 )
                 .into_any_element(),
         )
@@ -989,7 +1121,7 @@ impl Workspace {
         resolve.then(|| {
             let (id, resolved) = (thread.id.clone(), thread.is_resolved);
             ghost_button(ElementId::Name(format!("pr-thread-resolve:{id}").into()), t)
-                .disabled(panel.write.thread_pending)
+                .disabled(panel.write.thread_pending.contains(&thread.id))
                 .child(if resolved { "Unresolve" } else { "Resolve" })
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.set_pr_thread_resolved(id.clone(), !resolved, window, cx);
@@ -1013,7 +1145,7 @@ impl Workspace {
         Some(
             ghost_button(ElementId::Name(format!("pr-fix:{key}").into()), t)
                 .flex_none()
-                .disabled(panel.write.thread_pending || panel.handoff.is_some())
+                .disabled(finding_pending(&panel.write, &finding) || panel.handoff.is_some())
                 .child(Icon::new(Lucide::Hammer).with_size(px(12.)))
                 .child(if preparing { "Preparing..." } else { label })
                 .on_click(cx.listener(move |this, _, window, cx| this.fix_pr_finding(&finding, window, cx))),
@@ -1049,8 +1181,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let Some(mut input) = self.pr_ref_json() else { return };
-        let Some(write) = self.pr_write().filter(|w| !w.thread_pending) else { return };
-        write.thread_pending = true;
+        let Some(write) = self.pr_write().filter(|w| !w.thread_pending.contains(&thread_id)) else { return };
+        write.thread_pending.insert(thread_id.clone());
         input["threadId"] = json!(thread_id);
         input["resolved"] = json!(resolved);
         self.run_pr_write(
@@ -1060,9 +1192,9 @@ impl Workspace {
             None,
             window,
             cx,
-            |this, key, _, _, _| {
+            move |this, key, _, _, _| {
                 if let Some(write) = this.pr_write_of(key) {
-                    write.thread_pending = false;
+                    write.thread_pending.remove(&thread_id);
                 }
             },
         );
@@ -1084,7 +1216,7 @@ impl Workspace {
         match panel.write.replies.get(&thread.id) {
             Some(input) => {
                 let empty = text_of(input, cx).trim().is_empty();
-                let pending = panel.write.thread_pending;
+                let pending = panel.write.thread_pending.contains(&thread.id);
                 let (cancel, send) = (id.clone(), id.clone());
                 Some(
                     v_flex()
@@ -1151,13 +1283,13 @@ impl Workspace {
     /// Posts one conversation's reply; only that conversation's box closes once it lands.
     fn send_pr_reply(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(mut payload) = self.pr_ref_json() else { return };
-        let Some(write) = self.pr_write().filter(|w| !w.thread_pending) else { return };
+        let Some(write) = self.pr_write().filter(|w| !w.thread_pending.contains(thread_id)) else { return };
         let Some(input) = write.replies.get(thread_id).cloned() else { return };
         let body = text_of(&input, cx).trim().to_owned();
         if body.is_empty() {
             return;
         }
-        write.thread_pending = true;
+        write.thread_pending.insert(thread_id.to_owned());
         payload["threadId"] = json!(thread_id);
         payload["body"] = json!(body);
         let thread_id = thread_id.to_owned();
@@ -1170,7 +1302,7 @@ impl Workspace {
             cx,
             move |this, key, ok, _, _| {
                 if let Some(write) = this.pr_write_of(key) {
-                    write.thread_pending = false;
+                    write.thread_pending.remove(&thread_id);
                     if ok && write.replies.get(&thread_id) == Some(&input) {
                         write.replies.remove(&thread_id);
                     }
@@ -1251,6 +1383,8 @@ impl Workspace {
     /// `PullRequestMarkdownEditor`: Write and Preview, then Cancel and Save.
     pub(super) fn render_pr_editor(&mut self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
         let editing = self.pull_requests.panel.as_ref()?.write.editing.as_ref()?;
+        let method = if editing.kind == "description" { "pullRequests.update" } else { "pullRequests.updateComment" };
+        let writable = self.shown_pr_key().is_some_and(|key| self.pr_panel_permits(&key, method, None));
         let (input, preview, description, saving) = (
             editing.input.clone(),
             editing.preview,
@@ -1275,7 +1409,7 @@ impl Workspace {
             },
         );
         let body = if preview {
-            let rendered = (!empty).then(|| self.pr_markdown("editor-preview", &text, cx)).flatten();
+            let rendered = (!empty).then(|| self.pr_body("editor-preview", &text, false, t, cx)).flatten();
             div()
                 .rounded(px(8.))
                 .border_1()
@@ -1283,9 +1417,7 @@ impl Workspace {
                 .px(px(12.))
                 .py(px(8.))
                 .child(match rendered {
-                    Some(state) => {
-                        pr_markdown_view(&state, t, cx.entity(), self.pr_code_wraps(&state)).into_any_element()
-                    }
+                    Some(markdown) => markdown,
                     None => {
                         div().text_xs().text_color(t.muted_foreground).child("Nothing to preview.").into_any_element()
                     }
@@ -1318,7 +1450,7 @@ impl Workspace {
                         ))
                         .child(
                             xs_outline("pr-editor-save", t)
-                                .disabled(saving || (empty && !description))
+                                .disabled(saving || !writable || (empty && !description))
                                 .child(if saving { "Saving..." } else { "Save" })
                                 .on_click(cx.listener(|this, _, window, cx| this.save_pr_edit(window, cx))),
                         ),
@@ -1351,7 +1483,7 @@ impl Workspace {
     fn save_pr_title(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let current = self.pull_requests.panel.as_ref().and_then(|p| p.detail.as_ref()).map(|d| d.title.clone());
         let Some(mut payload) = self.pr_ref_json() else { return };
-        let Some(write) = self.pr_write().filter(|w| !w.saving) else { return };
+        let Some(write) = self.pr_write().filter(|w| !w.title_saving) else { return };
         let Some(input) = write.title.clone() else { return };
         let title = input.read(cx).value().trim().to_owned();
         if title.is_empty() || Some(&title) == current.as_ref() {
@@ -1359,7 +1491,7 @@ impl Workspace {
             cx.notify();
             return;
         }
-        write.saving = true;
+        write.title_saving = true;
         payload["title"] = json!(title);
         self.run_pr_write(
             "pullRequests.update",
@@ -1371,7 +1503,7 @@ impl Workspace {
             // A refused title stays in the editor to try again.
             |this, key, ok, _, _| {
                 if let Some(write) = this.pr_write_of(key) {
-                    write.saving = false;
+                    write.title_saving = false;
                     if ok {
                         write.title = None;
                     }
@@ -1381,7 +1513,7 @@ impl Workspace {
     }
 
     fn cancel_pr_title_edit(&mut self, cx: &mut Context<Self>) {
-        if let Some(write) = self.pr_write().filter(|w| !w.saving) {
+        if let Some(write) = self.pr_write().filter(|w| !w.title_saving) {
             write.title = None;
             cx.notify();
         }
@@ -1389,9 +1521,11 @@ impl Workspace {
 
     /// The title being renamed, with Cancel and Save under it; Escape cancels.
     pub(super) fn render_pr_title_input(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let write = &self.pull_requests.panel.as_ref()?.write;
+        let panel = self.pull_requests.panel.as_ref()?;
+        let writable = self.pr_panel_permits(&panel.reference.key(), "pullRequests.update", None);
+        let write = &panel.write;
         let input = write.title.as_ref()?;
-        let saving = write.saving;
+        let saving = write.title_saving;
         let empty = input.read(cx).value().trim().is_empty();
         Some(
             v_flex()
@@ -1417,7 +1551,7 @@ impl Workspace {
                         )
                         .child(
                             xs_outline("pr-title-save", t)
-                                .disabled(saving || empty)
+                                .disabled(saving || !writable || empty)
                                 .child(if saving { "Saving..." } else { "Save" })
                                 .on_click(cx.listener(|this, _, window, cx| this.save_pr_title(window, cx))),
                         ),
@@ -1616,11 +1750,13 @@ impl Workspace {
                 kind,
                 search,
                 candidates: None,
+                _candidates: None,
                 pending: None,
                 debounced: String::new(),
                 _debounce: None,
                 searches: HashMap::new(),
                 searching: HashSet::new(),
+                searches_epoch: 0,
                 highlight: Some(0),
                 scroll: ScrollHandle::new(),
             });
@@ -1639,7 +1775,7 @@ impl Workspace {
         } else {
             "pullRequests.labelCandidates"
         };
-        cx.spawn(async move |this, cx| {
+        let read = cx.spawn(async move |this, cx| {
             let result = client.request(method, input).await;
             let _ = this.update(cx, |this, cx| {
                 let Some(picker) = this.pr_panel(&key).and_then(|p| p.write.picker.as_mut()).filter(|p| p.kind == kind)
@@ -1650,8 +1786,10 @@ impl Workspace {
                 this.search_pr_reviewers(&key, cx);
                 cx.notify();
             });
-        })
-        .detach();
+        });
+        if let Some(picker) = self.pr_write().and_then(|w| w.picker.as_mut()).filter(|p| p.kind == kind) {
+            picker._candidates = Some(read);
+        }
         cx.notify();
     }
 
@@ -1693,10 +1831,14 @@ impl Workspace {
             return;
         }
         input["query"] = json!(query);
+        let epoch = picker.searches_epoch;
         cx.spawn(async move |this, cx| {
             let result = client.request("pullRequests.reviewerCandidates", input).await;
             let _ = this.update(cx, |this, cx| {
                 let Some(picker) = this.pr_write_of(&key).and_then(|w| w.picker.as_mut()) else { return };
+                if picker.searches_epoch != epoch {
+                    return;
+                }
                 picker.searching.remove(&query);
                 picker.searches.insert(query, result.map_err(|error| list_logic::error_message(&error)));
                 cx.notify();
@@ -1751,6 +1893,8 @@ impl Workspace {
                 // what was typed, so the one on screen is read again too.
                 if let Some(picker) = this.pr_write_of(key).and_then(|w| w.picker.as_mut()) {
                     picker.searches.clear();
+                    picker.searching.clear();
+                    picker.searches_epoch += 1;
                 }
                 this.read_pr_picker_candidates(kind, cx);
             }

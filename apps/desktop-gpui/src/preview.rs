@@ -2,8 +2,10 @@
 //! the per-thread reducer of `apps/web/src/previewStateStore.ts`, and the address
 //! bar's URL resolution from `packages/shared/src/preview.ts`.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 
+use gpui_kit::SharedString;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -150,17 +152,6 @@ impl Viewport {
             }
         }
     }
-
-    pub fn preset_id(&self) -> Option<&str> {
-        match self {
-            Viewport::Preset { preset_id, .. } => Some(preset_id),
-            _ => None,
-        }
-    }
-
-    pub fn preset(preset: &Preset) -> Value {
-        json!({"_tag": "preset", "presetId": preset.id, "width": preset.width, "height": preset.height})
-    }
 }
 
 pub struct Preset {
@@ -195,42 +186,85 @@ pub const PRESETS: [Preset; 17] = [
     preset("nest-hub-max", "Nest Hub Max", 1280, 800),
 ];
 
-/// A fixed viewport shrunk to fit `available`, never enlarged: its on-screen size and the scale,
-/// which the page zoom also takes so the page still lays out at the viewport's CSS width.
+/// A fixed viewport drawn at `zoom` (`resolveBrowserViewportLayout`), shrunk to fit `available`,
+/// never enlarged: its on-screen size and the scale, which the page zoom also takes so the page
+/// still lays out at the viewport's CSS width.
 /// The server's size is outside data: an empty one counts as 1px, so the scale is never NaN.
-pub fn fit_viewport(viewport: (f32, f32), available: (f32, f32)) -> ((f32, f32), f32) {
-    let (width, height) = (viewport.0.max(1.), viewport.1.max(1.));
-    let scale = (available.0 / width).min(available.1 / height);
-    let scale = if scale.is_finite() { scale.clamp(0.05, 1.) } else { 1. };
+/// So does an empty or negative area, which still shrinks the viewport to fit, however small.
+pub fn fit_viewport(viewport: (f32, f32), available: (f32, f32), zoom: f64) -> ((f32, f32), f32) {
+    #[expect(clippy::cast_possible_truncation, reason = "zoom factors fit f32")]
+    let zoom = if zoom.is_finite() && zoom > 0. { zoom as f32 } else { 1. };
+    let (width, height) = (viewport.0.max(1.) * zoom, viewport.1.max(1.) * zoom);
+    let area = |side: f32| if side.is_nan() { side } else { side.max(1.) };
+    let scale = (area(available.0) / width).min(area(available.1) / height);
+    let scale = if scale.is_finite() && scale > 0. { scale.min(1.) } else { 1. };
     ((width * scale, height * scale), scale)
 }
 
-/// The Chromium net errors a failed load reports as Electron's `did-fail-load` does, so
-/// `LoadFailed` reads the same to agents and other clients.
-const NET_ERRORS: [(i64, &str); 19] = [
+/// Chromium's net errors by code, named as Electron's `did-fail-load` names them.
+const NET_ERRORS: [(i64, &str); 26] = [
+    (-2, "ERR_FAILED"),
+    (-6, "ERR_FILE_NOT_FOUND"),
+    (-100, "ERR_CONNECTION_CLOSED"),
+    (-101, "ERR_CONNECTION_RESET"),
+    (-102, "ERR_CONNECTION_REFUSED"),
+    (-103, "ERR_CONNECTION_ABORTED"),
+    (-105, "ERR_NAME_NOT_RESOLVED"),
+    (-106, "ERR_INTERNET_DISCONNECTED"),
+    (-107, "ERR_SSL_PROTOCOL_ERROR"),
+    (-109, "ERR_ADDRESS_UNREACHABLE"),
+    (-110, "ERR_SSL_CLIENT_AUTH_CERT_NEEDED"),
+    (-117, "ERR_BAD_SSL_CLIENT_AUTH_CERT"),
+    (-118, "ERR_CONNECTION_TIMED_OUT"),
+    (-127, "ERR_PROXY_AUTH_REQUESTED"),
+    (-130, "ERR_PROXY_CONNECTION_FAILED"),
+    (-137, "ERR_NAME_RESOLUTION_FAILED"),
     (-200, "ERR_CERT_COMMON_NAME_INVALID"),
     (-201, "ERR_CERT_DATE_INVALID"),
-    (-117, "ERR_BAD_SSL_CLIENT_AUTH_CERT"),
-    (-206, "ERR_CERT_REVOKED"),
     (-202, "ERR_CERT_AUTHORITY_INVALID"),
-    (-109, "ERR_ADDRESS_UNREACHABLE"),
-    (-118, "ERR_CONNECTION_TIMED_OUT"),
-    (-320, "ERR_INVALID_RESPONSE"),
-    (-103, "ERR_CONNECTION_ABORTED"),
-    (-101, "ERR_CONNECTION_RESET"),
-    (-106, "ERR_INTERNET_DISCONNECTED"),
-    (-102, "ERR_CONNECTION_REFUSED"),
-    (-105, "ERR_NAME_NOT_RESOLVED"),
+    (-206, "ERR_CERT_REVOKED"),
+    (-300, "ERR_INVALID_URL"),
+    (-302, "ERR_UNKNOWN_URL_SCHEME"),
     (-310, "ERR_TOO_MANY_REDIRECTS"),
     (-312, "ERR_UNSAFE_PORT"),
-    (-100, "ERR_CONNECTION_CLOSED"),
+    (-320, "ERR_INVALID_RESPONSE"),
     (-324, "ERR_EMPTY_RESPONSE"),
-    (-107, "ERR_SSL_PROTOCOL_ERROR"),
-    (-2, "ERR_FAILED"),
 ];
 
+/// `WebKitGTK`'s `GError` domains as a Chromium net error.
+fn webkit_gtk_net_error(domain: &str, code: i64) -> Option<i64> {
+    Some(match (domain, code) {
+        ("WebKitNetworkError", 302) | ("g-io-error-quark", 19) => return None,
+        ("WebKitPolicyError", 100 | 102) => return None,
+        ("WebKitNetworkError", 301) | ("WebKitPolicyError", 101) => -302,
+        ("WebKitNetworkError", 303) => -6,
+        ("WebKitPolicyError", 103) => -312,
+        ("g-io-error-quark", 24) => -118,
+        ("g-io-error-quark", 28) | ("g-resolver-error-quark", 0 | 2) => -105,
+        ("g-resolver-error-quark", 1) => -137,
+        ("g-io-error-quark", 37 | 38) => -109,
+        ("g-io-error-quark", 39) => -102,
+        ("g-io-error-quark", 40) => -130,
+        ("g-io-error-quark", 44) => -100,
+        ("g-tls-error-quark", 2) => -202,
+        ("g-tls-error-quark", 5) => -110,
+        ("g-tls-error-quark", _) => -107,
+        _ => -2,
+    })
+}
+
+/// The net error Electron's `did-fail-load` reports for a main-frame navigation `WebKitGTK` failed
+/// (lb-wry's only safe failure callback), so `LoadFailed` reads the same to agents, other clients
+/// and the error page. `None` for what Electron leaves alone: an aborted load (cancelled or a
+/// download, `ERR_ABORTED`).
+pub fn net_error(error: &wry::PageLoadError) -> Option<(i64, &'static str)> {
+    let code = webkit_gtk_net_error(&error.domain, error.code)?;
+    let name = NET_ERRORS.iter().find(|(known, _)| *known == code).map_or("ERR_FAILED", |(_, name)| name);
+    Some((code, name))
+}
+
 /// Run in a page after its load: on WebView2's error page, the net error it names (in Chromium's
-/// `loadTimeData` or the page text), else `null`.
+/// `loadTimeData` or the page text), else `null`. WebView2's own failure callback needs `unsafe`.
 pub const FAILURE_PROBE: &str = r#"(() => {
   if (location.protocol !== "chrome-error:") return null;
   const data = window.loadTimeData && window.loadTimeData.data_;
@@ -246,33 +280,209 @@ pub fn failed_load(result: &str) -> Option<(i64, &'static str)> {
     Some(NET_ERRORS.into_iter().find(|(_, known)| *known == name).unwrap_or((-2, "ERR_FAILED")))
 }
 
-/// Reports the top page's URL and back/forward state over wry's IPC on load and on each history
-/// change, through Chromium's Navigation API (WebView2; WebKit lacks it and reports nothing).
+/// Reports the top page's URL and history over wry's IPC on load and on each history change,
+/// through the Navigation API (WebView2, and WebKit where it has it; older WebKit reports nothing).
+/// A traversal's `delta` is known only between two entries on the page's own origin.
 pub const HISTORY_SCRIPT: &str = r#"(() => {
   if (window !== window.top || !window.navigation || !window.ipc) return;
-  const post = () => window.ipc.postMessage(JSON.stringify({ t3History: { url: location.href, back: navigation.canGoBack, forward: navigation.canGoForward } }));
-  post();
-  navigation.addEventListener("currententrychange", post);
-  addEventListener("pageshow", post);
+  const delta = (from, to) => (from && to && from.index >= 0 && to.index >= 0 ? to.index - from.index : null);
+  const post = (type, step) => window.ipc.postMessage(JSON.stringify({ t3History: {
+    url: location.href, back: navigation.canGoBack, forward: navigation.canGoForward,
+    length: history.length, type, delta: step } }));
+  const activation = () => navigation.activation || { navigationType: null, from: null, entry: null };
+  const activated = activation();
+  post(activated.navigationType, delta(activated.from, activated.entry));
+  navigation.addEventListener("currententrychange", (event) => post(event.navigationType, delta(event.from, navigation.currentEntry)));
+  addEventListener("pageshow", (event) => {
+    const restored = activation();
+    if (event.persisted) post("traverse", delta(restored.from, restored.entry));
+    else post(null, null);
+  });
 })();"#;
+
+/// How the page reached its current entry: the Navigation API's `NavigationType`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoryStep {
+    Push,
+    Replace,
+    Reload,
+    Traverse,
+}
 
 /// [`HISTORY_SCRIPT`]'s message. The page can post one too, so its URL is only trusted within the
 /// page's own origin.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PageHistory {
     pub url: String,
+    /// The Navigation API's answers, which see only the page's own origin's entries.
     pub back: bool,
     pub forward: bool,
+    /// `history.length`: every entry, other origins' included.
+    pub length: usize,
+    /// `None` where the browser doesn't say (WebKit without `navigation.activation`, `pageshow`).
+    pub step: Option<HistoryStep>,
+    pub delta: Option<isize>,
 }
 
 pub fn history_message(body: &str) -> Option<PageHistory> {
     let message: serde_json::Value = serde_json::from_str(body).ok()?;
     let history = message.get("t3History")?;
+    let step = match history.get("type").and_then(serde_json::Value::as_str) {
+        Some("push") => Some(HistoryStep::Push),
+        Some("replace") => Some(HistoryStep::Replace),
+        Some("reload") => Some(HistoryStep::Reload),
+        Some("traverse") => Some(HistoryStep::Traverse),
+        _ => None,
+    };
     Some(PageHistory {
         url: history.get("url")?.as_str()?.to_owned(),
         back: history.get("back")?.as_bool()?,
         forward: history.get("forward")?.as_bool()?,
+        length: history
+            .get("length")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|length| usize::try_from(length).ok())
+            .unwrap_or(1),
+        step,
+        delta: history.get("delta").and_then(serde_json::Value::as_i64).and_then(|delta| isize::try_from(delta).ok()),
     })
+}
+
+/// Where a tab stands in its whole session history, as Electron's `navigationHistory` sees it.
+/// `navigation.canGoBack` leaves out other origins' entries, so after the address bar or a link
+/// loads another origin it says there is nothing to go back to. WebView2's and `WKWebView`'s own
+/// `canGoBack` are `unsafe` calls, so this follows the page's reports and the app's own traversals.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SessionHistory {
+    index: usize,
+    len: usize,
+    /// The step the app's Back or Forward asked for, until the page reports where it landed.
+    pending: Option<isize>,
+}
+
+impl SessionHistory {
+    /// The app asked the page to move `delta` entries.
+    pub fn traverse(&mut self, delta: isize) {
+        self.pending = Some(delta);
+    }
+
+    /// Takes a page's report; returns whether it can go back and forward.
+    pub fn report(&mut self, page: &PageHistory) -> (bool, bool) {
+        let len = page.length.max(1);
+        let pending = self.pending.take();
+        let moved = match page.step {
+            Some(HistoryStep::Traverse) => page.delta.or(pending),
+            Some(HistoryStep::Replace | HistoryStep::Reload) => None,
+            // A push drops the entries ahead; without a type, a new length is one.
+            Some(HistoryStep::Push) => {
+                self.index = len - 1;
+                None
+            }
+            None if pending.is_none() && len != self.len => {
+                self.index = len - 1;
+                None
+            }
+            None => pending,
+        };
+        if let Some(delta) = moved {
+            self.index = self.index.saturating_add_signed(delta);
+        }
+        self.len = len;
+        self.index = self.index.min(len - 1);
+        (page.back || self.index > 0, page.forward || self.index + 1 < len)
+    }
+}
+
+/// Hands the app's shell chords back from a focused page, as Electron's `before-input-event`
+/// forwarding does: a matching key never reaches the page, and unless it repeats its command
+/// posts over wry's IPC. Keys match as `matchesKeybindingShortcut` reads them.
+/// `window.__t3PageShortcuts(chords)` swaps the set when the keymap changes.
+/// It runs in every frame. Only the top frame has wry's IPC (WebView2 routes a subframe's
+/// messages elsewhere), so a subframe relays its command to the top, and each frame passes the
+/// chords on to its own frames; a new subframe asks its parent for them.
+const SHORTCUT_SCRIPT: &str = r#"(() => {
+  const top = window === window.top;
+  if (top && !window.ipc) return;
+  let chords = __CHORDS__;
+  const mac = __MAC__;
+  const send = (frame, next) => { try { frame.postMessage({ t3PageShortcuts: next }, "*"); } catch {} };
+  const children = () => Array.from({ length: frames.length }, (_, i) => frames[i]);
+  const swap = (next) => { chords = next; children().forEach((frame) => send(frame, next)); };
+  if (top) Object.defineProperty(window, "__t3PageShortcuts", { value: swap });
+  addEventListener("message", (event) => {
+    const data = event.data;
+    if (!data || typeof data !== "object") return;
+    if (top && typeof data.t3Shortcut === "string") window.ipc.postMessage(JSON.stringify({ t3Shortcut: data.t3Shortcut }));
+    else if (!top && event.source === parent && Array.isArray(data.t3PageShortcuts)) swap(data.t3PageShortcuts);
+    else if (data.t3PageShortcutsWanted === true && children().includes(event.source)) send(event.source, chords);
+    else return;
+    event.stopImmediatePropagation();
+  }, true);
+  if (!top) parent.postMessage({ t3PageShortcutsWanted: true }, "*");
+  const forward = (command) => top
+    ? window.ipc.postMessage(JSON.stringify({ t3Shortcut: command }))
+    : window.top.postMessage({ t3Shortcut: command }, "*");
+  const codes = { Backquote: "`", Backslash: "\\", BracketLeft: "[", BracketRight: "]", Comma: ",", Equal: "=", Minus: "-", Period: ".", Quote: "'", Semicolon: ";", Slash: "/" };
+  const keysOf = (event) => {
+    const lower = event.key.toLowerCase();
+    const key = lower === "esc" ? "escape" : lower;
+    const keys = new Set([key]);
+    const letter = /^Key([A-Z])$/.exec(event.code || "");
+    if (letter && !/^[a-z]$/.test(key)) keys.add(letter[1].toLowerCase());
+    const digit = /^Digit([0-9])$/.exec(event.code || "");
+    keys.add(/^[a-z]$/.test(key) ? key : (digit ? digit[1] : codes[event.code]) ?? key);
+    return keys;
+  };
+  addEventListener("keydown", (event) => {
+    if (!event.isTrusted || event.isComposing || typeof event.key !== "string") return;
+    if (!mac && event.ctrlKey && event.altKey && /^(?:[^a-zA-Z0-9]|Dead)$/u.test(event.key)) return;
+    const keys = keysOf(event);
+    const chord = chords.find((c) => c.meta === event.metaKey && c.ctrl === event.ctrlKey && c.shift === event.shiftKey && c.alt === event.altKey && keys.has(c.key));
+    if (!chord) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    if (!event.repeat) forward(chord.command);
+  }, true);
+})();"#;
+
+/// [`SHORTCUT_SCRIPT`] starting with `chords`, a JSON array of `PageChord`s.
+pub fn shortcut_script(chords: &str, mac: bool) -> String {
+    SHORTCUT_SCRIPT.replace("__CHORDS__", chords).replace("__MAC__", if mac { "true" } else { "false" })
+}
+
+/// Swaps the chords [`SHORTCUT_SCRIPT`] forwards in the page already loaded.
+pub fn shortcut_update_script(chords: &str) -> String {
+    format!("window.__t3PageShortcuts?.({chords});")
+}
+
+/// The command a page's [`SHORTCUT_SCRIPT`] forwarded. The page can post one too, so the caller
+/// runs only a command it forwards.
+pub fn shortcut_message(body: &str) -> Option<String> {
+    let message: serde_json::Value = serde_json::from_str(body).ok()?;
+    Some(message.get("t3Shortcut")?.as_str()?.to_owned())
+}
+
+/// Reports the pointer reaching the page's top-right corner, where the floating preview's
+/// handle sits: the native view covers it, so the mini player can't see the hover itself.
+/// The zone is a share of the page's width, so it matches at any zoom. While the pointer stays
+/// there it reports again now and then, as the mini player may have closed its pill meanwhile.
+pub const CORNER_SCRIPT: &str = r#"(() => {
+  if (window !== window.top || !window.ipc) return;
+  let inside = false, last = 0;
+  const post = (next) => window.ipc.postMessage(JSON.stringify({ t3Corner: next }));
+  addEventListener("pointermove", (event) => {
+    const zone = innerWidth * 0.12;
+    const next = innerWidth - event.clientX <= zone && event.clientY <= zone;
+    const now = Date.now();
+    if (next !== inside || (next && now - last > 250)) { inside = next; last = now; post(next); }
+  }, { capture: true, passive: true });
+  document.documentElement.addEventListener("mouseleave", () => { if (inside) { inside = false; post(false); } });
+})();"#;
+
+/// [`CORNER_SCRIPT`]'s message: whether the pointer is in the page's top-right corner.
+pub fn corner_message(body: &str) -> Option<bool> {
+    let message: serde_json::Value = serde_json::from_str(body).ok()?;
+    message.get("t3Corner")?.as_bool()
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -544,6 +754,102 @@ impl ThreadPreviews {
     }
 }
 
+/// A thread on one environment (`ScopedThreadRef`). Thread ids, and the tab ids each server
+/// numbers from 1, repeat across environments, so preview state is keyed by this.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ThreadRef {
+    pub environment: SharedString,
+    pub thread_id: String,
+}
+
+impl ThreadRef {
+    pub fn new(environment: impl Into<SharedString>, thread_id: impl Into<String>) -> Self {
+        Self { environment: environment.into(), thread_id: thread_id.into() }
+    }
+
+    pub fn tab(&self, tab_id: impl Into<String>) -> TabRef {
+        TabRef { thread: self.clone(), tab_id: tab_id.into() }
+    }
+}
+
+/// One browser tab of a thread on one environment.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TabRef {
+    pub thread: ThreadRef,
+    pub tab_id: String,
+}
+
+/// What a `subscribePreviewEvents` item changed.
+#[derive(Debug, PartialEq, Eq)]
+pub struct EventApplied {
+    pub thread: ThreadRef,
+    /// The thread's list must be (re)fetched: its server restarted, or it never loaded.
+    pub needs_list: bool,
+    /// [`ThreadPreviews::fresh_reveals`].
+    pub reveals: Vec<(String, bool)>,
+}
+
+/// Every thread's tabs on every environment (`previewStateAtom` by `scopedThreadKey`).
+#[derive(Debug, Default)]
+pub struct PreviewThreads(HashMap<ThreadRef, ThreadPreviews>);
+
+impl PreviewThreads {
+    pub fn get(&self, thread: &ThreadRef) -> Option<&ThreadPreviews> {
+        self.0.get(thread)
+    }
+
+    pub fn get_mut(&mut self, thread: &ThreadRef) -> Option<&mut ThreadPreviews> {
+        self.0.get_mut(thread)
+    }
+
+    /// The thread's tabs, empty until its list or an event arrives.
+    pub fn entry(&mut self, thread: &ThreadRef) -> &mut ThreadPreviews {
+        self.0.entry(thread.clone()).or_default()
+    }
+
+    pub fn session(&self, tab: &TabRef) -> Option<&Session> {
+        self.get(&tab.thread)?.get(&tab.tab_id)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&ThreadRef, &ThreadPreviews)> {
+        self.0.iter()
+    }
+
+    /// The threads known on `environment`.
+    pub fn on_environment<'a>(&'a self, environment: &'a str) -> impl Iterator<Item = &'a ThreadRef> {
+        self.0.keys().filter(move |thread| thread.environment.as_ref() == environment)
+    }
+
+    /// One item of `environment`'s `subscribePreviewEvents` stream, applied to its thread there.
+    /// `None` for an item that names no thread.
+    pub fn apply_event(&mut self, environment: &SharedString, event: &Value) -> Option<EventApplied> {
+        let thread = ThreadRef::new(environment.clone(), event.get("threadId")?.as_str()?);
+        let previews = self.entry(&thread);
+        let before = previews.clone();
+        let applied = previews.apply_event(event);
+        let reveals = previews.fresh_reveals(&before);
+        let needs_list = match applied {
+            Ok(Applied::Relist) => true,
+            Ok(_) => !previews.list_loaded,
+            Err(error) => {
+                log::warn!("bad preview event: {error}");
+                false
+            }
+        };
+        Some(EventApplied { thread, needs_list, reveals })
+    }
+
+    /// `preview.list`'s result for `thread`, with the reveals it brought.
+    pub fn apply_list(&mut self, thread: &ThreadRef, list: &Value) -> Vec<(String, bool)> {
+        let previews = self.entry(thread);
+        let before = previews.clone();
+        if let Err(error) = previews.apply_list(list) {
+            log::warn!("bad preview list: {error}");
+        }
+        previews.fresh_reveals(&before)
+    }
+}
+
 const LOOPBACK_PREFIXES: [&str; 5] = ["localhost", "127.0.0.1", "0.0.0.0", "[::]", "[::1]"];
 const KNOWN_NON_WEB_SCHEMES: [&str; 14] = [
     "about",
@@ -687,7 +993,7 @@ pub fn resolve_address(input: &str, search_template: &str) -> Result<String, &'s
 }
 
 /// JavaScript's `encodeURIComponent`.
-fn encode_uri_component(input: &str) -> String {
+pub(crate) fn encode_uri_component(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for byte in input.bytes() {
         if byte.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&byte) {
@@ -711,7 +1017,7 @@ fn is_local_loopback_host(host: &str) -> bool {
 }
 
 /// `isPrivateNetworkHost` (`packages/shared/src/hostClassification.ts`).
-fn is_private_network_host(host: &str) -> bool {
+pub(crate) fn is_private_network_host(host: &str) -> bool {
     let host = normalize_hostname(host);
     if host == "::"
         || host == "home.arpa"
@@ -802,7 +1108,7 @@ pub fn display_url(session: &Session) -> &str {
 /// `PREVIEW_VIEWPORT_{MIN,MAX}_DIMENSION` and `PREVIEW_VIEWPORT_MAX_AREA`.
 pub const VIEWPORT_MIN_DIMENSION: i64 = 240;
 pub const VIEWPORT_MAX_DIMENSION: i64 = 3840;
-const VIEWPORT_MAX_AREA: i64 = 3840 * 2160;
+pub const VIEWPORT_MAX_AREA: i64 = 3840 * 2160;
 /// The size "Responsive" starts at when switched to from "Fill panel" (`RESPONSIVE_SEED_SIZE`).
 const RESPONSIVE_SEED: (u32, u32) = (1280, 800);
 
@@ -982,8 +1288,9 @@ pub enum Partition {
     Default,
     /// In memory, gone when the app closes.
     Incognito,
-    /// A folder of its own, named by a hash so any id makes a short, valid name.
-    Folder(String),
+    /// A store of its own, keyed by a hash of the id: the folder's name (`WebView2`, `WebKitGTK`) and
+    /// the `WKWebsiteDataStore` identifier (macOS).
+    Folder([u8; 16]),
 }
 
 pub fn partition(profile_id: Option<&str>) -> Partition {
@@ -991,7 +1298,11 @@ pub fn partition(profile_id: Option<&str>) -> Partition {
     match profile_id {
         None | Some(DEFAULT_PROFILE_ID) => Partition::Default,
         Some(INCOGNITO_PROFILE_ID) => Partition::Incognito,
-        Some(id) => Partition::Folder(crate::hex::lower_hex(&sha2::Sha256::digest(id.as_bytes())[..16])),
+        Some(id) => {
+            let mut store = [0; 16];
+            store.copy_from_slice(&sha2::Sha256::digest(id.as_bytes())[..16]);
+            Partition::Folder(store)
+        }
     }
 }
 
@@ -1278,9 +1589,12 @@ mod tests {
 
         assert_eq!(partition(None), Partition::Default);
         assert_eq!(partition(Some("incognito")), Partition::Incognito);
-        let Partition::Folder(folder) = partition(Some("profile-work")) else { panic!() };
-        assert_eq!(folder.len(), 32);
-        assert_ne!(partition(Some("profile-home")), Partition::Folder(folder));
+        assert_eq!(partition(Some("default")), Partition::Default, "the default profile keeps the default store");
+        let Partition::Folder(store) = partition(Some("profile-work")) else { panic!() };
+        // Pinned: a profile's folder and macOS store keep this key across releases.
+        assert_eq!(crate::hex::lower_hex(&store), "fe994b29faae4f113655296d74acd42f");
+        assert_eq!(partition(Some("profile-work")), Partition::Folder(store), "stable");
+        assert_ne!(partition(Some("profile-home")), Partition::Folder(store), "distinct per profile");
 
         let report = profile_report(&stored);
         assert_eq!(report["defaultProfileId"], "profile-work");
@@ -1290,14 +1604,45 @@ mod tests {
 
     #[test]
     fn fits_fixed_viewports_without_enlarging_them() {
-        assert_eq!(fit_viewport((375., 667.), (500., 900.)), ((375., 667.), 1.));
-        assert_eq!(fit_viewport((820., 1180.), (410., 1180.)), ((410., 590.), 0.5));
-        assert_eq!(fit_viewport((0., 0.), (0., 0.)), ((0.05, 0.05), 0.05), "an empty viewport never makes a NaN size");
-        assert_eq!(fit_viewport((375., 667.), (f32::NAN, f32::NAN)), ((375., 667.), 1.));
+        assert_eq!(fit_viewport((375., 667.), (500., 900.), 1.), ((375., 667.), 1.));
+        assert_eq!(fit_viewport((820., 1180.), (410., 1180.), 1.), ((410., 590.), 0.5));
+        assert_eq!(
+            fit_viewport((0., 0.), (0., 0.), 1.),
+            ((1., 1.), 1.),
+            "an empty viewport in an empty area is 1px, never a NaN size"
+        );
+        // A 3840x2160 viewport at 500% still fits a narrow panel, however small that makes it.
+        let ((width, height), scale) = fit_viewport((3840., 2160.), (380., 1000.), 5.);
+        assert!((width - 380.).abs() < 1e-3 && height <= 1000. && (scale - 380. / 19200.).abs() < 1e-6);
+        // Rails wider than the panel leave a 1px area, as the web's `Math.max(1, …)`.
+        assert_eq!(fit_viewport((100., 100.), (-20., 100.), 1.), ((1., 1.), 0.01));
+        assert_eq!(fit_viewport((375., 667.), (f32::NAN, f32::NAN), 1.), ((375., 667.), 1.));
+        // At 200% a 390x844 viewport draws 780x1688, so the page still lays out 390 CSS px wide.
+        assert_eq!(fit_viewport((390., 844.), (2000., 2000.), 2.), ((780., 1688.), 1.));
+        assert_eq!(fit_viewport((390., 844.), (390., 2000.), 2.), ((390., 844.), 0.5));
+        assert_eq!(fit_viewport((390., 844.), (2000., 2000.), f64::NAN), ((390., 844.), 1.), "a bad zoom is 1");
     }
 
     #[test]
-    fn reads_failed_loads_from_the_error_page_probe() {
+    fn native_load_failures_read_as_chromium_net_errors() {
+        let failure = |domain: &str, code: i64| {
+            net_error(&wry::PageLoadError {
+                url: "https://a.test/".into(),
+                domain: domain.into(),
+                code,
+                description: String::new(),
+            })
+        };
+        // WebKitGTK.
+        assert_eq!(failure("g-io-error-quark", 39), Some((-102, "ERR_CONNECTION_REFUSED")));
+        assert_eq!(failure("g-resolver-error-quark", 0), Some((-105, "ERR_NAME_NOT_RESOLVED")));
+        assert_eq!(failure("g-io-error-quark", 24), Some((-118, "ERR_CONNECTION_TIMED_OUT")));
+        assert_eq!(failure("g-tls-error-quark", 2), Some((-202, "ERR_CERT_AUTHORITY_INVALID")));
+        assert_eq!(failure("WebKitPolicyError", 103), Some((-312, "ERR_UNSAFE_PORT")));
+        assert_eq!(failure("WebKitNetworkError", 302), None, "cancelled");
+        assert_eq!(failure("WebKitPolicyError", 102), None, "interrupted by a download");
+        assert_eq!(failure("g-io-error-quark", 19), None, "cancelled");
+        // WebView2, from its error page.
         assert_eq!(failed_load(r#""ERR_NAME_NOT_RESOLVED""#), Some((-105, "ERR_NAME_NOT_RESOLVED")));
         assert_eq!(failed_load(r#""ERR_CONNECTION_REFUSED""#), Some((-102, "ERR_CONNECTION_REFUSED")));
         assert_eq!(failed_load(r#""ERR_SOMETHING_NEW""#), Some((-2, "ERR_FAILED")));
@@ -1310,11 +1655,88 @@ mod tests {
     fn reads_the_history_scripts_message() {
         assert_eq!(
             history_message(r#"{"t3History":{"url":"https://a.test/#b","back":true,"forward":false}}"#),
-            Some(PageHistory { url: "https://a.test/#b".into(), back: true, forward: false })
+            Some(PageHistory {
+                url: "https://a.test/#b".into(),
+                back: true,
+                forward: false,
+                length: 1,
+                step: None,
+                delta: None
+            })
+        );
+        assert_eq!(
+            history_message(
+                r#"{"t3History":{"url":"https://a.test/","back":false,"forward":true,"length":3,"type":"traverse","delta":-1}}"#
+            ),
+            Some(PageHistory {
+                url: "https://a.test/".into(),
+                back: false,
+                forward: true,
+                length: 3,
+                step: Some(HistoryStep::Traverse),
+                delta: Some(-1)
+            })
         );
         assert_eq!(history_message(r#"{"t3History":{"url":"https://a.test/","back":true}}"#), None);
         assert_eq!(history_message("not json"), None);
         assert_eq!(history_message(r#"{"other":1}"#), None);
+    }
+
+    fn report(length: usize, step: Option<HistoryStep>, delta: Option<isize>) -> PageHistory {
+        // What the Navigation API says on a page whose neighbours are on other origins.
+        PageHistory { url: "https://b.test/".into(), back: false, forward: false, length, step, delta }
+    }
+
+    #[test]
+    fn back_and_forward_count_entries_on_other_origins() {
+        let push = Some(HistoryStep::Push);
+        let mut history = SessionHistory::default();
+        assert_eq!(history.report(&report(1, push, None)), (false, false), "the first page (after its redirect)");
+        assert_eq!(history.report(&report(2, push, None)), (true, false), "a URL typed in the address bar");
+        history.traverse(-1);
+        assert_eq!(history.report(&report(2, Some(HistoryStep::Traverse), None)), (false, true), "Back");
+        history.traverse(1);
+        assert_eq!(history.report(&report(2, Some(HistoryStep::Traverse), None)), (true, false), "Forward");
+        assert_eq!(history.report(&report(2, Some(HistoryStep::Reload), None)), (true, false), "a reload stays put");
+        assert_eq!(history.report(&report(2, Some(HistoryStep::Replace), None)), (true, false), "so does a replace");
+
+        // A traversal the page measured on its own origin wins over the app's step.
+        history.traverse(-2);
+        assert_eq!(history.report(&report(2, Some(HistoryStep::Traverse), Some(-1))), (false, true));
+        assert_eq!(history.report(&report(2, push, None)), (true, false), "a push drops the entries ahead");
+
+        // WebKit without `navigation.activation`: a longer history is a push, the same one stays put.
+        let mut webkit = SessionHistory::default();
+        assert_eq!(webkit.report(&report(1, None, None)), (false, false));
+        assert_eq!(webkit.report(&report(2, None, None)), (true, false));
+        assert_eq!(webkit.report(&report(2, None, None)), (true, false), "pageshow repeats the report");
+        webkit.traverse(-1);
+        assert_eq!(webkit.report(&report(2, None, None)), (false, true));
+
+        // The page's own answer still counts.
+        let same_origin = PageHistory { back: true, ..report(1, push, None) };
+        assert_eq!(SessionHistory::default().report(&same_origin), (true, false));
+    }
+
+    #[test]
+    fn the_shortcut_script_posts_what_the_app_reads() {
+        let chords = r#"[{"command":"sidebar.toggle","key":"b","meta":false,"ctrl":true,"shift":false,"alt":false}]"#;
+        let script = shortcut_script(chords, true);
+        assert!(script.contains(&format!("let chords = {chords};")) && script.contains("const mac = true;"));
+        assert!(!script.contains("__CHORDS__") && !script.contains("__MAC__"));
+        assert!(script.contains("window.ipc.postMessage(JSON.stringify({ t3Shortcut: command }))"));
+        assert_eq!(shortcut_message(r#"{"t3Shortcut":"sidebar.toggle"}"#).as_deref(), Some("sidebar.toggle"));
+        assert_eq!(shortcut_message(r#"{"t3Shortcut":1}"#), None);
+        assert_eq!(shortcut_message(r#"{"t3History":{}}"#), None);
+    }
+
+    #[test]
+    fn the_corner_script_posts_what_the_app_reads() {
+        assert!(CORNER_SCRIPT.contains("JSON.stringify({ t3Corner: next })"));
+        assert_eq!(corner_message(r#"{"t3Corner":true}"#), Some(true));
+        assert_eq!(corner_message(r#"{"t3Corner":false}"#), Some(false));
+        assert_eq!(corner_message(r#"{"t3Corner":1}"#), None);
+        assert_eq!(corner_message(r#"{"t3Shortcut":"x"}"#), None);
     }
 
     #[test]
@@ -1323,7 +1745,7 @@ mod tests {
             serde_json::from_value(json!({"_tag": "preset", "presetId": "ipad-air", "width": 820, "height": 1180}))
                 .unwrap();
         assert_eq!(fixed.size(), Some((820., 1180.)));
-        assert_eq!(fixed.preset_id(), Some("ipad-air"));
+        assert_eq!(fixed.choice(), "ipad-air");
         let fill: Viewport = serde_json::from_value(json!({"_tag": "fill"})).unwrap();
         assert_eq!(fill.size(), None);
     }
@@ -1409,6 +1831,33 @@ mod tests {
             "serverEpoch": "e1", "revision": 5, "snapshot": session("c", "6")});
         previews.apply_event(&reopened).unwrap();
         assert!(previews.get("c").is_some(), "the id is usable again");
+    }
+
+    #[test]
+    fn equal_thread_and_tab_ids_on_two_environments_stay_apart() {
+        let (a, b) = (SharedString::from("env-a"), SharedString::from("env-b"));
+        let (thread_a, thread_b) = (ThreadRef::new(a.clone(), "t1"), ThreadRef::new(b.clone(), "t1"));
+        let mut threads = PreviewThreads::default();
+        let list = json!({"sessions": [session("tab-1", "1")], "serverEpoch": "epoch-a", "revision": 3});
+        assert!(threads.apply_list(&thread_a, &list).is_empty());
+
+        // Another server, another epoch: not a restart of the first one's.
+        let opened = json!({"type": "opened", "threadId": "t1", "tabId": "tab-1", "createdAt": "2",
+            "serverEpoch": "epoch-b", "revision": 1, "snapshot": session("tab-1", "2")});
+        let applied = threads.apply_event(&b, &opened).expect("names its thread");
+        assert_eq!(applied.thread, thread_b);
+        assert!(applied.needs_list, "the second environment's list hasn't loaded");
+        assert_eq!(threads.get(&thread_a).map(|p| p.list_loaded), Some(true), "the first keeps its list");
+        assert_eq!(threads.session(&thread_a.tab("tab-1")).map(|s| s.updated_at.as_str()), Some("1"));
+        assert_eq!(threads.session(&thread_b.tab("tab-1")).map(|s| s.updated_at.as_str()), Some("2"));
+
+        let closed = json!({"type": "closed", "threadId": "t1", "tabId": "tab-1", "createdAt": "3",
+            "serverEpoch": "epoch-b", "revision": 2});
+        threads.apply_event(&b, &closed);
+        assert!(threads.session(&thread_b.tab("tab-1")).is_none());
+        assert!(threads.session(&thread_a.tab("tab-1")).is_some(), "a close on one environment leaves the other");
+        assert_eq!(threads.on_environment("env-a").collect::<Vec<_>>(), [&thread_a]);
+        assert_eq!(threads.apply_event(&a, &json!({"type": "opened"})), None, "an event without a thread");
     }
 
     #[test]

@@ -579,6 +579,9 @@ pub struct InputBaseState<M: InputModeKind> {
     ///
     pub(super) enable_context_menu: bool,
 
+    /// Metadata for the clipboard entry `Copy` and `Cut` write, from the copied text.
+    copy_item: Option<Rc<dyn Fn(&str, &mut Window, &mut App) -> Option<ClipboardItem>>>,
+
     /// A flag to indicate if we are currently inserting a completion item.
     pub(super) completion_inserting: bool,
     pub(super) overlay_action_handler: Option<
@@ -1047,6 +1050,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             context_menu_handler: None,
             pending_context_menu: None,
             enable_context_menu: true,
+            copy_item: None,
             completion_inserting: false,
             overlay_action_handler: None,
             silent_replace_text: false,
@@ -1071,6 +1075,21 @@ impl<M: InputModeKind> InputBaseState<M> {
 
     pub fn set_context_menu_enabled(&mut self, enabled: bool) {
         self.enable_context_menu = enabled;
+    }
+
+    /// Replaces what `Copy` and `Cut` put on the clipboard (to add metadata or HTML): `f`
+    /// gets the copied text and returns the item, or `None` for plain text.
+    pub fn set_copy_item(
+        &mut self,
+        f: impl Fn(&str, &mut Window, &mut App) -> Option<ClipboardItem> + 'static,
+    ) {
+        self.copy_item = Some(Rc::new(f));
+    }
+
+    /// The clipboard item for copied `text`: [`Self::set_copy_item`]'s, else plain text.
+    fn copied_item(&self, text: String, window: &mut Window, cx: &mut App) -> ClipboardItem {
+        let item = self.copy_item.clone().and_then(|f| f(&text, window, cx));
+        item.unwrap_or_else(|| ClipboardItem::new_string(text))
     }
 
     /// Set whether search UI allows replacement, default is true.
@@ -3166,14 +3185,15 @@ impl<M: InputModeKind> InputBaseState<M> {
             .collect()
     }
 
-    pub(super) fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn copy(&mut self, _: &Copy, window: &mut Window, cx: &mut Context<Self>) {
         if !self.is_copyable() {
             return;
         }
 
         let texts = self.selected_texts();
 
-        cx.write_to_clipboard(ClipboardItem::new_string(texts.join("\n")));
+        let item = self.copied_item(texts.join("\n"), window, cx);
+        cx.write_to_clipboard(item);
     }
 
     pub(super) fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
@@ -3183,7 +3203,8 @@ impl<M: InputModeKind> InputBaseState<M> {
 
         let texts = self.selected_texts();
 
-        cx.write_to_clipboard(ClipboardItem::new_string(texts.join("\n")));
+        let item = self.copied_item(texts.join("\n"), window, cx);
+        cx.write_to_clipboard(item);
 
         self.undo_manager.set_pending_intent(EditIntent::Atomic);
         self.replace_text_in_range_silent(None, "", window, cx);
@@ -4614,9 +4635,14 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
             .map(|range| self.range_to_utf16(&range.into()))
     }
 
-    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
-        self.ime_marked_range = None;
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let ended_uncommitted = self.ime_marked_range.take().is_some();
         self.undo_manager.commit_transaction();
+        // Marked text emits no change, so a composition that ends without a
+        // commit (cancelled, or left as typed) reports one here.
+        if ended_uncommitted && self.emit_events {
+            self.emit_change(cx);
+        }
     }
 
     /// Replace text in range.
@@ -5012,6 +5038,13 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         }
         if new_text.is_empty() {
             self.undo_manager.commit_transaction();
+            // An empty preedit cancels the composition and clears the mark, so a
+            // later `unmark_text` cannot report it: report the cancel here. The
+            // text is back to what it was, so no edit batch goes out; the next
+            // one still spans from the pre-composition text.
+            if !starts_composition && self.emit_events {
+                cx.emit(InputEvent::Change);
+            }
         }
         cx.notify();
     }
@@ -9309,25 +9342,55 @@ mod tests {
     }
 
     /// Canceling a composition via `unmark_text` closes its transaction so it
-    /// does not leak and swallow a later edit.
+    /// does not leak and swallow a later edit, and reports the change the
+    /// marked text never did; a commit's own change is not reported twice.
     #[gpui::test]
     fn test_composition_cancel_via_unmark_does_not_leak(cx: &mut TestAppContext) {
         let input_view = InputView::build_textarea(cx, |state| state.default_value(""));
         let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
         let input = input_view.input;
+        let changes = Rc::new(Cell::new(0));
+        let observed = changes.clone();
+        let _subscription = cx.update(|_, cx| {
+            cx.subscribe(&input, move |_, event: &InputEvent, _| {
+                if matches!(event, InputEvent::Change) {
+                    observed.set(observed.get() + 1);
+                }
+            })
+        });
 
-        cx.update(|window, cx| {
+        let after_cancel = cx.update(|window, cx| {
             input.update(cx, |s, cx| {
                 // Start a composition, then cancel it via unmark.
                 s.replace_and_mark_text_in_range(None, "n", Some(1..1), window, cx);
                 s.unmark_text(window, cx);
-                let after_cancel = s.undo_manager.undo_count();
+                s.unmark_text(window, cx);
+                s.undo_manager.undo_count()
+            })
+        });
+        assert_eq!(changes.get(), 1, "the cancel is reported once");
 
+        cx.update(|window, cx| {
+            input.update(cx, |s, cx| {
                 // A later edit is recorded independently.
                 s.replace_text_in_range(None, "x", window, cx);
                 assert_eq!(s.undo_manager.undo_count(), after_cancel + 1);
+                s.replace_and_mark_text_in_range(None, "y", Some(1..1), window, cx);
+                s.replace_text_in_range(None, "y", window, cx);
+                s.unmark_text(window, cx);
             });
         });
+        assert_eq!(changes.get(), 3, "a commit followed by unmark is one change");
+
+        cx.update(|window, cx| {
+            input.update(cx, |s, cx| {
+                // Cancelled through an empty preedit; the unmark that follows adds nothing.
+                s.replace_and_mark_text_in_range(None, "z", Some(1..1), window, cx);
+                s.replace_and_mark_text_in_range(None, "", None, window, cx);
+                s.unmark_text(window, cx);
+            });
+        });
+        assert_eq!(changes.get(), 4, "an empty-preedit cancel is reported once");
     }
 
     #[gpui::test]
@@ -10629,6 +10692,35 @@ mod tests {
                     assert_eq!(state.value(), "abcdef");
                     assert_eq!(state.selected_range(), 0..5);
                 }
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn test_copy_and_cut_write_the_copy_item(cx: &mut TestAppContext) {
+        let view = InputView::build_textarea(cx, |state| state.default_value("one two"));
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        cx.update(|window, cx| {
+            view.input.update(cx, |state, cx| {
+                state.set_selected_range(0..3, cx);
+                state.copy(&Copy, window, cx);
+                assert_eq!(cx.read_from_clipboard().unwrap().metadata(), None);
+                state.set_copy_item(|text, _, _| {
+                    let metadata = format!("[{text}]");
+                    (text != "two")
+                        .then(|| ClipboardItem::new_string_with_metadata(text.into(), metadata))
+                });
+                state.copy(&Copy, window, cx);
+                let copied = cx.read_from_clipboard().unwrap();
+                assert_eq!(copied.text().as_deref(), Some("one"));
+                assert_eq!(copied.metadata().map(String::as_str), Some("[one]"));
+                state.cut(&Cut, window, cx);
+                let cut = cx.read_from_clipboard().unwrap();
+                assert_eq!(cut.metadata().map(String::as_str), Some("[one]"));
+                assert_eq!(state.value(), " two");
+                state.set_selected_range(1..4, cx);
+                state.copy(&Copy, window, cx);
+                assert_eq!(cx.read_from_clipboard().unwrap().metadata(), None);
             });
         });
     }
@@ -12056,6 +12148,45 @@ mod tests {
 4. c");
                 assert_eq!(state.selections.iter().count(), 1);
                 assert_eq!(state.selected_range(), 8..8);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn test_retokenize_keeps_history_and_moves_a_covered_caret(cx: &mut TestAppContext) {
+        use crate::input::{InlineToken, InputContent};
+        let view = multi_line(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("say hi", window, cx);
+                state.replace_ranges(&[(0..0, "ok ".to_string())], 4..4, window, cx);
+                let content = InputContent::new("ok say hi")
+                    .with_token(3..6, InlineToken::new("t", "say"))
+                    .unwrap();
+                state.retokenize(content, cx).unwrap();
+                assert_eq!(state.tokens().len(), 1);
+                assert_eq!(state.selected_range(), 6..6);
+                assert!(state.retokenize(InputContent::new("other"), cx).is_err());
+
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), "say hi");
+                assert_eq!(state.tokens()[0].range(), 0..3);
+
+                // Every cursor is normalized, each keeping its direction.
+                state.set_value("say hi you", window, cx);
+                state.set_selected_range_with_direction(1..5, true, cx);
+                state.add_selection(8..8, cx);
+                let content = InputContent::new("say hi you")
+                    .with_token(0..3, InlineToken::new("t", "say"))
+                    .and_then(|content| content.with_token(7..10, InlineToken::new("u", "you")))
+                    .unwrap();
+                state.retokenize(content, cx).unwrap();
+                assert!(state.is_selection_reversed());
+                let ranges: Vec<_> = state.selections.iter().map(|s| s.start..s.end).collect();
+                assert_eq!(ranges, [0..5, 10..10]);
             });
         });
     }

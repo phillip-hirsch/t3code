@@ -37,10 +37,13 @@ pub(super) struct ScopedGroup {
     pub(super) has_other_members: bool,
 }
 
-/// `ProjectSettingsPanel`'s member filter: only `machine`'s checkouts, when one is picked.
-pub(super) fn narrow(group: &ProjectGroup, machine: Option<&str>) -> ScopedGroup {
+/// `ProjectSettingsPanel`'s member filter: only `machine`'s checkouts, and only `checkout`,
+/// when picked.
+pub(super) fn narrow(group: &ProjectGroup, machine: Option<&str>, checkout: Option<&str>) -> ScopedGroup {
     let mut scoped = group.clone();
-    scoped.members.retain(|m| machine.is_none_or(|id| m.project.environment_id == id));
+    scoped.members.retain(|m| {
+        machine.is_none_or(|id| m.project.environment_id == id) && checkout.is_none_or(|key| m.physical_key == key)
+    });
     let has_other_members = scoped.members.len() < group.members.len();
     ScopedGroup { group: scoped, whole_members: group.members.clone(), has_other_members }
 }
@@ -80,7 +83,8 @@ pub(super) fn has_default_icon(member: &Member) -> bool {
     }
 }
 
-/// `planProjectRemoval`: whether the whole group goes, and the confirmation to show.
+/// `planProjectRemoval`: whether the whole group goes, and the confirmation to show. `unloaded`
+/// counts the members' threads the shell left out (older settled ones).
 pub(super) fn plan_removal(
     members: &[&Member],
     group_member_count: usize,
@@ -88,11 +92,13 @@ pub(super) fn plan_removal(
     display_name: &str,
     environment_label: Option<&str>,
     threads: &[ThreadShell],
+    unloaded: usize,
 ) -> (bool, String) {
     let thread_count = threads
         .iter()
-        .filter(|thread| thread.is_listed() && members.iter().any(|m| m.project.id == thread.project_id))
-        .count();
+        .filter(|thread| thread.is_listed() && members.iter().any(|m| m.project.project_ref() == thread.project_ref()))
+        .count()
+        + unloaded;
     let whole_group = members.len() == group_member_count;
     let kind = if has_other_members || !whole_group { "checkout" } else { "project" };
     let single = if let [member] = members { Some(*member) } else { None };
@@ -145,7 +151,7 @@ mod tests {
     }
 
     #[test]
-    fn a_picked_machine_narrows_the_group_to_its_checkouts() {
+    fn a_picked_machine_or_checkout_narrows_the_group() {
         let member = |id: &str, environment: &str| {
             let mut project = project(id, &format!("/{id}"), Value::Null);
             project.environment_id = environment.into();
@@ -165,14 +171,16 @@ mod tests {
             archived: false,
         };
         let ids = |members: &[Member]| members.iter().map(|m| m.project.id.clone()).collect::<Vec<_>>();
-        let scoped = narrow(&group, Some("laptop"));
+        let scoped = narrow(&group, Some("laptop"), None);
         assert_eq!(ids(&scoped.group.members), ["a", "c"]);
         assert_eq!(ids(&scoped.whole_members), ["a", "b", "c"]);
         assert!(scoped.has_other_members);
-        let all = narrow(&group, None);
+        let all = narrow(&group, None, None);
         assert_eq!(ids(&all.group.members), ["a", "b", "c"]);
         assert!(!all.has_other_members);
-        assert!(narrow(&group, Some("gone")).group.members.is_empty());
+        assert!(narrow(&group, Some("gone"), None).group.members.is_empty());
+        let checkout = narrow(&group, Some("laptop"), Some("c"));
+        assert_eq!((ids(&checkout.group.members), checkout.has_other_members), (vec!["c".to_owned()], true));
     }
 
     #[test]
@@ -205,7 +213,10 @@ mod tests {
             "updatedAt": "2026-11-01T00:00:00.000Z", "createdAt": "2026-11-01T00:00:00.000Z",
         }))
         .unwrap();
-        let (whole, message) = plan_removal(&[&member], 1, false, "api", Some("box"), &[thread]);
+        // The same project id on another environment holds threads of its own.
+        let mut elsewhere = thread.clone();
+        elsewhere.environment_id = "other".into();
+        let (whole, message) = plan_removal(&[&member], 1, false, "api", Some("box"), &[thread, elsewhere], 0);
         assert!(whole);
         assert_eq!(
             message,
@@ -213,9 +224,14 @@ mod tests {
              Those threads and any archived threads are deleted from T3 Code. Provider sessions are kept.\n\
              This removes only the project entries, not the files on disk.\nThis action cannot be undone."
         );
-        let (whole, message) = plan_removal(&[&member], 2, false, "group", None, &[]);
+        let (whole, message) = plan_removal(&[&member], 2, false, "group", None, &[], 0);
         assert!(!whole);
         assert!(message.starts_with("Remove checkout \"api\"?\nPath: /src/api\nAny archived"));
+        // Older settled threads the shell left out count too.
+        let (_, message) = plan_removal(&[&member], 2, false, "group", None, &[], 2);
+        assert!(
+            message.starts_with("Remove checkout \"api\" and delete its 2 threads?\nPath: /src/api\nThose threads")
+        );
         assert!(message.contains("Other entries in this grouped project are unaffected."));
     }
 }

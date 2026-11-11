@@ -9,7 +9,7 @@ use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, Context, ElementId, FontWeight, InteractiveElement as _, IntoElement, ListAlignment, ListState,
-    ParentElement as _, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, div, list, px,
+    ParentElement as _, ScrollHandle, SharedString, Styled as _, div, list, px,
 };
 
 use crate::app::Workspace;
@@ -158,13 +158,6 @@ pub(super) fn column_label(mut column: usize) -> String {
 }
 
 impl Table {
-    /// A spreadsheet's cells under lettered columns.
-    pub(super) fn grid(rows: &[Vec<String>]) -> Self {
-        let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
-        let rows = rows.iter().map(|row| row.iter().map(|c| SharedString::from(c.clone())).collect()).collect();
-        Self::new(Cells { header: Vec::new(), rows, columns })
-    }
-
     pub(super) fn new(Cells { header, rows, columns }: Cells) -> Self {
         let list = ListState::new(rows.len(), ListAlignment::Top, px(300.)).with_uniform_item_height(px(ROW_HEIGHT));
         Self { header, rows, columns, scroll: ScrollHandle::new(), list, measured: RefCell::new(0..0) }
@@ -263,12 +256,10 @@ impl Workspace {
             }),
         )
         .flex_1();
-        div()
-            .id(ElementId::Name(format!("table-scroll:{id}").into()))
+        let scroller = div().id(ElementId::Name(format!("table-scroll:{id}").into()));
+        crate::app::history_swipe::horizontal_scroller(scroller, &table.scroll)
             .flex_1()
             .min_h_0()
-            .overflow_x_scroll()
-            .track_scroll(&table.scroll)
             .text_xs()
             .child(v_flex().w(px(table_width)).h_full().child(header).child(list))
             .into_any_element()

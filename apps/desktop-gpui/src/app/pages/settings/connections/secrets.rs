@@ -9,28 +9,24 @@ use gpui_kit::component::{WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, ElementId, Entity, FontWeight, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window,
-    div, px,
+    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window, div,
+    px,
 };
 use serde_json::{Value, json};
 
 use super::super::widgets::{RowFrame, section_with_action, settings_section};
-use super::logic::{self, PROVIDERS_MANAGE, SecretProviderDraft};
+use super::SettingsWriter;
+use super::logic::{self, PROVIDERS_MANAGE, SETTINGS_WRITE, SecretProviderDraft};
 use super::ui::{self, Size, Variant, WebButton, text_sm, text_xs};
-use super::{SessionLoad, check_session, error_toast, update_settings};
 use crate::app::Workspace;
 use crate::app::pages::settings::widgets::SettingsView;
-use crate::rpc::RpcClient;
 use crate::settings::scope::ScopeKind;
 use crate::theme::{self, Tokens};
 
-/// What the page keeps: the session (for `providers:manage`) and revealed accounts.
+/// The accounts the page has revealed.
 #[derive(Default)]
 pub(super) struct SecretsState {
-    started: bool,
-    session: SessionLoad,
     revealed: HashSet<String>,
-    _session_task: Option<Task<()>>,
 }
 
 impl Workspace {
@@ -42,13 +38,6 @@ impl Workspace {
     ) -> AnyElement {
         let state =
             window.use_keyed_state(self.settings_state_key("settings-secrets"), cx, |_, _| SecretsState::default());
-        let started = state.read(cx).started;
-        if let (Some(endpoint), Some(_), false) = (self.settings_endpoint().cloned(), self.settings_client(), started) {
-            state.update(cx, |state, cx| {
-                state.started = true;
-                state._session_task = Some(check_session(endpoint, cx, |this, session, _| this.session = session));
-            });
-        }
         let t = *theme::tokens(cx);
         let config = &self.settings_info().config;
         let connected = self.settings_client().is_some() && config.is_object();
@@ -57,7 +46,9 @@ impl Workspace {
             message_section(format!("Update T3 Code on {label} to manage its secret providers."), &t)
         } else if connected {
             let project_scoped = matches!(view.scope.kind, ScopeKind::Project { .. });
-            self.secret_providers(&state, label, project_scoped, cx, &t)
+            let host =
+                SettingsWriter { workspace: cx.entity().downgrade(), environment: self.settings_environment(), label };
+            self.secret_providers(&state, host, project_scoped, cx, &t)
         } else {
             message_section(
                 "Connect an environment to manage the secret providers its provider variables read from.".into(),
@@ -70,24 +61,22 @@ impl Workspace {
     fn secret_providers(
         &self,
         state: &Entity<SecretsState>,
-        environment: String,
+        host: SettingsWriter,
         project_scoped: bool,
         cx: &App,
         t: &Tokens,
     ) -> AnyElement {
         let s = state.read(cx);
         // Provider settings and secret providers need the same grant; a project can't own them.
-        let read_only = !s.session.grants(PROVIDERS_MANAGE) || project_scoped;
+        let read_only = !self.settings_grants(PROVIDERS_MANAGE) || project_scoped;
         let empty = serde_json::Map::new();
         let providers = self.server_settings()["secretProviders"].as_object().unwrap_or(&empty);
-        let ids: Vec<String> = providers.keys().cloned().collect();
-        let client = self.settings_client();
         let add = (!read_only).then(|| {
-            let (client, environment, ids) = (client.clone(), environment.clone(), ids.clone());
+            let host = host.clone();
             WebButton::new("add-secret-provider", "Add provider")
                 .icon(IconName::Plus)
                 .on_click(move |_, window, cx| {
-                    open_provider_dialog(client.clone(), environment.clone(), ids.clone(), None, window, cx);
+                    open_provider_dialog(host.clone(), None, window, cx);
                 })
                 .into_any_element()
         });
@@ -131,24 +120,17 @@ impl Workspace {
                     };
                     let controls = (!read_only).then(|| {
                         let edit = account.is_some().then(|| {
-                            let (client, environment, ids) = (client.clone(), environment.clone(), ids.clone());
+                            let host = host.clone();
                             let editing = (id.clone(), provider.clone());
                             WebButton::new(ElementId::Name(format!("secret-provider-edit-{id}").into()), "Edit")
                                 .variant(Variant::Ghost)
                                 .on_click(move |_, window, cx| {
                                     let editing = Some(editing.clone());
-                                    open_provider_dialog(
-                                        client.clone(),
-                                        environment.clone(),
-                                        ids.clone(),
-                                        editing,
-                                        window,
-                                        cx,
-                                    );
+                                    open_provider_dialog(host.clone(), editing, window, cx);
                                 })
                         });
                         let remove = {
-                            let (client, id, label) = (client.clone(), id.clone(), label.clone());
+                            let (host, id, label) = (host.clone(), id.clone(), label.clone());
                             let uses: Vec<String> = logic::secret_provider_uses(self.server_settings(), &id)
                                 .into_iter()
                                 .map(|u| u.label)
@@ -156,7 +138,7 @@ impl Workspace {
                             WebButton::new(ElementId::Name(format!("secret-provider-remove-{id}").into()), "Remove")
                                 .variant(Variant::Ghost)
                                 .on_click(move |_, window, cx| {
-                                    confirm_remove(client.clone(), id.clone(), label.clone(), uses.clone(), window, cx);
+                                    confirm_remove(host.clone(), id.clone(), label.clone(), uses.clone(), window, cx);
                                 })
                         };
                         h_flex().gap(px(4.)).children(edit).child(remove).into_any_element()
@@ -189,6 +171,7 @@ fn redacted_account(state: &Entity<SecretsState>, id: &str, account: &str, revea
         .min_w_0()
         .truncate()
         .cursor_pointer()
+        .map(|el| ui::tab_stop(el, t.ring))
         .font_family(t.fonts.mono)
         .text_size(px(11.))
         .text_color(t.muted_foreground)
@@ -210,7 +193,7 @@ fn redacted_account(state: &Entity<SecretsState>, id: &str, account: &str, revea
 
 /// `RemoveSecretProviderButton`; `uses` are what reads from the provider and will be unset.
 fn confirm_remove(
-    client: Option<RpcClient>,
+    host: SettingsWriter,
     id: String,
     label: String,
     uses: Vec<String>,
@@ -218,7 +201,7 @@ fn confirm_remove(
     cx: &mut App,
 ) {
     window.open_alert_dialog(cx, move |dialog, _, cx| {
-        let (client, id) = (client.clone(), id.clone());
+        let (host, id) = (host.clone(), id.clone());
         let t = theme::tokens(cx);
         let description = if uses.is_empty() {
             format!("Nothing reads from {label}. The secrets themselves are untouched.").into_any_element()
@@ -249,32 +232,22 @@ fn confirm_remove(
             .ok_variant(gpui_kit::component::button::ButtonVariant::Danger)
             .on_ok(move |_, window, cx| {
                 let patch = json!({ "secretProviders": { id.clone(): null } });
-                save(client.clone(), patch, window, cx);
+                // Removing also unsets what reads from it (`requiredScopesForServerSettingsPatch`).
+                host.save(patch, &[SETTINGS_WRITE, PROVIDERS_MANAGE], window, cx);
                 true
             })
     });
-}
-
-fn save(client: Option<RpcClient>, patch: Value, window: &mut Window, cx: &mut App) {
-    window
-        .spawn(cx, async move |cx| {
-            if let Err(error) = update_settings(client, patch).await {
-                let _ = cx.update(|window, cx| error_toast(window, cx, "Could not update settings", error));
-            }
-        })
-        .detach();
 }
 
 /// The add/edit dialog's form (`SecretProviderDialog`); one per open, so each starts fresh.
 struct ProviderForm {
     name: Entity<InputState>,
     account: Entity<InputState>,
-    existing_ids: Vec<String>,
     /// The provider being edited: its id and stored config.
     editing: Option<(String, Value)>,
     submitted: bool,
-    client: Option<RpcClient>,
-    _subscriptions: [Subscription; 2],
+    host: SettingsWriter,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl ProviderForm {
@@ -285,15 +258,30 @@ impl ProviderForm {
         }
     }
 
+    /// The destination's providers now, not at open: another client may have added or removed one.
+    fn existing_ids(&self, cx: &App) -> Vec<String> {
+        let Some(workspace) = self.host.workspace.upgrade() else { return Vec::new() };
+        let environment = self.host.environment.as_deref().unwrap_or_default();
+        let info = workspace.read(cx).env_info(environment);
+        info.and_then(|info| info.settings["secretProviders"].as_object())
+            .map(|providers| providers.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
     fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.submitted = true;
         cx.notify();
+        let existing_ids = self.existing_ids(cx);
         let editing = self.editing.as_ref().map(|(id, _)| id.as_str());
-        let Ok(entry) = logic::secret_provider_from_draft(&self.draft(cx), &self.existing_ids, editing) else { return };
+        // The web unmounts the edit dialog once its provider is gone; don't recreate it.
+        if editing.is_some_and(|id| !existing_ids.iter().any(|existing| existing == id)) {
+            return window.close_dialog(cx);
+        }
+        let Ok(entry) = logic::secret_provider_from_draft(&self.draft(cx), &existing_ids, editing) else { return };
         let patch = json!({ "secretProviders": { entry.id: {
             "kind": "one_password", "label": entry.label, "config": { "account": entry.account },
         } } });
-        save(self.client.clone(), patch, window, cx);
+        self.host.save(patch, &[PROVIDERS_MANAGE], window, cx);
         window.close_dialog(cx);
     }
 }
@@ -302,7 +290,7 @@ impl Render for ProviderForm {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = *theme::tokens(cx);
         let editing = self.editing.as_ref().map(|(id, _)| id.as_str());
-        let result = logic::secret_provider_from_draft(&self.draft(cx), &self.existing_ids, editing);
+        let result = logic::secret_provider_from_draft(&self.draft(cx), &self.existing_ids(cx), editing);
         let issues =
             if self.submitted { result.as_ref().err().cloned().unwrap_or_default() } else { Default::default() };
         let field =
@@ -346,14 +334,7 @@ impl Render for ProviderForm {
     }
 }
 
-fn open_provider_dialog(
-    client: Option<RpcClient>,
-    environment: String,
-    existing_ids: Vec<String>,
-    editing: Option<(String, Value)>,
-    window: &mut Window,
-    cx: &mut App,
-) {
+fn open_provider_dialog(host: SettingsWriter, editing: Option<(String, Value)>, window: &mut Window, cx: &mut App) {
     let draft = editing.as_ref().map(|(_, config)| SecretProviderDraft {
         name: config["label"].as_str().unwrap_or_default().to_owned(),
         account: logic::one_password_account(config).unwrap_or_default(),
@@ -367,7 +348,8 @@ fn open_provider_dialog(
         None => "Add a 1Password provider".into(),
     };
     let description: SharedString = format!(
-        "Provider variables on {environment} can read values from it by name. Values are read with the op CLI on that server when a provider starts."
+        "Provider variables on {} can read values from it by name. Values are read with the op CLI on that server when a provider starts.",
+        host.label
     )
     .into();
     let form = cx.new(|cx| {
@@ -383,13 +365,16 @@ fn open_provider_dialog(
             }
         };
         ProviderForm {
-            _subscriptions: [cx.subscribe_in(&name, window, on_input), cx.subscribe_in(&account, window, on_input)],
+            _subscriptions: [cx.subscribe_in(&name, window, on_input), cx.subscribe_in(&account, window, on_input)]
+                .into_iter()
+                // Re-validate when the destination's providers change, as the web's render does.
+                .chain(host.workspace.upgrade().map(|workspace| cx.observe(&workspace, |_, _, cx| cx.notify())))
+                .collect(),
             name,
             account,
-            existing_ids,
             editing,
             submitted: false,
-            client,
+            host,
         }
     });
     window.open_dialog(cx, move |dialog, _, cx| {

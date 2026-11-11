@@ -11,18 +11,52 @@ use serde_json::json;
 
 use super::{Workspace, new_id};
 use crate::inbox::Facts;
-use crate::model::ThreadShell;
+use crate::model::{ScopedId, ThreadShell};
 
 const THROTTLE_MS: i64 = 10_000;
 
 #[derive(Default)]
 pub(super) struct VisitTracker {
-    thread_id: Option<String>,
+    thread: Option<ScopedId>,
     state: VisitState,
-    /// When this client last opened each thread, sent or not, so recent threads follow
-    /// switches the server merges or never hears (`localThreadOpens`).
-    local_opens: HashMap<String, i64>,
+    /// A page replaces the chat, which the web's tracker is mounted with.
+    hidden: bool,
+    /// When this client last opened each thread, on its environment, sent or not, so recent
+    /// threads follow switches the server merges or never hears (`localThreadOpens`).
+    local_opens: HashMap<ScopedId, i64>,
     _timer: Option<Task<()>>,
+}
+
+impl VisitTracker {
+    /// Tracks `thread` as newly opened at `now`, keeping when other threads were opened.
+    fn open(&mut self, thread: ScopedId, now: i64) {
+        let mut local_opens = std::mem::take(&mut self.local_opens);
+        local_opens.insert(thread.clone(), now);
+        *self = Self {
+            thread: Some(thread),
+            state: VisitState { open_pending: true, ..VisitState::default() },
+            hidden: false,
+            local_opens,
+            _timer: None,
+        };
+    }
+
+    /// Whether tracking runs, with the chat `shown` or replaced by a page. Showing it again
+    /// opens `open_thread`, the tracked thread when it is still the one on screen, anew.
+    fn show(&mut self, shown: bool, open_thread: Option<ScopedId>, now: i64) -> bool {
+        if !shown {
+            self.hidden = true;
+            return false;
+        }
+        if let (true, Some(thread)) = (std::mem::take(&mut self.hidden), open_thread) {
+            self.open(thread, now);
+        }
+        true
+    }
+
+    fn opened_at(&self, thread: &ScopedId) -> Option<i64> {
+        self.local_opens.get(thread).copied()
+    }
 }
 
 #[derive(Default)]
@@ -99,35 +133,43 @@ fn decide_now(state: &mut VisitState, shell: &ThreadShell, woke_at: Option<&str>
 }
 
 impl Workspace {
-    /// Starts tracking `thread_id` as the thread on screen.
-    pub(super) fn open_visit(&mut self, thread_id: &str, cx: &mut Context<Self>) {
-        let mut local_opens = std::mem::take(&mut self.visit.local_opens);
-        local_opens.insert(thread_id.to_owned(), super::sidebar::now_ms());
-        self.visit = VisitTracker {
-            thread_id: Some(thread_id.to_owned()),
-            state: VisitState { open_pending: true, ..VisitState::default() },
-            local_opens,
-            _timer: None,
-        };
+    /// Starts tracking `thread` as the thread on screen.
+    pub(super) fn open_visit(&mut self, thread: ScopedId, cx: &mut Context<Self>) {
+        self.visit.open(thread, super::sidebar::now_ms());
         self.track_visit(cx);
     }
 
-    /// When this client last opened `thread_id`.
-    pub(super) fn local_opened_at(&self, thread_id: &str) -> Option<i64> {
-        self.visit.local_opens.get(thread_id).copied()
+    /// When this client last opened `thread`, on its environment.
+    pub(super) fn local_opened_at(&self, thread: &ThreadShell) -> Option<i64> {
+        self.visit.opened_at(&ScopedId::of_thread(thread))
+    }
+
+    /// Whether the chat is on screen: Pull requests and the other non-modal pages replace it,
+    /// while Settings and Usage open over it.
+    fn chat_shown(&self) -> bool {
+        self.page.is_none_or(super::pages::Page::is_modal)
+    }
+
+    /// Runs on each render: tracking stops while a page replaces the chat and starts again when
+    /// it comes back, as the web's tracker unmounts and remounts with the chat view.
+    pub(super) fn sync_visit_shown(&mut self, cx: &mut Context<Self>) {
+        if self.visit.hidden == self.chat_shown() {
+            self.track_visit(cx);
+        }
     }
 
     /// Runs after every shell update, and when a throttled visit comes due.
     pub(super) fn track_visit(&mut self, cx: &mut Context<Self>) {
         self.visit._timer = None;
-        let Some(thread_id) = self.visit.thread_id.clone() else { return };
-        if self.open_thread_id() != Some(&*thread_id) {
+        let now = super::sidebar::now_ms();
+        let open = self.visit.thread.clone().filter(|thread| self.is_open_thread(thread));
+        if !self.visit.show(self.chat_shown(), open.clone(), now) {
             return;
         }
-        let Some(shell) = self.shell.threads.iter().find(|t| t.id == thread_id) else { return };
+        let Some(thread) = open else { return };
+        let Some(shell) = self.shell.thread(&thread) else { return };
         // Decide only once it can be sent: deciding records the visit as sent.
-        let Some(client) = self.client() else { return };
-        let now = super::sidebar::now_ms();
+        let Some(client) = self.env_client(&thread.env) else { return };
         let woke_at = Facts::new(shell, &Default::default()).woke_at(now);
         match decide(&mut self.visit.state, shell, woke_at, now) {
             Visit::Skip => {}
@@ -138,7 +180,7 @@ impl Workspace {
                 }));
             }
             Visit::Send { visited_at, opened } => {
-                let mut command = json!({"type": "thread.visit", "commandId": new_id(), "threadId": thread_id, "visitedAt": visited_at});
+                let mut command = json!({"type": "thread.visit", "commandId": new_id(), "threadId": thread.id, "visitedAt": visited_at});
                 if opened {
                     command["opened"] = true.into();
                 }
@@ -210,6 +252,35 @@ mod tests {
         let now = crate::timestamp::parse_ms(T2).unwrap();
         assert_eq!(decide(&mut state, &shell(T1, Some(T1), None), None, now), Visit::Skip);
         assert_eq!(state.last_dispatched, crate::timestamp::parse_ms(T1));
+    }
+
+    #[test]
+    fn local_opens_are_kept_per_environment() {
+        let mut tracker = VisitTracker::default();
+        tracker.open(ScopedId::new("a", "t"), 1);
+        tracker.open(ScopedId::new("b", "u"), 2);
+        assert_eq!(tracker.opened_at(&ScopedId::new("a", "t")), Some(1));
+        assert_eq!(tracker.opened_at(&ScopedId::new("b", "t")), None, "B/T was never opened");
+        assert_eq!(tracker.thread, Some(ScopedId::new("b", "u")));
+    }
+
+    #[test]
+    fn a_page_over_the_chat_pauses_tracking_and_coming_back_opens_again() {
+        let thread = ScopedId::new("a", "t");
+        let mut tracker = VisitTracker::default();
+        tracker.open(thread.clone(), 1);
+        tracker.state.open_pending = false;
+        assert!(tracker.show(true, Some(thread.clone()), 2));
+        assert!(!tracker.state.open_pending, "the chat never left");
+        // The Pull requests page replaces the chat: a completion meanwhile stays unread.
+        assert!(!tracker.show(false, Some(thread.clone()), 3));
+        assert!(tracker.show(true, Some(thread.clone()), 4));
+        assert!(tracker.state.open_pending, "showing the chat again is a new open");
+        assert_eq!(tracker.opened_at(&thread), Some(4));
+        // Coming back to a draft opens nothing.
+        assert!(!tracker.show(false, None, 5));
+        assert!(tracker.show(true, None, 6));
+        assert_eq!(tracker.opened_at(&thread), Some(4));
     }
 
     #[test]

@@ -11,12 +11,14 @@ use wayland_client::{Connection, protocol::wl_data_offer::WlDataOffer};
 use wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1;
 
 use crate::linux::platform::{PIPE_READ_TIMEOUT, read_fd_with_timeout};
-use gpui::{ClipboardEntry, ClipboardItem, Image, ImageFormat, hash};
+use gpui::{ClipboardEntry, ClipboardItem, ClipboardString, Image, ImageFormat, hash};
 
 /// Text mime types that we'll offer to other programs.
 pub(crate) const TEXT_MIME_TYPES: [&str; 3] =
     ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain"];
 pub(crate) const FILE_LIST_MIME_TYPE: &str = "text/uri-list";
+/// HTML offered beside the text when an entry carries it.
+pub(crate) const HTML_MIME_TYPE: &str = "text/html";
 
 /// Text mime types that we'll accept from other programs.
 pub(crate) const ALLOWED_TEXT_MIME_TYPES: [&str; 2] = ["text/plain;charset=utf-8", "UTF8_STRING"];
@@ -114,7 +116,18 @@ impl<T: ReceiveData> DataOffer<T> {
         // copying from eg: firefox inserts a lot of blank
         // lines, and that is super annoying.
         let result = text_content.replace("\r\n", "\n");
-        Some(ClipboardItem::new_string(result))
+        let html = self
+            .has_mime_type(HTML_MIME_TYPE)
+            .then(|| self.read_bytes(connection, HTML_MIME_TYPE))
+            .flatten()
+            .and_then(|bytes| String::from_utf8(bytes).ok());
+        Some(ClipboardItem {
+            entries: vec![ClipboardEntry::String(ClipboardString {
+                text: result,
+                metadata: None,
+                html,
+            })],
+        })
     }
 
     fn read_image(&self, connection: &Connection) -> Option<ClipboardItem> {
@@ -174,8 +187,15 @@ impl Clipboard {
         self.self_mime.clone()
     }
 
-    pub fn send(&self, _mime_type: String, fd: OwnedFd) {
-        if let Some(text) = self.contents.as_ref().and_then(|contents| contents.text()) {
+    pub fn send(&self, mime_type: String, fd: OwnedFd) {
+        let Some(contents) = self.contents.as_ref() else {
+            return;
+        };
+        if mime_type == HTML_MIME_TYPE {
+            if let Some(html) = contents.html() {
+                self.send_bytes(fd, html.as_bytes().to_owned());
+            }
+        } else if let Some(text) = contents.text() {
             self.send_bytes(fd, text.as_bytes().to_owned());
         }
     }

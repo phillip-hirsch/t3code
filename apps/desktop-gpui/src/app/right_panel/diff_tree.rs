@@ -1,19 +1,21 @@
-//! The Diff surface's file tree (`DiffFileTree` beside the patch) and its "Hide test files"
-//! filter. Folders come in the order of their first file, as `orderDiffFilesLikeTree` keeps
-//! the list and the tree in agreement.
+//! A diff's file tree (`DiffFileTree` in `FileExplorerPane` beside the patch), for the Diff
+//! surface and a pull request's Code tab, and the Diff surface's "Hide test files" filter.
+//! Folders come in the order of their first file, as `orderDiffFilesLikeTree` keeps the list
+//! and the tree in agreement.
 
 use std::collections::HashSet;
 use std::ops::Range;
+use std::rc::Rc;
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::diff::{DiffFile, DiffFileStatus};
+use gpui_kit::component::diff::{DiffFile, DiffFileStatus, DiffState};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, DragMoveEvent, ElementId, Empty, FocusHandle, InteractiveElement as _,
-    IntoElement, KeyDownEvent, ParentElement as _, ScrollStrategy, SharedString, StatefulInteractiveElement as _,
-    Styled as _, UniformListScrollHandle, Window, div, px, uniform_list,
+    AnyElement, App, AppContext as _, Context, DragMoveEvent, ElementId, Empty, Entity, FocusHandle,
+    InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, ScrollStrategy, SharedString,
+    StatefulInteractiveElement as _, Styled as _, UniformListScrollHandle, Window, div, px, uniform_list,
 };
 
 use super::super::git;
@@ -22,33 +24,61 @@ use super::super::{Target, Workspace};
 use super::DiffScope;
 use crate::theme::Tokens;
 
-/// `FileExplorerPane` as the diff uses it: 256px at most at first (40% of the row), never under
-/// 160px, and leaving the patch 256px while it stays under 560px.
-const TREE_DEFAULT: f32 = 256.;
+/// `FileExplorerPane`'s limits: at most 560px, and leaving the patch 256px while it can; the
+/// default takes 40% of the row (`defaultWidthFraction`) up to the owner's own default.
 const TREE_FRACTION: f32 = 0.4;
-const TREE_MIN: f32 = 160.;
 const TREE_MAX: f32 = 560.;
 const PATCH_MIN: f32 = 256.;
 /// How far one arrow key moves the resize handle.
 const RESIZE_STEP: f32 = 16.;
 
+/// Which diff a file tree serves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::app) enum TreeOwner {
+    /// The right panel's Diff surface.
+    Changes,
+    /// A pull request's Code tab.
+    PullRequest,
+}
+
+impl TreeOwner {
+    /// `defaultWidth` and `minWidth`: the Diff surface keeps the pane's own, the Code tab asks
+    /// for 320px and 192px.
+    fn sizing(self) -> (f32, f32) {
+        match self {
+            Self::Changes => (256., 160.),
+            Self::PullRequest => (320., 192.),
+        }
+    }
+
+    fn id(self, name: &str) -> ElementId {
+        let prefix = match self {
+            Self::Changes => "diff",
+            Self::PullRequest => "pr-code",
+        };
+        ElementId::Name(format!("{prefix}-{name}").into())
+    }
+}
+
 /// The tree's width and its largest in a row `row` wide; a chosen width overrides the default.
-fn pane_width(chosen: Option<f32>, row: f32) -> (f32, f32) {
-    let initial = TREE_MIN.max(TREE_DEFAULT.min(row * TREE_FRACTION));
-    let max = TREE_MIN.max(TREE_MAX.min((row - PATCH_MIN).max(initial)));
-    (chosen.unwrap_or(initial).clamp(TREE_MIN, max), max)
+fn pane_width(owner: TreeOwner, chosen: Option<f32>, row: f32) -> (f32, f32) {
+    let (default, min) = owner.sizing();
+    let initial = min.max(default.min(row * TREE_FRACTION));
+    let max = min.max(TREE_MAX.min((row - PATCH_MIN).max(initial)));
+    (chosen.unwrap_or(initial).clamp(min, max), max)
 }
 
 /// The resize handle's keys: `ArrowLeft` widens, `ArrowRight` narrows, Home and End jump.
-fn resized_width(width: f32, max: f32, key: &str) -> Option<f32> {
+fn resized_width(owner: TreeOwner, width: f32, max: f32, key: &str) -> Option<f32> {
+    let min = owner.sizing().1;
     let next = match key {
         "left" => width + RESIZE_STEP,
         "right" => width - RESIZE_STEP,
-        "home" => TREE_MIN,
+        "home" => min,
         "end" => max,
         _ => return None,
     };
-    Some(next.clamp(TREE_MIN, max))
+    Some(next.clamp(min, max))
 }
 
 /// What a key does in the tree (Pierre's roving focus).
@@ -102,8 +132,15 @@ fn folders(files: &[(&str, Status)]) -> Vec<String> {
     out
 }
 
-/// The tree pane's own state: its width, keyboard focus and scroll.
-pub(super) struct TreePane {
+/// One diff's file tree: its folds, the file picked in it, its rows, and the pane's width,
+/// keyboard focus and scroll.
+pub(in crate::app) struct DiffTree {
+    /// Folded folders, with their trailing `/`.
+    folded: HashSet<String>,
+    selected: Option<String>,
+    /// The visible rows, rebuilt when the shown files or the folds change.
+    rows: Rc<[Row]>,
+    folders: Vec<String>,
     /// The width dragged or keyed to; unset, the pane takes its default.
     width: Option<f32>,
     focus: FocusHandle,
@@ -111,25 +148,27 @@ pub(super) struct TreePane {
     resize_focus: FocusHandle,
     toggle_focus: FocusHandle,
     scroll: UniformListScrollHandle,
-    folders: Vec<String>,
 }
 
-impl TreePane {
-    pub(super) fn new(cx: &mut App) -> Self {
+impl DiffTree {
+    pub(in crate::app) fn new(cx: &mut App) -> Self {
         Self {
+            folded: HashSet::new(),
+            selected: None,
+            rows: Rc::new([]),
+            folders: Vec::new(),
             width: None,
             focus: cx.focus_handle().tab_stop(true),
             focused: None,
             resize_focus: cx.focus_handle().tab_stop(true),
             toggle_focus: cx.focus_handle().tab_stop(true),
             scroll: UniformListScrollHandle::new(),
-            folders: Vec::new(),
         }
     }
 }
 
-/// Drag payload for the tree's resize handle.
-struct TreeResize;
+/// Drag payload for a tree's resize handle.
+struct TreeResize(TreeOwner);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Status {
@@ -264,57 +303,81 @@ impl Workspace {
         panel.all_diff_files = files;
     }
 
-    /// Rebuilds the tree's rows from the files the patch shows; run when they or the folds change.
-    pub(super) fn rebuild_tree_rows(&mut self, cx: &App) {
-        let panel = &mut self.right_panel;
-        let state = panel.diff.read(cx);
-        let files: Vec<(&str, Status)> = state.files().iter().map(|f| (f.path().as_ref(), Status::of(f))).collect();
-        panel.tree_rows = rows(&files, &panel.tree_folded).into();
-        panel.tree_pane.folders = folders(&files);
-    }
-
-    fn toggle_diff_tree_folder(&mut self, path: &str, cx: &mut Context<Self>) {
-        let folded = &mut self.right_panel.tree_folded;
-        if !folded.remove(path) {
-            folded.insert(path.to_owned());
+    /// `owner`'s tree and the diff it lists, while that diff is open.
+    fn diff_tree(&self, owner: TreeOwner) -> Option<(&DiffTree, &Entity<DiffState>)> {
+        match owner {
+            TreeOwner::Changes => Some((&self.right_panel.tree, &self.right_panel.diff)),
+            TreeOwner::PullRequest => self.pr_code_tree(),
         }
-        self.rebuild_tree_rows(cx);
+    }
+
+    fn diff_tree_mut(&mut self, owner: TreeOwner) -> Option<(&mut DiffTree, Entity<DiffState>)> {
+        match owner {
+            TreeOwner::Changes => Some((&mut self.right_panel.tree, self.right_panel.diff.clone())),
+            TreeOwner::PullRequest => self.pr_code_tree_mut(),
+        }
+    }
+
+    /// Rebuilds the Diff surface's tree rows; run when its files or folds change.
+    pub(super) fn rebuild_tree_rows(&mut self, cx: &App) {
+        self.rebuild_diff_tree(TreeOwner::Changes, cx);
+    }
+
+    /// Rebuilds `owner`'s tree rows from the files its patch shows.
+    pub(in crate::app) fn rebuild_diff_tree(&mut self, owner: TreeOwner, cx: &App) {
+        let Some((tree, diff)) = self.diff_tree_mut(owner) else { return };
+        let state = diff.read(cx);
+        let files: Vec<(&str, Status)> = state.files().iter().map(|f| (f.path().as_ref(), Status::of(f))).collect();
+        tree.rows = rows(&files, &tree.folded).into();
+        tree.folders = folders(&files);
+    }
+
+    fn toggle_diff_tree_folder(&mut self, owner: TreeOwner, path: &str, cx: &mut Context<Self>) {
+        let Some((tree, _)) = self.diff_tree_mut(owner) else { return };
+        if !tree.folded.remove(path) {
+            tree.folded.insert(path.to_owned());
+        }
+        self.rebuild_diff_tree(owner, cx);
         cx.notify();
     }
 
-    fn select_diff_tree_file(&mut self, path: &str, cx: &mut Context<Self>) {
-        self.right_panel.tree_selected = Some(path.to_owned());
-        self.reveal_diff_file(path, cx);
+    fn select_diff_tree_file(&mut self, owner: TreeOwner, path: &str, cx: &mut Context<Self>) {
+        let Some((tree, _)) = self.diff_tree_mut(owner) else { return };
+        tree.selected = Some(path.to_owned());
+        match owner {
+            TreeOwner::Changes => self.reveal_diff_file(path, cx),
+            TreeOwner::PullRequest => self.reveal_pr_code_file(path, cx),
+        }
         cx.notify();
     }
 
-    fn diff_tree_key(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
-        let rows = self.right_panel.tree_rows.clone();
-        let focused = self.right_panel.tree_pane.focused.as_ref();
-        let at = focused.and_then(|path| rows.iter().position(|r| &r.path == path));
-        let Some(action) = tree_key(&rows, &self.right_panel.tree_folded, at, key) else { return false };
+    fn diff_tree_key(&mut self, owner: TreeOwner, key: &str, cx: &mut Context<Self>) -> bool {
+        let Some((tree, _)) = self.diff_tree(owner) else { return false };
+        let rows = tree.rows.clone();
+        let at = tree.focused.as_ref().and_then(|path| rows.iter().position(|r| &r.path == path));
+        let Some(action) = tree_key(&rows, &tree.folded, at, key) else { return false };
         match action {
             TreeKey::Focus(index) => {
-                let pane = &mut self.right_panel.tree_pane;
-                pane.focused = Some(rows[index].path.clone());
-                pane.scroll.scroll_to_item(index, ScrollStrategy::Nearest);
+                let Some((tree, _)) = self.diff_tree_mut(owner) else { return false };
+                tree.focused = Some(rows[index].path.clone());
+                tree.scroll.scroll_to_item(index, ScrollStrategy::Nearest);
                 cx.notify();
             }
-            TreeKey::Toggle(index) => self.toggle_diff_tree_folder(&rows[index].path, cx),
-            TreeKey::Select(index) => self.select_diff_tree_file(&rows[index].path, cx),
+            TreeKey::Toggle(index) => self.toggle_diff_tree_folder(owner, &rows[index].path, cx),
+            TreeKey::Select(index) => self.select_diff_tree_file(owner, &rows[index].path, cx),
         }
         true
     }
 
     /// "Collapse all folders", or "Expand all folders" while any is folded.
-    fn toggle_all_tree_folders(&mut self, cx: &mut Context<Self>) {
-        let panel = &mut self.right_panel;
-        if panel.tree_pane.folders.iter().any(|f| panel.tree_folded.contains(f)) {
-            panel.tree_folded.clear();
+    fn toggle_all_tree_folders(&mut self, owner: TreeOwner, cx: &mut Context<Self>) {
+        let Some((tree, _)) = self.diff_tree_mut(owner) else { return };
+        if tree.folders.iter().any(|f| tree.folded.contains(f)) {
+            tree.folded.clear();
         } else {
-            panel.tree_folded.extend(panel.tree_pane.folders.iter().cloned());
+            tree.folded.extend(tree.folders.iter().cloned());
         }
-        self.rebuild_tree_rows(cx);
+        self.rebuild_diff_tree(owner, cx);
         cx.notify();
     }
 
@@ -335,35 +398,37 @@ impl Workspace {
         cx.notify();
     }
 
-    /// The tree pane beside the patch (`FileExplorerPane` around `DiffFileTree`) in a row
-    /// `row_width` wide: the Files header, the rows, and a handle on its left edge that drags
-    /// or keys its width.
-    pub(super) fn render_diff_tree(
+    /// `owner`'s tree pane beside its patch (`FileExplorerPane` around `DiffFileTree`) in a row
+    /// `row_width` wide: the Files header, the rows, an optional footer, and a handle on its
+    /// left edge that drags or keys its width.
+    pub(in crate::app) fn render_diff_tree(
         &self,
+        owner: TreeOwner,
         row_width: f32,
+        footer: Option<AnyElement>,
         tokens: &Tokens,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let rows = self.right_panel.tree_rows.clone();
-        let pane = &self.right_panel.tree_pane;
-        let (width, max) = pane_width(pane.width, row_width);
-        let focused = pane.focused.clone().filter(|_| pane.focus.is_focused(window));
-        let all_open = !pane.folders.iter().any(|f| self.right_panel.tree_folded.contains(f));
+        let Some((tree, diff)) = self.diff_tree(owner) else { return div().into_any_element() };
+        let rows = tree.rows.clone();
+        let (width, max) = pane_width(owner, tree.width, row_width);
+        let focused = tree.focused.clone().filter(|_| tree.focus.is_focused(window));
+        let all_open = !tree.folders.iter().any(|f| tree.folded.contains(f));
         let list = uniform_list(
-            "diff-file-tree-rows",
+            owner.id("file-tree-rows"),
             rows.len(),
             cx.processor(move |this, range: Range<usize>, _, cx| {
                 let tokens = *crate::theme::tokens(cx);
                 range
                     .map(|index| {
                         let focused = focused.as_deref() == Some(rows[index].path.as_str());
-                        this.diff_tree_row(&rows[index], focused, &tokens, cx)
+                        this.diff_tree_row(owner, &rows[index], focused, &tokens, cx)
                     })
                     .collect::<Vec<_>>()
             }),
         )
-        .track_scroll(&pane.scroll)
+        .track_scroll(&tree.scroll)
         .size_full();
         let ring = tokens.ring;
         let toggle_label = if all_open { "Collapse all folders" } else { "Expand all folders" };
@@ -376,12 +441,12 @@ impl Workspace {
             .text_xs()
             .text_color(tokens.muted_foreground)
             .child(div().px_1().font_weight(gpui_kit::FontWeight::MEDIUM).text_color(tokens.foreground).child("Files"))
-            .child(div().ml_auto().child(self.right_panel.diff.read(cx).files().len().to_string()))
-            .when(!pane.folders.is_empty(), |el| {
+            .child(div().ml_auto().child(diff.read(cx).files().len().to_string()))
+            .when(!tree.folders.is_empty(), |el| {
                 el.child(
                     div()
-                        .id("diff-tree-toggle-folders")
-                        .track_focus(&pane.toggle_focus)
+                        .id(owner.id("tree-toggle-folders"))
+                        .track_focus(&tree.toggle_focus)
                         .focus_visible(move |s| s.border_2().border_color(ring))
                         .size(px(24.))
                         .flex_none()
@@ -396,12 +461,12 @@ impl Workspace {
                                 .size(px(14.)),
                         )
                         .tooltip(move |window, cx| Tooltip::new(toggle_label).build(window, cx))
-                        .on_click(cx.listener(|this, _, _, cx| this.toggle_all_tree_folders(cx))),
+                        .on_click(cx.listener(move |this, _, _, cx| this.toggle_all_tree_folders(owner, cx))),
                 )
             });
         let handle = div()
-            .id("diff-file-tree-resize")
-            .track_focus(&pane.resize_focus)
+            .id(owner.id("file-tree-resize"))
+            .track_focus(&tree.resize_focus)
             .absolute()
             .top_0()
             .bottom_0()
@@ -409,20 +474,23 @@ impl Workspace {
             .w(px(6.))
             .cursor_col_resize()
             .focus_visible(move |s| s.bg(ring))
-            .on_drag(TreeResize, |_, _, _, cx| cx.new(|_| Empty))
+            .on_drag(TreeResize(owner), |_, _, _, cx| cx.new(|_| Empty))
             .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
                 let modifiers = &event.keystroke.modifiers;
                 if modifiers.alt || modifiers.control || modifiers.platform {
                     return;
                 }
-                if let Some(next) = resized_width(width, max, &event.keystroke.key) {
-                    this.right_panel.tree_pane.width = Some(next);
+                if let Some(next) = resized_width(owner, width, max, &event.keystroke.key)
+                    && let Some((tree, _)) = this.diff_tree_mut(owner)
+                {
+                    tree.width = Some(next);
                     cx.stop_propagation();
                     cx.notify();
                 }
             }));
+        let min = owner.sizing().1;
         v_flex()
-            .id("diff-file-tree")
+            .id(owner.id("file-tree"))
             .relative()
             .w(px(width))
             .flex_none()
@@ -431,35 +499,49 @@ impl Workspace {
             .border_l_1()
             .border_color(tokens.border.opacity(0.6))
             .on_drag_move(cx.listener(move |this, event: &DragMoveEvent<TreeResize>, _, cx| {
+                if event.drag(cx).0 != owner {
+                    return;
+                }
                 let right = f32::from(event.bounds.right());
-                this.right_panel.tree_pane.width =
-                    Some((right - f32::from(event.event.position.x)).clamp(TREE_MIN, max));
-                cx.notify();
+                if let Some((tree, _)) = this.diff_tree_mut(owner) {
+                    tree.width = Some((right - f32::from(event.event.position.x)).clamp(min, max));
+                    cx.notify();
+                }
             }))
             .child(handle)
             .child(header)
             .child(
                 div()
-                    .id("diff-file-tree-keys")
-                    .track_focus(&pane.focus)
+                    .id(owner.id("file-tree-keys"))
+                    .track_focus(&tree.focus)
                     .flex_1()
                     .min_h_0()
                     .px_1()
                     .pb_1()
-                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                        if !event.keystroke.modifiers.modified() && this.diff_tree_key(&event.keystroke.key, cx) {
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                        if !event.keystroke.modifiers.modified() && this.diff_tree_key(owner, &event.keystroke.key, cx)
+                        {
                             cx.stop_propagation();
                         }
                     }))
                     .child(list),
             )
+            .children(footer)
             .into_any_element()
     }
 
-    fn diff_tree_row(&self, row: &Row, focused: bool, tokens: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+    fn diff_tree_row(
+        &self,
+        owner: TreeOwner,
+        row: &Row,
+        focused: bool,
+        tokens: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some((tree, _)) = self.diff_tree(owner) else { return div().into_any_element() };
         let is_folder = row.status.is_none();
-        let folded = is_folder && self.right_panel.tree_folded.contains(&row.path);
-        let selected = self.right_panel.tree_selected.as_deref() == Some(row.path.as_str());
+        let folded = is_folder && tree.folded.contains(&row.path);
+        let selected = tree.selected.as_deref() == Some(row.path.as_str());
         let scheme = self.diff_color_scheme();
         let color = match row.status {
             Some(Status::Added) => git::addition_color(tokens, scheme),
@@ -475,7 +557,7 @@ impl Workspace {
         };
         let path = row.path.clone();
         h_flex()
-            .id(ElementId::Name(format!("diff-tree-{}", row.path).into()))
+            .id(owner.id(&format!("tree-{}", row.path)))
             .h(px(24.))
             .flex_none()
             .pl(px(8. + row.depth as f32 * 12.))
@@ -500,13 +582,13 @@ impl Workspace {
                     .child(status.letter())
             }))
             .on_click(cx.listener(move |this, _, window, cx| {
-                let pane = &mut this.right_panel.tree_pane;
-                pane.focused = Some(path.clone());
-                window.focus(&pane.focus.clone(), cx);
+                let Some((tree, _)) = this.diff_tree_mut(owner) else { return };
+                tree.focused = Some(path.clone());
+                window.focus(&tree.focus.clone(), cx);
                 if is_folder {
-                    this.toggle_diff_tree_folder(&path, cx);
+                    this.toggle_diff_tree_folder(owner, &path, cx);
                 } else {
-                    this.select_diff_tree_file(&path, cx);
+                    this.select_diff_tree_file(owner, &path, cx);
                 }
             }))
             .into_any_element()
@@ -558,20 +640,28 @@ mod tests {
     }
 
     #[test]
-    fn the_tree_starts_at_most_256px_and_resizes_within_its_limits() {
+    fn each_tree_starts_at_its_default_and_resizes_within_its_limits() {
         // 40% of the row, between 160px and 256px.
-        assert_eq!(pane_width(None, 1000.), (256., 560.));
-        assert_eq!(pane_width(None, 500.), (200., 244.));
-        assert_eq!(pane_width(None, 300.), (160., 160.));
+        let changes = TreeOwner::Changes;
+        assert_eq!(pane_width(changes, None, 1000.), (256., 560.));
+        assert_eq!(pane_width(changes, None, 500.), (200., 244.));
+        assert_eq!(pane_width(changes, None, 300.), (160., 160.));
         // A chosen width holds while the row has room for it.
-        assert_eq!(pane_width(Some(400.), 1000.), (400., 560.));
-        assert_eq!(pane_width(Some(400.), 500.), (244., 244.));
-        assert_eq!(resized_width(256., 560., "left"), Some(272.));
-        assert_eq!(resized_width(256., 560., "right"), Some(240.));
-        assert_eq!(resized_width(170., 560., "right"), Some(160.));
-        assert_eq!(resized_width(256., 560., "home"), Some(160.));
-        assert_eq!(resized_width(256., 560., "end"), Some(560.));
-        assert_eq!(resized_width(256., 560., "up"), None);
+        assert_eq!(pane_width(changes, Some(400.), 1000.), (400., 560.));
+        assert_eq!(pane_width(changes, Some(400.), 500.), (244., 244.));
+        assert_eq!(resized_width(changes, 256., 560., "left"), Some(272.));
+        assert_eq!(resized_width(changes, 256., 560., "right"), Some(240.));
+        assert_eq!(resized_width(changes, 170., 560., "right"), Some(160.));
+        assert_eq!(resized_width(changes, 256., 560., "home"), Some(160.));
+        assert_eq!(resized_width(changes, 256., 560., "end"), Some(560.));
+        assert_eq!(resized_width(changes, 256., 560., "up"), None);
+        // A pull request's Code tab starts at most 320px and never under 192px.
+        let code = TreeOwner::PullRequest;
+        assert_eq!(pane_width(code, None, 1000.), (320., 560.));
+        assert_eq!(pane_width(code, None, 600.), (240., 344.));
+        assert_eq!(pane_width(code, None, 400.), (192., 192.));
+        assert_eq!(resized_width(code, 200., 560., "right"), Some(192.));
+        assert_eq!(resized_width(code, 256., 560., "home"), Some(192.));
     }
 
     #[test]

@@ -12,6 +12,14 @@ it once upstream has an equivalent), and update the versions here and in `../Car
 gpui-kit's `gpui-pre-platform` pins). Each patch was committed separately from its unmodified
 copy, so `git log -p -- vendor/<name>` shows it.
 
+## Not vendored: libghostty-vt needs Zig 0.15.2
+
+The terminal links the crates.io `libghostty-vt` crate. Its `libghostty-vt-sys` build script
+clones Ghostty at the crate's pinned commit and builds it with `zig build`, so every platform needs
+Zig 0.15.2 on `PATH`, and the first build of a target directory needs network (a few minutes; later
+builds reuse it). On macOS 27 or newer, install Zig with Homebrew (the formula that provides
+0.15.2, such as `brew install zig@0.15`): the ziglang.org 0.15.2 download fails to link there.
+
 ## gpui-pre 0.3.11
 
 GPUI's core (Zed's `gpui`), which gpui-kit re-exports.
@@ -95,6 +103,47 @@ registered for the current focus, because Windows `WM_CHAR` and IME callbacks re
 handler without checking focus. Pointer events are untouched. Tests:
 `focus_next_skips_an_inert_subtree`, `cached_view_replay_recomputes_inertness`.
 
+**The interface can scale like a page zoom.** Electron's View menu zoom (and Ctrl+wheel) scales
+the whole page; 0.3.11 has only the display's scale factor, and `rem_size` scales nothing drawn
+in `px`. The patch adds `Window::set_ui_scale`: the window's logical pixels become the
+platform's divided by the scale, so everything draws larger or smaller and stays crisp. Window
+bounds and sizes stay in the platform's units. Files:
+
+- `src/window.rs`: the `ui_scale` field, `ui_scale`/`set_ui_scale`; `bounds_changed` multiplies
+  the scale factor by it and divides the viewport and pointer by it; the platform input callback
+  scales each event (`PlatformInput::scaled_down`) before `dispatch_event`, so events GPUI
+  synthesizes in window units aren't scaled twice; `insets` and `visual_viewport_bounds` divide,
+  and `show_window_menu`, `set_client_inset`, `set_client_corner_radii`, `set_input_region` and
+  the IME position multiply. Accessibility bounds already go out in device pixels.
+- `src/interactive.rs`: `PlatformInput::scaled_down`, positions and pixel scroll deltas.
+- `src/platform.rs`: `PlatformInputHandler`'s bounds and points the platform asks about.
+- `src/geometry.rs`: `Pixels::scale_down`.
+- Test in `window.rs`: `ui_scale_scales_the_interface_against_the_platform_window`.
+
+**Key events carry the platform's code for their physical key.** The terminal encodes keys from
+the physical key the way the web does from `KeyboardEvent.code`: a release matches its press on
+any layout, and keypad keys stay keypad keys. 0.3.11's keystrokes carry only a layout-dependent
+name and the typed character (a keypad `1` looks like the main row's). A field on `KeyDownEvent`
+would break every crate that builds one, so the patch adds `PlatformWindow::native_key` (default:
+nothing), which each platform answers for the key event it is dispatching, and
+`Window::native_key`, which reads it. `NativeKey` holds a `NativeKeyCode` (the Windows scan code
+with the extended bit, the XKB keycode, or the macOS `keyCode`), whether Num Lock was on, which
+the terminal reports to Kitty programs as the web does from `getModifierState("NumLock")`, and
+the character the key types without modifiers on the current layout, which Electron reads from
+its keyboard layout map (German Shift+7 is the key `7` typing `/`). Files:
+
+- `src/platform/keystroke.rs`: `NativeKeyCode` and `NativeKey`.
+- `src/platform.rs`: the trait method.
+- `src/window.rs`: `Window::native_key`.
+
+**Clipboard text can carry HTML.** Copied composer context chips travel between the app and the
+web/Electron in the web's HTML fallback (`encodeComposerContextClipboardHtml`, a
+`data-t3-context-fragment` attribute), because the web's own `web application/x-t3-context-fragment+json`
+flavor lives in Chromium's private clipboard formats. 0.3.11's `ClipboardString` holds text and
+GPUI-only metadata. The patch, in `src/platform.rs`: a `ClipboardString::html` field with
+`with_html`, and `ClipboardItem::html`, the first string entry's HTML. Each platform below writes
+and reads it as the system's HTML flavor.
+
 The crate's tests need `--features test-support`; run them from a scratch copy outside this
 repository (`cargo test --features test-support --lib`). The copy needs the published crate's
 missing pieces: put it two levels below a folder whose `assets/fonts/ibm-plex-sans` and
@@ -117,6 +166,25 @@ the environment variable still works. Files:
 - `src/platform.rs`: the `DIRECT_COMPOSITION_DISABLED` flag, its setter, and the check in `WindowsPlatform::new`.
 - `src/gpui_windows.rs`: exports the setter.
 
+**Key events carry the platform's code for their physical key** (see gpui-pre's patch of that
+name). `handle_key_event` records the scan code of every key message from its `lparam` (bits
+16-23, with `0xE000` for the extended bit 24), Num Lock from the keyboard state `process_key`
+already reads with `GetKeyboardState`, and the key's unmodified character from the
+`MapVirtualKeyW(MAPVK_VK_TO_CHAR)` lookup `get_key_from_vkey` already makes for key names, now run
+for every key message. No new `unsafe`. Files:
+
+- `src/events.rs`: `native_key_code`, called in `handle_key_event`; `parse_normal_key` and
+  `process_key` hand back Num Lock.
+- `src/keyboard.rs`: `layout_char`, which lowercases `get_key_from_vkey`'s character.
+- `src/window.rs`: `WindowsWindowState::last_native_key` and `native_key`.
+
+**Clipboard text carries HTML** (see gpui-pre's patch of that name). A string entry with HTML
+also writes the registered `HTML Format` (CF_HTML: a header of UTF-8 byte offsets around the
+markup, which Chromium parses), and reading text also reads that format's markup, from `StartHTML`
+to `EndHTML` (or the fragment). It goes through the file's existing `register_clipboard_format`,
+`set_clipboard_bytes` and `get_clipboard_data`; no new `unsafe`. File: `src/clipboard.rs`
+(`to_cf_html`, `from_cf_html`, test `cf_html_offsets_frame_the_markup`).
+
 ## gpui-pre-linux 0.3.11
 
 GPUI's Linux platform (Zed's `gpui_linux`), which gpui-kit pulls in through `gpui-pre-platform`.
@@ -134,6 +202,103 @@ so saved bounds include no shadow. The app keeps its resize edges for that case
 
 - `src/linux/x11/window.rs`: `request_decorations`, `window_decorations` and `set_client_inset`.
 
+**Key events carry the platform's code for their physical key** (see gpui-pre's patch of that
+name). Each key press, repeat and release records its XKB keycode, Num Lock (the XKB state's
+`Mod2`, read like Caps Lock) and the character of the key's level-0 keysym in its active layout,
+through xkbcommon's safe keymap API; an IBus commit sent as a key has none of them. Files:
+
+- `src/linux/platform.rs`: `native_key_from_xkb`, beside `capslock_from_xkb`.
+- `src/linux/x11/client.rs`, `src/linux/x11/window.rs`: `X11ClientState::native_key`, set in
+  the `KeyPress` and `KeyRelease` arms, and `native_key`.
+- `src/linux/wayland/client.rs`, `src/linux/wayland/window.rs`: `WaylandClientState::native_key`,
+  set in the keyboard `Key` event, the repeat timer and `CommitString`, and `native_key`.
+
+**Clipboard text carries HTML** (see gpui-pre's patch of that name), as `text/html` (UTF-8, what
+Chromium writes and reads). No new `unsafe`. Files:
+
+- `src/linux/wayland/clipboard.rs`, `src/linux/wayland/client.rs`: the clipboard's data source
+  also offers `text/html` when the entry has HTML, and `send` answers that MIME type with it;
+  reading text also reads `text/html` when the offer has it. The primary selection stays text.
+- `src/linux/x11/clipboard.rs`, `src/linux/x11/client.rs`: the `HTML` atom; `set_text` also owns
+  `text/html` when given HTML (the clipboard passes it, the primary selection doesn't), and
+  `get_any` reads `text/html` beside the text.
+
+## gpui-pre-macos 0.3.11
+
+GPUI's macOS platform (Zed's `gpui_macos`), which gpui-kit pulls in through `gpui-pre-platform`.
+
+**Key events carry the platform's code for their physical key** (see gpui-pre's patch of that
+name). `platform_input_from_native` already holds the `NSEvent`; for a key down or up it also
+returns its `keyCode` (a safe `objc2-app-kit` call `parse_keystroke` already makes) and the
+unmodified character `parse_keystroke` already translates with `chars_for_modified_key(_,
+NO_MOD)`, and `handle_key_event` stores them in the window state before dispatching. No new
+`unsafe`. Mac keyboards have no Num Lock, so none is reported. Files:
+
+- `src/events.rs`: `platform_input_from_native` returns the `NativeKey` beside the input;
+  `parse_keystroke` hands back the unmodified character.
+- `src/window.rs`: `MacWindowState::native_key`, set in `handle_key_event`; `native_key`; the
+  view-event caller drops the `NativeKey`.
+
+**Clipboard text carries HTML** (see gpui-pre's patch of that name), as `public.html`, named
+with `NSString::from_str` so it needs no `unsafe` extern static; `dataForType` and
+`setData_forType` are safe calls. File: `src/pasteboard.rs` (`html_type`, an HTML case in
+`test_string`).
+
+## lb-wry 0.53.3
+
+The webview crate (a wry fork) behind the preview browser, file previews and `gpui-webview`.
+
+No patch adds `unsafe`: where a platform's API is reachable only through it, the feature is left
+out on that platform.
+
+**A handler for failed navigations (Linux).** Electron reports a page that failed to load with
+`did-fail-load` and its Chromium net error, which the browser panel shows as its unreachable page
+and reports to the server. 0.53.3 reports a failed main-frame navigation only as a finished one.
+The patch adds `WebViewBuilder::with_on_page_load_error_handler`, which passes a `PageLoadError`
+(the URL, the `GError` domain and code, and its description); the app maps it to a net error
+(`preview::net_error`). Only WebKitGTK's `load-failed` signal has a safe binding: WebView2's
+failure details are `unsafe` COM calls and WKWebView's are new `unsafe` delegate methods, so the
+handler is never called on Windows or macOS. On Windows the app reads the error from WebView2's
+`chrome-error:` page instead (`preview::FAILURE_PROBE`); on macOS a failed load goes unreported.
+Files:
+
+- `src/lib.rs`: `PageLoadError`, the attribute and the builder method.
+- `src/webkitgtk/mod.rs`: `load-failed`, with the code read through the error domains a load
+  reports (`load_error_code`). It handles the signal, so WebKitGTK loads no error page of its own,
+  which would read as a new page load.
+
+**A child webview can move to another window (Windows).** The browser's separate preview window
+takes a tab's live page out of the main window and gives it back when it closes. 0.53.3's
+`reparent` takes an HWND and keeps WebView2's old parent for a child webview, which `focus_parent`
+and `bounds` still use. The patch adds `WebView::reparent_as_child`, which takes a window handle
+as `build_as_child` does and records the new parent. Moving a WKWebView or an X11 child needs
+`unsafe`, so on macOS and Linux the app builds the page again in the other window. Files:
+
+- `src/lib.rs`: `reparent_as_child`, on Windows only.
+- `src/webview2/mod.rs`: `SetParent` through the existing `reparent`, then the new parent for a
+  child webview too.
+
+## gpui-webview 0.9.0
+
+The native WebView the app embeds in GPUI's layout (the preview browser, HTML pages, MCP apps,
+media and Mermaid).
+
+**Native views follow the interface scale.** With gpui-pre's `Window::set_ui_scale` (above), a
+GPUI pixel is no longer a platform logical pixel. 0.9.0 already places Linux views in device
+pixels and matches their page zoom to GPUI's scale factor, but on Windows and macOS it passed
+GPUI's pixels to wry as logical ones, so a zoomed window misplaced its pages. The patch, in
+`src/lib.rs`, multiplies those bounds by the scale and the page zoom by it too, so a CSS pixel
+draws as one GPUI pixel on every platform (its `ui_scale` field, kept current in `prepaint`). The
+preview divides its own zoom by the scale, since Electron's app zoom leaves previews alone.
+
+**`Theme::Auto` keeps GTK's own preference on Linux.** 0.9.0 sets GTK's process-wide
+`gtk-application-prefer-dark-theme` to false for `Auto`, the same as `Light`, so a page asking for
+the system scheme always rendered light and the first override erased a dark `settings.ini`. The
+patch, in `src/linux.rs` (`set_theme`), records the preference GTK started with before the first
+override and restores it for `Auto`. GTK 3 still never reads the desktop's scheme, so the preview
+resolves its System scheme to the app's appearance itself (`page_appearance` in
+`src/app/preview/mod.rs`) and passes `Light` or `Dark`.
+
 ## gpui-base 0.9.0
 
 **Text decorations on the textarea.** The composer needs atomic inline tokens (its chips),
@@ -150,6 +315,48 @@ type parameter (default `EditorMode`, so editor code is unaffected), and its met
 - `src/input/editor/decorations.rs`: the generic handle; its methods move into a macro (`git diff -w` shows the real change).
 - `src/input/mod.rs`: exports `TextareaExtras`.
 - `src/input/base/state.rs`: one test, `test_textarea_decorations_follow_edits_beside_tokens`.
+
+**Copies can carry clipboard metadata and HTML.** Copying a composer selection that holds context
+chips also copies their records (as GPUI metadata, and in the web's HTML fallback through
+gpui-pre's clipboard HTML patch), so a paste into another draft, or into the web, brings them
+back. 0.9.0's `Copy` and `Cut` always write plain text. The patch, in `src/input/base/state.rs`:
+`InputBaseState::set_copy_item` takes a function from the copied text to the clipboard item, and
+`copy` and `cut` write it when it returns some. One test, `test_copy_and_cut_write_the_copy_item`.
+
+**A textarea can draw a presentation over its text.** The rich composer keeps its text as
+Markdown source and draws it the way the web's Tiptap editor renders it: delimiters hidden away
+from the caret, list markers and checkboxes in place of their syntax, headings larger, code in the
+code font inside a frame. 0.9.0's textarea can only restyle ranges (decorations) and lay out
+atomic tokens. The patch adds `TextPresentation`, set with `TextareaState::set_presentation`: none
+of it enters the text, its history or the caret's movement, and an edit drops what it touches
+and shifts what follows until the caller sets it again.
+
+- Replaced ranges (`InlineReplacement`): hidden (no width), drawn inline at a width (clamped to
+  the row), or drawn in the line's indent (a list marker). They wrap and lay out as zero- or
+  fixed-width elements beside the tokens, with the same `LineFragment::element` path.
+- Line styles (`LineStyle`): a line's font family, a size relative to the input's, and an indent
+  on every row; the wrapper measures and narrows the line with them. Rows keep the input's
+  line height.
+- Backdrops (`BlockBackdrop`): a filled, optionally bordered and rounded rectangle behind the
+  rows of the lines a range spans, or a bar beside them, painted before the text.
+
+Files:
+
+- `src/input/base/presentation.rs` (new): the types, `set_presentation` (which drops ranges off
+  character boundaries, across lines or over tokens), `adjust_for_edit`; one test,
+  `edits_drop_what_they_touch_and_shift_what_follows`.
+- `src/input/base/kind.rs`: `TextareaExtras` holds the presentation and a revision;
+  `InputExtras::presentation`; `TextareaMode`'s annotation hooks reset and shift it.
+- `src/input/base/element.rs`: `measure_tokens` merges replaced widths into the inline metrics
+  and passes line styles to the wrapper; a textarea with a presentation lays out through
+  `layout_token_lines`, which takes the widths from the merged metrics and applies each line's
+  family, size and indent; `prepaint_replacements` draws replacements, `layout_backdrops` the
+  backdrops, painted under the glyph backgrounds.
+- `src/input/editor/display_map/text_wrapper.rs`: `WrapLineStyle`, `TextWrapper::set_line_styles`
+  (rewraps only the lines whose style changed) and the styled wrap; `LineLayout::indent`, added
+  to every visual row's offset. `wrap_map.rs`, `display_map.rs` and `display_map/mod.rs` pass it
+  through.
+- `src/input/mod.rs`: exports the types.
 
 **Toasts above dialogs.** Dialogs paint in a deferred pass (priority `10 + layer`), but 0.9.0's
 `ToastStack` paints in the normal pass, so a toast raised while a dialog is open (an error from
@@ -237,17 +444,151 @@ leaves, which `replace_text_in_ranges_selecting` in `src/input/base/state.rs` se
 records its cursors, so redo restores that caret rather than one per range. Test there:
 `test_replace_ranges_redo_restores_chosen_selection`.
 
+**Tokens change under unchanged text.** When an environment's skills or models load or change,
+the composer turns plain `$name` and `model:` text into chips and stale chips back into text, as
+the web does outside its undo history. `set_value` would clear the history and the selection;
+each token replacement would add an undo step. The patch, in `src/input/base/inline_tokens.rs`:
+`retokenize`, which installs new tokens over the same text, bumps the document revision so the
+token layout remeasures, and widens only the selections a new token partly covers, each cursor
+keeping its direction. Test in `src/input/base/state.rs`:
+`test_retokenize_keeps_history_and_moves_a_covered_caret`.
+
+**A composition that ends without a commit emits a change.** `retokenize` refuses while an IME
+composition is active, so the composer waits for the change that ends it. Marked text emits no
+`InputEvent::Change`, and 0.9.0's `unmark_text` (a cancelled composition, or one left as typed)
+emitted none either, so the wait outlasted the composition. The patch, in
+`src/input/base/state.rs`: `unmark_text` emits a change when it ends a composition still marked;
+after a commit, which already emitted one, it does not. An empty preedit (the other way a
+composition is cancelled) clears the mark itself, so `replace_and_mark_text_in_range` emits the
+change there, without an edit batch since the text is back to what it was. Test there:
+`test_composition_cancel_via_unmark_does_not_leak`.
+
 **Code block actions span the top row.** The web's code block header puts the language on the
 left and its buttons on the right. 0.9.0 pins the actions to the block's top-right corner at their
 own width, so the row could span the block only when the caller knew its width. The patch anchors
 the actions at the block's left edge too, so the row can fill it. `src/text/node.rs`: the
 `actions` container in `CodeBlock::render`.
 
+**`<details>` is a disclosure.** The chat renders `<details>`/`<summary>` as an expandable
+disclosure (the web's `MarkdownDetails`): a summary row with a chevron that opens a panel of the
+Markdown inside, between hairlines, and the thread find opens a closed one to show a match. 0.9.0
+flattens the element's children into ordinary blocks, and CommonMark ends an HTML block at a blank
+line, so the open tag, the Markdown inside and `</details>` arrive as sibling blocks. The patch:
+
+- `src/text/format/details.rs` (new): `DetailsGrouper` pairs `<details>` and `</details>` tags
+  across a container's sibling blocks, as rehype-raw's re-parse does (nested, several in one HTML
+  block, a summary in a later HTML block, one never closed holding the rest of the document, as a
+  streamed reply reads); test `tags_are_found_whole_and_case_blind`.
+- `src/text/format/markdown.rs`: `block_children` runs the root's, blockquotes' and list items'
+  blocks through it; tests `details_tags_hold_the_markdown_blocks_between_them`,
+  `details_nest_close_and_open_within_one_html_block`,
+  `a_details_element_in_one_html_block_is_a_disclosure`,
+  `a_summary_in_its_own_html_block_still_labels_the_disclosure`.
+- `src/text/format/html.rs`: a `details` arm and `parse_details`, the first `<summary>` as inline
+  text and the rest as blocks.
+- `src/text/node.rs`: `BlockNode::Details` (summary, children, the `open` attribute, span) in every
+  traversal; `render_details` draws it, the row keyboard-focusable with a focus ring;
+  `Disclosures`, the open state the reader toggled, keyed by the disclosure's source start so it
+  survives streamed re-parses, reached through `NodeContext::disclosures`.
+- `src/text/state.rs`: `TextViewState` owns the `Disclosures`; `reveal_range` opens every
+  disclosure whose panel holds the revealed text (the web's `beforematch`); test
+  `revealing_text_in_a_closed_disclosure_opens_it`.
+- `src/text/range_highlight.rs`, `src/text/stream_fade.rs`: the summary is a text leaf and the
+  panel's text stays in the rendered text while closed, so find counts it; the index records each
+  panel's range for `reveal_range`.
+
+**Links can drop their underline.** The chat's links show by color alone (`.chat-markdown a {
+text-decoration: none }`); 0.9.0 always draws a hairline under every link. The patch adds an
+opt-in flag; other views keep the underline. Files:
+
+- `src/text/style.rs`: `TextViewStyle::link_underline`, `with_link_underline`.
+- `src/text/text_view.rs`: `TextView::link_underline`, applied to the frame's style.
+- `src/text/node.rs`: `link_underline`, read wherever a link mark is styled.
+
+gpui-component's `src/text/compat.rs` forwards `link_underline` from its `TextView`.
+
+**Links report hover.** The chat opens a pull request link's preview card, and shows any web
+link's URL in a tooltip, when the pointer rests on it (`PullRequestLinkPreview`). 0.9.0 tracks the
+hovered link only to set the cursor. The patch adds `TextView::on_link_hover`: the handler gets
+`Some(LinkHover)` (the URL and the line box of the link under the pointer, in window coordinates)
+when the pointer enters a link, and `None` when it leaves it. A link wrapped over lines, or led by
+an inline object, reports from each piece, so one event can carry a leave and an enter in either
+order; the app resolves them together. Files:
+
+- `src/text/text_view.rs`: `LinkHover`, `LinkHoverFn`, the `link_hover_handler` field and builder;
+  test `link_hover_reports_entering_and_leaving_a_link`.
+- `src/text/state.rs`: the handler, set each frame like the task toggle's.
+- `src/text/inline.rs`: the mouse-move listener reports changes, also when the pointer leaves the
+  text; `InlineState::reported_hover` keeps the last report across frames, so a repaint under a
+  still pointer reports nothing and a link drawn under the pointer reports on the first move;
+  `link_line_bounds`. `src/text/node.rs`: `set_leaf_key` initializes the new field.
+- `src/text/inline_object.rs`: an object inside a link reports its own bounds.
+
+gpui-component's `src/text/compat.rs` forwards `on_link_hover`, and `src/text/mod.rs` re-exports
+`LinkHover`.
+
+**A plugin object can lead a link.** The chat draws a host mark (the GitHub icon, a favicon, a
+globe) before a web link's text (`MarkdownExternalLinkContent`), and a click or right click on it
+is the link's. 0.9.0's inline plugins replace the node they claim. The patch adds
+`MarkdownNode::leading()`: for a claimed link or link reference, the converter places the object
+first with the link's mark (a reference's resolves through its definition when drawn), then
+converts the link as if no plugin claimed it. The object's text and Markdown stay
+empty, so it adds nothing to the text, find or copies. Files:
+
+- `src/text/markdown_ext.rs`: the `leading` flag and builder.
+- `src/text/format/markdown.rs`: the leading branch of `parse_paragraph`, `link_text_mark` and
+  `reference_text_mark` (shared with the `Node::Link` and `Node::LinkReference` arms); test
+  `a_leading_object_opens_the_link_whose_text_follows_it`.
+
+**Markdown images open on a click.** The web's chat markdown makes an image that is not inside a
+link a button (`role="button"`, `tabIndex={0}`) whose click, Enter or Space opens the expanded
+image viewer. 0.9.0's images are clickable only inside a link. The patch adds
+`TextView::on_image_click`: with a handler set, an image outside a link is a tab stop with a
+pointer cursor and a 2px ring on keyboard focus, and a left click, Enter or Space calls the handler
+with the image's URL. Linked images keep following their link. Files:
+
+- `src/text/text_view.rs`: `ImageClickHandlerFn`, `on_image_click` and `clickable_image`.
+- `src/text/state.rs`: the handler carried to each frame's `NodeContext`.
+- `src/text/node.rs`: `NodeContext::image_click_handler`, the plain image path in
+  `Paragraph::render`, and the image's URL on `InlineFlowItem::Image`.
+- `src/text/inline_flow.rs`: `InlineFlow::image_click_handler` and `image_element`.
+
+**Code blocks can draw as something else.** The web's chat draws a closed Mermaid fence as its
+diagram, with the source a toggle away. 0.9.0 always draws a fenced block as code. The patch adds
+`TextView::code_block_renderer`: the closure gets each `CodeBlock` and returns the element that
+replaces it, keeping the block's spacing, or `None` to draw the block as usual. Files:
+
+- `src/text/text_view.rs`: `CodeBlockRenderFn`, the `code_block_renderer` field and builder.
+- `src/text/state.rs`: the renderer, carried to each frame's `NodeContext`.
+- `src/text/node.rs`: `NodeContext::code_block_renderer`, asked first in `CodeBlock::render`.
+
+gpui-component's `src/text/compat.rs` forwards `code_block_renderer` from its `TextView`.
+
+**Wide tables scroll, with a scrollbar.** The web's chat tables sit in a scroll area whose
+horizontal scrollbar stays visible while they overflow, its thumb `muted-foreground` at 60% (80%
+hovered). 0.9.0 scrolls only tables whose style opts into `overflow_x: scroll`, clips the others
+past their column floors, and draws no scrollbar on either. The patch: `src/text/node.rs`
+(`BlockNode::render_table`) puts every table in `horizontal_scroll_area`, keeping each layout's
+column floors, and `src/scrollable_mask.rs` (`horizontal_scroll_area`) adds an always-shown
+horizontal `Scrollbar` in the text style's muted color, 1px off the bottom edge.
+
+**Plugins can resolve reference definitions.** The web's chat plays `![clip][v]` as video when
+`[v]` is defined as an `.mp4`, since its renderer resolves the reference to an `<img src>` first.
+0.9.0's parse context has no definitions, so a plugin can't tell where an `ImageReference` points.
+`src/text/markdown_ext.rs` adds `MarkdownParseContext::definition`, read from the document's
+collected definitions, which `src/text/format/markdown.rs` passes in.
+
 The crate's own tests need `--features test-support` and `include_str!` a `README.md` four levels
 above `src/text`, which this folder lacks: run them from a scratch copy laid out as
-`<dir>/crates/gpui-base` with a `<dir>/README.md`.
+`<dir>/crates/gpui-base` with a `<dir>/README.md`, with `[patch.crates-io]` pointing `gpui-pre` and
+`gpui-pre-linux` at the vendored copies (`--config 'patch.crates-io.gpui-pre.path="…"'`).
 
 ## gpui-component 0.9.0
+
+The crate's tests need `--features test-support` and `include_bytes!` files of the upstream
+monorepo: run them from a scratch workspace with this folder as `<dir>/crates/ui`, gpui-kit-assets
+as `crates/assets`, the vendored gpui-base as `crates/base`, stub `examples/fixtures/test.md` and
+`themes/aurora.json`, and `[patch.crates-io]` entries for the vendored gpui crates.
 
 **The diff view draws like the web's.** The web renders diffs with Pierre diffs, whose unified
 view shows one line number per row (the new line, or the old one for a deletion), marks changed
@@ -256,12 +597,41 @@ rows with a 4px bar at the leading edge (dashed for deletions) and separates hun
 the numbers, and its line-info separator reads "N lines not in patch" on a flat strip. The patch
 draws one lane per Unified row, moves the bar to the row's edge, and draws the separator as the
 web's rounded bar with Pierre's wording. The app picks `DiffHunkSeparator::LineInfo` and
-`DiffChangeIndicator::Bars`, Pierre's defaults. Expanding unchanged lines needs the full files,
-which the app doesn't load, so the separator has no expand buttons. Files:
+`DiffChangeIndicator::Bars`, Pierre's defaults. Files:
 
 - `src/diff/mod.rs`: `code_width`, the lanes and bar in `code_line`, `change_bar`, and the
   `LineInfo` arm of `render_hunk_separator`.
 - `locales/ui.yml`: `Diff.HiddenLine` and the English `Diff.HiddenLines`.
+
+**Unchanged lines outside the hunks expand from the full files.** Pierre fills in a partial diff
+when the caller gives it `loadDiffFiles` (`canHydrateCollapsedContext`): the line-info separators
+get expand chevrons, and a "More unchanged context may be available" separator follows the last
+hunk. 0.9.0 keeps only the patch's lines. The patch adds `DiffState::set_contents_loader`: with a
+`DiffContentsLoader`, a modified or renamed file's separators expand (up, down or both by the
+expansion count, the count expanding both ends), the first expansion reads the file and
+`DiffFile::with_contents` rebuilds it with every line of both sides, and each gap between hunks
+shows its revealed ends (`GapReveal`) around a separator that hides the rest. A failed read leaves
+the patch as it was, and so do contents that no longer fit it: `with_contents` refuses a hunk line
+whose text differs from the patch's, or a gap line that differs between the sides, line endings and
+a final newline included as `git diff` compares them, so a file edited since the patch never shows
+its new lines as unchanged. A patch made ignoring whitespace
+(`DiffFileContents::ignore_whitespace`) is checked by `with_contents_ignoring_whitespace`, which
+compares those lines with whitespace (line endings too, as `git diff -w` does) removed. (Pierre's `hydratePartialDiff` does not check; this
+is stricter.) `DiffFile::is_same` also matches a hydrated file to the patch-only file it
+came from, so `update_files` keeps it. Files:
+
+- `src/diff/document.rs`: `with_contents`, `can_load_contents`, `is_hydrated`, `gap_pairs`,
+  `segments`, each hunk's modified source lines, and `is_same`.
+- `src/diff/state.rs`: `DisplayRow::Hunk`'s `hidden` pairs and the trailing separator in
+  `project_file`, `GapReveal`, `set_contents_loader`, `expand_gap`, `load_contents`, `hydrate`,
+  and `FoldExpansion::Both`.
+- `src/diff/mod.rs`: the expandable `LineInfo` arm of `render_hunk_separator`.
+- `src/diff/parser.rs`, `src/diff/presentation.rs`: hunks record both sides' lines; a hydrated
+  file highlights in one pass.
+- `locales/ui.yml`: `Diff.MoreContext`.
+- `src/diff/review_tests.rs`: `gap_reveals_grow_from_either_end_and_stop_at_the_gap`,
+  `full_contents_fill_the_gaps_between_hunks`,
+  `expanding_a_gap_reads_the_file_once_and_reveals_its_lines`.
 
 **Lazily read files join a diff without resetting it.** The app reads a large diff one file at a
 time and shows each batch as it settles. 0.9.0's only way to change the files is `set_files`,
@@ -281,6 +651,17 @@ on Windows set Segoe UI at 9pt in 28px rows. 0.9.0's `PopupMenu` rows are always
 menu is unchanged. Files:
 
 - `src/menu/popup_menu.rs`: the `item_text` field and builder, read in `render_item` and `render`.
+
+**A menu row can hold a second item.** The web's diff Commits menu puts each commit's SHA link,
+its own `DropdownMenuItem`, on the commit's row, so the arrow keys reach it after the commit.
+0.9.0 draws one item per row. The patch adds `PopupMenuItem::inline` for element items: an inline
+item draws at the end of the previous item's row and stays its own stop for the arrow keys, and
+the row highlights as one while either item is hovered or selected. Files:
+
+- `src/menu/popup_menu.rs`: the `inline` field and builder, `render_rows` (which `render` uses in
+  place of one `render_item` per item), `row_of` for scrolling the selection into view, and
+  `render_item`'s `in_row`.
+- `src/menu/menu_item.rs`: `MenuItemElement::in_row`, which leaves the highlight to the row.
 
 **Inputs grow below the web's `sm` breakpoint.** The web's `Input` and `Textarea` are 0.25rem taller
 with 1rem text in a window narrower than 640px (`h-9 sm:h-8`, `text-base sm:text-sm`). 0.9.0 sizes
@@ -338,6 +719,16 @@ their own width with `min-w-(--anchor-width) max-w-(--available-width)`; 0.9.0's
 `menu_width` used that width alone, so a wide trigger had a narrower popup. In `src/select.rs` a
 set width is at least the trigger's and at most the window's less the 8px margins.
 
+**A select says whether its menu is open.** The scheduled task editor's Destination picker
+replaces its rows in recency order only while the menu is closed, so rows don't move under the
+cursor. 0.9.0 keeps the open state private; `src/select.rs` adds `SelectState::is_open`.
+
+**Replacing a select's items keeps the search being typed.** The Destination picker replaces its
+rows when a thread is added, removed or renamed, even while its menu is open. 0.9.0's
+`SelectState::set_items` shows every new row while the typed query stays in the search field;
+`src/select.rs` runs the query over the new items before showing them. Test:
+`replacing_items_keeps_the_search_being_typed`.
+
 **Switches can be mixed.** gpui-base's `Switch` reports only on or off; `src/switch.rs` (in
 gpui-base) adds `mixed`, exposed as `aria-checked="mixed"` like the web's mixed `Switch`.
 
@@ -346,12 +737,34 @@ gpui-base) adds `mixed`, exposed as `aria-checked="mixed"` like the web's mixed 
 `src/menu/dropdown_menu.rs` adds `DropdownMenuPopover::open`, passed to its `Popover` as
 `Popover::open` is, so a caller can hold the open state with `on_open_change`.
 
+**Context menus open from the keyboard.** The web opens a focused element's context menu with
+the ContextMenu key or Shift+F10 (a browser's keyboard `contextmenu`). 0.9.0's `ContextMenuExt`
+opens only on a right click or a long press. `src/menu/context_menu.rs`:
+
+- `opens_context_menu` is that key test (re-exported from `src/menu/mod.rs`).
+- `ContextMenuExt::context_menu` adds a key-down listener on the trigger, so with focus on it or
+  inside it those keys open the menu below its lower-left corner. Each prepaint hands the
+  listener the trigger's bounds and menu state (`KeyboardTarget`); `keyboard_bounds` makes the
+  trigger that opened it draw the menu, which sits outside its bounds. Focus returns on dismiss,
+  as for a right click.
+- `ContextMenuExt::on_context_menu_key` does the same for a menu the element builds itself
+  (its own right-click handler): it measures the element with a `canvas` child and calls back
+  with the lower-left corner.
+
+**Text views pass link styling and hover through.** `src/text/compat.rs`: `TextView::link_underline`
+and `TextView::on_link_hover` forward to gpui-base's (see its "Links can drop their underline" and
+"Links report hover"); `src/text/mod.rs` re-exports `LinkHover`.
+
 **Soft breaks can render as line breaks.** `src/text/compat.rs`: `TextView::markdown_line_breaks`,
 passing through to gpui-base's (see its "Soft breaks can render as line breaks").
 
 **A thread's timeline reopens where it was left.** 0.9.0's `MessageScrollerState` scrolls only to
 a row's top. `src/message_scroller.rs`: `scroll_to_offset` scrolls to a row and an offset into
 it, the `logical_scroll_top` it reported.
+
+**A newly started turn anchors near the top.** The web reserves end space under a sent message
+so it can sit near the top while the reply streams in, which needs the rows' measured positions.
+`src/message_scroller.rs`: `bounds_for_item` and `viewport_bounds` pass the list's through.
 
 **A diff says which files are near the viewport, and pins the current file's header.** The web
 reads a large diff's patches as their headers come within 600px of the viewport, and its file
@@ -361,4 +774,52 @@ headers are sticky. The patch, in `src/diff/state.rs` and `src/diff/mod.rs`:
   below it, counting rows never laid out at the row height.
 - `DiffState::sticky_header` and `render_diff`'s `diff-sticky-header` overlay: once the list
   scrolls past a file's header, that header draws pinned over the top of the body, pushed up by
-  the next file's header as it arrives; a canvas records its height for the push.
+  the next file's header as it arrives; a canvas records its height for the push. The overlay
+  renders inside the state's update, so file headers read whether their file is folded from
+  `CodePresentation::collapsed`, not from the state.
+
+**A diff file lists its patch body.** The web's review comments name a selection by its rows in
+the patch (`reviewCommentContext.ts`) and quote those rows; 0.9.0 keeps a file's lines private.
+The patch, in `src/diff/document.rs`: `DiffFile::patch_body`, each line of the patch in order as a
+`DiffPatchLine` (its line on each side and its text), exported from `src/diff/mod.rs`. Test: an
+assertion in `alignment_covers_each_source_line_once`.
+
+**Markdown images open on a click.** `src/text/compat.rs`: `TextView::on_image_click`, passing
+through to gpui-base's (see its "Markdown images open on a click").
+
+**Code blocks can draw as something else.** `src/text/compat.rs`: `TextView::code_block_renderer`,
+passing through to gpui-base's (see its "Code blocks can draw as something else").
+
+**A diff can be searched.** T3 Code patches Pierre diffs with a find panel (`CodeViewSearch`):
+Mod+F inside a diff opens it on the selected text, the query (with Match Case, Whole Word and
+Regexp) runs over every file's lines, including folded files, collapsed context and rows never
+laid out, matches paint orange with the current one in the modified colour, and Enter, Shift+Enter,
+Mod+G and Mod+Shift+G step through them, wrapping, unfolding the file and expanding the context
+that hides one and centering it below the sticky header and the panel. Escape closes it and
+focuses the diff. 0.9.0 has no find. The patch:
+
+- `src/diff/search.rs`: `collect_matches` (unified order: a run's deletions, then its additions),
+  `step`, the panel (`render_panel`) and the match colours.
+- `src/diff/state.rs`: `DiffState::open_search`, `close_search`, `is_search_open`,
+  `step_search`, `reveal_match` (a folded file reports `DiffEvent::FileExpanded`), and a search
+  that runs again, keeping its current match, after `set_files`, `update_files` and hydration.
+- `src/diff/mod.rs`: the `OpenSearch`, `SearchNext`, `SearchPrevious` and `CloseSearch` actions
+  and bindings, match highlights in `line_highlights`, the panel in `render_diff`, and
+  `reveal_match_horizontally`.
+- `locales/ui.yml`: the English `Diff.Search*` strings.
+- `Cargo.toml`: a `fancy-regex` dependency. Pierre compiles the query as a JavaScript `RegExp`
+  (flags `g`, plus `i` without Match Case), which has lookaround and backreferences; the `regex`
+  crate rejects both. `fancy-regex` hands any pattern without them to `regex`'s own engine.
+  JavaScript's non-Unicode `\w`, `\d` and `\b` are ASCII-only and stay Unicode-aware here.
+- `src/diff/search_tests.rs`.
+
+**A parsed file reports its hunks and each side's lines.** The app checks a tool call's recorded
+patch the way the web reads Pierre's `hunks`, `additionLines` and `deletionLines`: an added file
+must have no original lines, a deleted one no modified lines. 0.9.0 keeps both counts
+crate-private. `src/diff/document.rs`: `DiffFile::lines_count` is public and `DiffFile::hunk_count`
+is new.
+
+**A diff paints on the code surface.** The web's diffs sit on `--code-background` and
+`--code-foreground`, which a theme sets apart from the canvas. 0.9.0 paints the theme's background
+and foreground. `src/diff/mod.rs`: `DiffCodeColors`, a global the app sets; the diff body, its
+pinned header and its hunk separators read it, falling back to the theme's colors without it.

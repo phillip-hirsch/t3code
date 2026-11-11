@@ -6,10 +6,10 @@
 //! web's environment-id tiebreaks and cross-environment grouping drop out.
 
 use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 
-use crate::model::{ProjectShell, ThreadShell};
+use crate::model::{ProjectShell, ScopedId, ThreadRef, ThreadShell};
 use crate::timestamp::parse_ms;
 
 fn ms(value: Option<&str>) -> Option<i64> {
@@ -31,7 +31,8 @@ pub fn format_relative(elapsed_ms: i64) -> String {
 /// (`IndexDraftLanding`): `sortScopedProjectsForSidebar(.., "updated_at")[0]`
 /// over unarchived projects. A project's time is its newest unarchived
 /// thread's latest user message (else updated, else created), or its own
-/// updated/created time without threads; ties go by title, then id.
+/// updated/created time without threads; ties go by title, then
+/// environment, then id.
 pub fn most_recent_project<'a>(projects: &'a [ProjectShell], threads: &[ThreadShell]) -> Option<&'a ProjectShell> {
     projects_by_recency(projects, threads).into_iter().next()
 }
@@ -41,20 +42,22 @@ pub fn projects_by_recency<'a>(projects: &'a [ProjectShell], threads: &[ThreadSh
     let thread_time = |t: &ThreadShell| {
         ms(t.latest_user_message_at.as_deref()).or_else(|| parse_ms(&t.updated_at)).or_else(|| parse_ms(&t.created_at))
     };
-    let mut latest: HashMap<&str, i64> = HashMap::new();
+    // By environment and project: project ids repeat across environments.
+    let mut latest: HashMap<(&str, &str), i64> = HashMap::new();
     for thread in threads.iter().filter(|t| t.archived_at.is_none()) {
         let time = thread_time(thread).unwrap_or(i64::MIN);
-        latest.entry(thread.project_id.as_str()).and_modify(|l| *l = (*l).max(time)).or_insert(time);
+        let key = (thread.environment_id.as_ref(), thread.project_id.as_str());
+        latest.entry(key).and_modify(|l| *l = (*l).max(time)).or_insert(time);
     }
     let project_time = |p: &ProjectShell| {
         latest
-            .get(p.id.as_str())
+            .get(&(p.environment_id.as_ref(), p.id.as_str()))
             .copied()
             .or_else(|| ms(p.updated_at.as_deref().or(p.created_at.as_deref())))
             .unwrap_or(i64::MIN)
     };
     let mut sorted: Vec<&ProjectShell> = projects.iter().filter(|p| p.archived_at.is_none()).collect();
-    sorted.sort_by_cached_key(|p| (Reverse(project_time(p)), p.title.clone(), p.id.clone()));
+    sorted.sort_by_cached_key(|p| (Reverse(project_time(p)), p.title.clone(), p.environment_id.clone(), p.id.clone()));
     sorted
 }
 
@@ -141,70 +144,128 @@ pub enum ChildRequest {
     Input,
 }
 
-/// `pendingSubagentRequestsByThread` in `client-runtime/src/state/threadShell.ts`.
-pub fn child_requests(threads: &[ThreadShell]) -> HashMap<&str, ChildRequest> {
-    let mut requests: HashMap<&str, ChildRequest> = HashMap::new();
-    let by_id: HashMap<&str, &ThreadShell> = threads.iter().map(|t| (t.id.as_str(), t)).collect();
+/// What each thread's children ask, by the parent's environment and id.
+pub type ChildRequests<'a> = HashMap<ThreadRef<'a>, ChildRequest>;
+
+fn request_of(kind: &str) -> ChildRequest {
+    if kind == "user_input" { ChildRequest::Input } else { ChildRequest::Approval }
+}
+
+/// `subagentRequest`: what a subagent, or a task a linked environment delegated, asks. Provider-native
+/// subagents ask on their parent, and a question outlives its run, but the parent stops waiting once
+/// the run ends.
+fn subagent_request(thread: &ThreadShell) -> Option<ChildRequest> {
+    let kind = thread.pending_runtime_request.as_ref()?.kind.as_str();
+    let child = thread.lineage.relationship_to_parent.as_deref() == Some("subagent") || thread.delegated_from.is_some();
+    let asks = kind != "auth_refresh"
+        && child
+        && thread.creation_source.as_deref() != Some("provider")
+        && is_child_run_live(thread);
+    asks.then(|| request_of(kind))
+}
+
+/// `sideChatRequest`: a side chat asks its user directly, so questions roll up as well as approvals.
+fn side_chat_request(thread: &ThreadShell) -> Option<ChildRequest> {
+    let kind = thread.pending_runtime_request.as_ref()?.kind.as_str();
+    (kind != "auth_refresh" && thread.lineage.side_chat == Some(true)).then(|| request_of(kind))
+}
+
+/// Flags an approval on `first`, on `env`, and up its subagent and side chat chain there.
+fn flag_approval<'a>(
+    requests: &mut ChildRequests<'a>,
+    by_ref: &HashMap<ThreadRef<'a>, &'a ThreadShell>,
+    (env, first): ThreadRef<'a>,
+    mut seen: Vec<&'a str>,
+) {
+    let mut next = Some(first);
+    while let Some(id) = next.filter(|id| !seen.contains(id)) {
+        seen.push(id);
+        requests.insert((env, id), ChildRequest::Approval);
+        next = by_ref.get(&(env, id)).and_then(|parent| {
+            let chained = parent.lineage.relationship_to_parent.as_deref() == Some("subagent")
+                || parent.lineage.side_chat == Some(true);
+            chained.then_some(parent.lineage.parent_thread_id.as_deref()).flatten()
+        });
+    }
+}
+
+/// `pendingSubagentRequestsByThread` and `delegatedSubagentRequestsAtom` in
+/// `client-runtime/src/state/threadShell.ts`. A subagent's or side chat's parent lives on the child's
+/// environment; a delegated task's parent is the thread it names on the linked environment.
+pub fn child_requests(threads: &[ThreadShell]) -> ChildRequests<'_> {
+    let mut requests: ChildRequests = HashMap::new();
+    let by_ref: HashMap<ThreadRef, &ThreadShell> =
+        threads.iter().map(|t| ((t.environment_id.as_ref(), t.id.as_str()), t)).collect();
     for child in threads {
-        let Some(kind) = child.pending_runtime_request.as_ref().map(|r| r.kind.as_str()) else { continue };
         let Some(parent_id) = child.lineage.parent_thread_id.as_deref() else { continue };
-        if kind == "auth_refresh" {
-            continue;
-        }
+        let env: &str = &child.environment_id;
         if child.lineage.side_chat == Some(true) {
-            let request = if kind == "user_input" { ChildRequest::Input } else { ChildRequest::Approval };
-            if requests.get(parent_id) != Some(&ChildRequest::Approval) {
-                requests.insert(parent_id, request);
+            if let Some(request) =
+                side_chat_request(child).filter(|_| requests.get(&(env, parent_id)) != Some(&ChildRequest::Approval))
+            {
+                requests.insert((env, parent_id), request);
             }
             continue;
         }
         // The coordinator answers its subagents' questions; only approvals climb.
-        if child.lineage.relationship_to_parent.as_deref() != Some("subagent") || kind == "user_input" {
-            continue;
-        }
-        // `subagentRequest`: provider-native subagents ask on their parent, and a
-        // question outlives its run, but the parent stops waiting once the run ends.
-        if child.creation_source.as_deref() == Some("provider") || !is_child_run_live(child) {
-            continue;
-        }
-        let mut seen = vec![child.id.as_str()];
-        let mut next = Some(parent_id);
-        while let Some(id) = next.filter(|id| !seen.contains(id)) {
-            seen.push(id);
-            requests.insert(id, ChildRequest::Approval);
-            next = by_id.get(id).and_then(|parent| {
-                let chained = parent.lineage.relationship_to_parent.as_deref() == Some("subagent")
-                    || parent.lineage.side_chat == Some(true);
-                chained.then_some(parent.lineage.parent_thread_id.as_deref()).flatten()
-            });
+        if child.lineage.relationship_to_parent.as_deref() == Some("subagent")
+            && subagent_request(child) == Some(ChildRequest::Approval)
+        {
+            flag_approval(&mut requests, &by_ref, (env, parent_id), vec![child.id.as_str()]);
         }
     }
-    requests
+    // A delegated task asks for an approval itself or through what it runs (its subagents, its own
+    // delegated tasks). Each pass settles one more hop of a chain; flags only grow, so environments
+    // delegating to each other settle too.
+    let mut tasks: Vec<(&ThreadShell, ThreadRef)> = threads
+        .iter()
+        .filter_map(|t| {
+            let from =
+                t.delegated_from.as_ref().filter(|from| from.environment_id.as_str() != t.environment_id.as_ref())?;
+            Some((t, (from.environment_id.as_str(), from.thread_id.as_str())))
+        })
+        .collect();
+    loop {
+        let before = tasks.len();
+        tasks.retain(|&(task, parent)| {
+            let asks = subagent_request(task) == Some(ChildRequest::Approval)
+                || requests.get(&(task.environment_id.as_ref(), task.id.as_str())) == Some(&ChildRequest::Approval);
+            if asks {
+                flag_approval(&mut requests, &by_ref, parent, Vec::new());
+            }
+            !asks
+        });
+        if tasks.len() == before {
+            return requests;
+        }
+    }
 }
 
-/// `childThreadInputsAtom`: the subagents and side chats under `parent`, at any depth,
-/// that ask the user something (`subagentRequest`, `sideChatRequest`).
-pub fn child_thread_inputs<'a>(threads: &'a [ThreadShell], parent: &str) -> Vec<&'a ThreadShell> {
-    let is_child = |t: &ThreadShell| {
-        t.lineage.relationship_to_parent.as_deref() == Some("subagent") || t.lineage.side_chat == Some(true)
-    };
-    let asks = |t: &ThreadShell| {
-        let Some(kind) = t.pending_runtime_request.as_ref().map(|r| r.kind.as_str()) else { return false };
-        kind != "auth_refresh"
-            && (t.lineage.side_chat == Some(true)
-                || (t.creation_source.as_deref() != Some("provider") && is_child_run_live(t)))
-    };
-    let mut seen = vec![parent];
-    let mut pending = vec![parent];
+/// `childThreadInputsAtom`: the subagents, side chats and delegated tasks under `parent` on `env`, at
+/// any depth and on any environment, that ask the user something.
+pub fn child_thread_inputs<'a>(threads: &'a [ThreadShell], env: &str, parent: &str) -> Vec<&'a ThreadShell> {
+    let mut children: HashMap<ThreadRef, Vec<&ThreadShell>> = HashMap::new();
+    for thread in threads {
+        let lineage = &thread.lineage;
+        let under = lineage.relationship_to_parent.as_deref() == Some("subagent") || lineage.side_chat == Some(true);
+        let parent = match (lineage.parent_thread_id.as_deref().filter(|_| under), &thread.delegated_from) {
+            (Some(id), _) => (thread.environment_id.as_ref(), id),
+            (None, Some(from)) => (from.environment_id.as_str(), from.thread_id.as_str()),
+            (None, None) => continue,
+        };
+        children.entry(parent).or_default().push(thread);
+    }
+    let mut seen = HashSet::from([(env, parent)]);
+    let mut pending = VecDeque::from([(env, parent)]);
     let mut inputs = Vec::new();
-    while let Some(id) = pending.pop() {
-        for child in threads.iter().filter(|t| t.lineage.parent_thread_id.as_deref() == Some(id) && is_child(t)) {
-            if seen.contains(&child.id.as_str()) {
+    while let Some(key) = pending.pop_front() {
+        for &child in children.get(&key).into_iter().flatten() {
+            let child_key = (child.environment_id.as_ref(), child.id.as_str());
+            if !seen.insert(child_key) {
                 continue;
             }
-            seen.push(&child.id);
-            pending.insert(0, &child.id);
-            if asks(child) {
+            pending.push_back(child_key);
+            if subagent_request(child).is_some() || side_chat_request(child).is_some() {
                 inputs.push(child);
             }
         }
@@ -220,8 +281,8 @@ pub struct Facts<'a> {
 }
 
 impl<'a> Facts<'a> {
-    pub fn new(thread: &'a ThreadShell, requests: &HashMap<&str, ChildRequest>) -> Self {
-        Self { thread, child_request: requests.get(thread.id.as_str()).copied() }
+    pub fn new(thread: &'a ThreadShell, requests: &ChildRequests) -> Self {
+        Self { thread, child_request: requests.get(&(thread.environment_id.as_ref(), thread.id.as_str())).copied() }
     }
 
     /// `shellRuntime(...)?.status`; `None` before the thread ever ran.
@@ -413,6 +474,65 @@ impl<'a> Facts<'a> {
         parse_ms(visited).is_none_or(|visited| completed > visited)
     }
 
+    /// `resolveThreadStatusPill`: the palette's word for what the thread waits on or did last.
+    pub fn pill(&self) -> Option<Pill> {
+        let t = self.thread;
+        if self.has_pending_approvals() || self.child_request == Some(ChildRequest::Approval) {
+            return Some(Pill::PendingApproval);
+        }
+        if self.has_pending_user_input() || self.child_request == Some(ChildRequest::Input) {
+            return Some(Pill::AwaitingInput);
+        }
+        if t.pending_guest_message_count > 0 {
+            return Some(Pill::GuestRequest);
+        }
+        let runtime = self.runtime_status();
+        let blocked = t.blocked_on_thread_wait == Some(true);
+        if (runtime == Some("running") && !blocked) || runtime == Some("waiting") {
+            return Some(Pill::Working);
+        }
+        if matches!(runtime, Some("preparing" | "starting" | "queued")) {
+            return Some(Pill::Connecting);
+        }
+        // `backgroundWorkHoldsCompletion` parks the runtime as idle.
+        if (runtime == Some("running") && blocked) || self.holds_completion() {
+            return Some(Pill::Waiting);
+        }
+        if self.has_unseen_failure() {
+            return Some(Pill::Failed);
+        }
+        // `isLatestRunSettled`.
+        let run_settled =
+            self.latest_run_status().is_some_and(|status| !is_active_run(status)) && t.active_run_id != t.latest_run_id;
+        if !self.has_pending_user_input()
+            && t.interaction_mode.as_deref() == Some("plan")
+            && run_settled
+            && t.has_actionable_proposed_plan
+        {
+            return Some(Pill::PlanReady);
+        }
+        self.is_unread().then_some(Pill::Completed)
+    }
+
+    fn holds_completion(&self) -> bool {
+        self.thread
+            .pending_background_tasks
+            .iter()
+            .any(|task| task.awaited == Some(true) || matches!(task.kind.as_str(), "subagent" | "background_task"))
+    }
+
+    /// `hasUnseenFailure`: unlike a completion, an unopened thread's failure counts as unseen.
+    fn has_unseen_failure(&self) -> bool {
+        if self.latest_run_status() != Some("failed") {
+            return false;
+        }
+        let Some(visited) = self.thread.last_visited() else { return true };
+        match (ms(self.latest_run_completed_at()), parse_ms(visited)) {
+            (Some(completed), Some(visited)) => completed > visited,
+            _ => true,
+        }
+    }
+
     /// `resolveSidebarThreadStatus`.
     pub fn status(&self) -> Status {
         if self.has_pending_approvals() || self.child_request == Some(ChildRequest::Approval) {
@@ -537,6 +657,36 @@ pub enum Status {
     Ready,
 }
 
+/// `ThreadStatusPill`'s label.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pill {
+    PendingApproval,
+    AwaitingInput,
+    GuestRequest,
+    Working,
+    Connecting,
+    Waiting,
+    Failed,
+    PlanReady,
+    Completed,
+}
+
+impl Pill {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::PendingApproval => "Pending Approval",
+            Self::AwaitingInput => "Awaiting Input",
+            Self::GuestRequest => "Guest Request",
+            Self::Working => "Working",
+            Self::Connecting => "Connecting",
+            Self::Waiting => "Waiting",
+            Self::Failed => "Failed",
+            Self::PlanReady => "Plan Ready",
+            Self::Completed => "Completed",
+        }
+    }
+}
+
 /// `shouldRecedeSidebarThread`.
 pub fn recedes(status: Status, unread: bool, woke: bool, active: bool) -> bool {
     match status {
@@ -583,9 +733,9 @@ const WORKING_EXIT_GRACE_MS: i64 = 2_000;
 /// to the inbox so the Active list sorts it by that time.
 #[derive(Default)]
 pub struct ReturnTracker {
-    /// Threads that read as working, keyed by id. Only these carry state.
-    working: HashMap<String, Hold>,
-    returns: HashMap<String, i64>,
+    /// Threads that read as working, keyed by environment and id. Only these carry state.
+    working: HashMap<ScopedId, Hold>,
+    returns: HashMap<ScopedId, i64>,
 }
 
 struct Hold {
@@ -604,27 +754,29 @@ fn placement(t: &ThreadShell) -> u64 {
 
 impl ReturnTracker {
     /// Updates the holds for the current shells at `now`.
-    pub fn observe(&mut self, threads: &[ThreadShell], requests: &HashMap<&str, ChildRequest>, now: i64) {
+    pub fn observe(&mut self, threads: &[ThreadShell], requests: &ChildRequests, now: i64) {
         let (mut working, mut returns) = (0, 0);
         for thread in threads {
-            self.observe_one(Facts::new(thread, requests), now);
-            working += usize::from(self.working.contains_key(thread.id.as_str()));
-            returns += usize::from(self.returns.contains_key(thread.id.as_str()));
+            let key = ScopedId::of_thread(thread);
+            self.observe_one(&key, Facts::new(thread, requests), now);
+            working += usize::from(self.working.contains_key(&key));
+            returns += usize::from(self.returns.contains_key(&key));
         }
         // Forget threads that left the shell.
         if working < self.working.len() || returns < self.returns.len() {
-            let present: HashSet<&str> = threads.iter().map(|t| t.id.as_str()).collect();
-            self.working.retain(|id, _| present.contains(id.as_str()));
-            self.returns.retain(|id, _| present.contains(id.as_str()));
+            let present: HashSet<ThreadRef> =
+                threads.iter().map(|t| (t.environment_id.as_ref(), t.id.as_str())).collect();
+            self.working.retain(|key, _| present.contains(&key.pair()));
+            self.returns.retain(|key, _| present.contains(&key.pair()));
         }
     }
 
-    fn observe_one(&mut self, facts: Facts, now: i64) {
+    fn observe_one(&mut self, key: &ScopedId, facts: Facts, now: i64) {
         let thread = facts.thread;
         let actual = facts.is_working();
-        let Some(hold) = self.working.get_mut(thread.id.as_str()) else {
+        let Some(hold) = self.working.get_mut(key) else {
             if actual {
-                self.working.insert(thread.id.clone(), Hold { deadline: None, placement: placement(thread) });
+                self.working.insert(key.clone(), Hold { deadline: None, placement: placement(thread) });
             }
             return;
         };
@@ -647,17 +799,17 @@ impl ReturnTracker {
         }
         // A grace that ran out returned the thread at its deadline, as the web's timer does.
         let returned = hold.deadline.filter(|d| *d <= now).unwrap_or(now);
-        self.working.remove(thread.id.as_str());
-        self.returns.insert(thread.id.clone(), returned);
+        self.working.remove(key);
+        self.returns.insert(key.clone(), returned);
     }
 
     /// Working, or held on the Working shelf, as of the last [`Self::observe`].
-    pub fn is_working(&self, thread_id: &str) -> bool {
-        self.working.contains_key(thread_id)
+    pub fn is_working(&self, (env, id): ThreadRef) -> bool {
+        self.working.contains_key(&ScopedId::new(env.to_owned(), id))
     }
 
-    pub fn returned_at(&self, thread_id: &str) -> Option<i64> {
-        self.returns.get(thread_id).copied()
+    pub fn returned_at(&self, (env, id): ThreadRef) -> Option<i64> {
+        self.returns.get(&ScopedId::new(env.to_owned(), id)).copied()
     }
 
     /// When the next hold expires; the caller observes again then.
@@ -698,7 +850,7 @@ pub fn partition<'a>(
             &mut sections.settled
         } else if thread.pinned_at.is_some() {
             &mut sections.pinned
-        } else if working_shelf && returns.is_working(&thread.id) {
+        } else if working_shelf && returns.is_working((&thread.environment_id, &thread.id)) {
             &mut sections.working
         } else {
             &mut sections.active
@@ -716,7 +868,7 @@ pub fn partition<'a>(
         sections.active.sort_by_cached_key(|f| (Reverse(f.send_timestamp()), id(f)));
     } else if working_shelf {
         sections.active.sort_by_cached_key(|f| {
-            let returned = returns.returned_at(id(f)).unwrap_or(0);
+            let returned = returns.returned_at((&f.thread.environment_id, id(f))).unwrap_or(0);
             (Reverse(f.return_timestamp().max(returned)), id(f))
         });
     } else {
@@ -1152,6 +1304,16 @@ mod tests {
         // Equal times fall back to the title.
         let tied = [project("y", "Yak", Some("2026-11-04T09:00:00.000Z"), false), projects[0].clone()];
         assert_eq!(most_recent_project(&tied, &[]).map(|p| p.id.as_str()), Some("a"));
+        // Then the environment, before the id, as `sortScopedProjectsForSidebar` breaks ties.
+        let twins = [
+            ProjectShell { environment_id: "env-b".into(), ..project("a", "Alpha", None, false) },
+            ProjectShell { environment_id: "env-a".into(), ..project("b", "Alpha", None, false) },
+        ];
+        let first = most_recent_project(&twins, &[]).map(|p| p.environment_id.as_ref());
+        assert_eq!(first, Some("env-a"));
+        // Activity in project `b` on another environment says nothing about this one's `b`.
+        let elsewhere = [ThreadShell { environment_id: "other".into(), ..thread("b", "2026-11-04T10:00:00.000Z") }];
+        assert_eq!(most_recent_project(&projects, &elsewhere).map(|p| p.id.as_str()), Some("a"));
     }
     use serde::Deserialize as _;
     use serde_json::{Value, json};
@@ -1324,6 +1486,45 @@ mod tests {
     }
 
     #[test]
+    fn the_status_pill_names_what_waits_first_then_the_run() {
+        let pill = |extra: Value| Facts::new(&thread("t", extra), &HashMap::new()).pill();
+        let visited = "2026-11-02T00:00:00.000Z";
+        assert_eq!(pill(json!({})), None);
+        let approval = json!({"latestRunId": "r", "status": "running", "pendingRuntimeRequest": {"kind": "command"}});
+        assert_eq!(pill(approval), Some(Pill::PendingApproval));
+        let question = json!({"pendingRuntimeRequest": {"kind": "user_input"}, "pendingGuestMessageCount": 1});
+        assert_eq!(pill(question), Some(Pill::AwaitingInput));
+        assert_eq!(pill(json!({"pendingGuestMessageCount": 1})), Some(Pill::GuestRequest));
+        assert_eq!(pill(json!({"latestRunId": "r", "status": "running"})), Some(Pill::Working));
+        assert_eq!(pill(json!({"latestRunId": "r", "status": "starting"})), Some(Pill::Connecting));
+        let blocked = json!({"latestRunId": "r", "status": "running", "blockedOnThreadWait": true});
+        assert_eq!(pill(blocked), Some(Pill::Waiting));
+        let parked =
+            json!({"latestRunId": "r", "status": "completed", "pendingBackgroundTasks": [{"kind": "subagent"}]});
+        assert_eq!(pill(parked), Some(Pill::Waiting));
+        // A failure counts before the thread is ever opened; a completion does not.
+        let failed = |visited_at: Option<&str>| {
+            json!({"latestRunId": "r", "status": "failed", "latestRunCompletedAt": "2026-11-03T00:00:00.000Z",
+                "lastVisitedAt": visited_at})
+        };
+        assert_eq!(pill(failed(None)), Some(Pill::Failed));
+        assert_eq!(pill(failed(Some(visited))), Some(Pill::Failed));
+        assert_eq!(pill(failed(Some("2026-11-04T00:00:00.000Z"))), None);
+        let done = |visited_at: Option<&str>| {
+            json!({"latestRunId": "r", "status": "completed", "latestRunCompletedAt": "2026-11-03T00:00:00.000Z",
+                "lastVisitedAt": visited_at})
+        };
+        assert_eq!(pill(done(None)), None);
+        assert_eq!(pill(done(Some(visited))), Some(Pill::Completed));
+        let plan = json!({"latestRunId": "r", "status": "completed", "interactionMode": "plan",
+            "hasActionableProposedPlan": true, "lastVisitedAt": "2026-11-04T00:00:00.000Z"});
+        assert_eq!(pill(plan.clone()), Some(Pill::PlanReady));
+        let mut active = plan;
+        active["activeRunId"] = json!("r");
+        assert_eq!(pill(active), None, "the plan's run is still the active one");
+    }
+
+    #[test]
     fn subagent_approvals_pull_the_parent_out_of_working() {
         let child = |extra: Value| {
             let mut value = json!({"pendingRuntimeRequest": {"kind": "command"}, "lineage": {"rootThreadId": "parent", "parentThreadId": "parent", "relationshipToParent": "subagent"}});
@@ -1331,7 +1532,7 @@ mod tests {
             thread("child", value)
         };
         let parent = thread("parent", json!({"latestRunId": "r", "status": "running"}));
-        let flagged = |child: ThreadShell| child_requests(&[parent.clone(), child]).get("parent").copied();
+        let flagged = |child: ThreadShell| child_requests(&[parent.clone(), child]).get(&("", "parent")).copied();
         // Older servers omit the activity run, so the run status decides.
         assert_eq!(flagged(child(json!({"status": "running"}))), Some(ChildRequest::Approval));
         assert_eq!(flagged(child(json!({"status": "idle"}))), None);
@@ -1348,6 +1549,81 @@ mod tests {
         let sections = partition(&threads, now(), true, false, &mut ReturnTracker::default(), |_| true);
         assert_eq!(ids(&sections.active), ["parent"]);
         assert_eq!(sections.active[0].status(), Status::Approval);
+
+        // Another environment's thread with the parent's id is not the one asked.
+        let mut elsewhere = parent.clone();
+        elsewhere.environment_id = "remote".into();
+        let threads = vec![parent.clone(), elsewhere.clone(), child(json!({"status": "running"}))];
+        let requests = child_requests(&threads);
+        assert_eq!(Facts::new(&parent, &requests).child_request, Some(ChildRequest::Approval));
+        assert_eq!(Facts::new(&elsewhere, &requests).child_request, None);
+        assert_eq!(child_thread_inputs(&threads, "", "parent").len(), 1);
+        assert!(child_thread_inputs(&threads, "remote", "parent").is_empty());
+    }
+
+    #[test]
+    fn tasks_delegated_to_linked_environments_ask_on_their_parent() {
+        let on = |env: &str, id: &str, extra: Value| ThreadShell {
+            environment_id: env.to_owned().into(),
+            ..thread(id, extra)
+        };
+        let task = |env: &str, id: &str, from: (&str, &str), request: Option<&str>| {
+            let mut extra = json!({"status": "running",
+                "delegatedFrom": {"environmentId": from.0, "threadId": from.1, "title": "Parent"}});
+            if let Some(kind) = request {
+                extra["pendingRuntimeRequest"] = json!({"kind": kind});
+            }
+            on(env, id, extra)
+        };
+        let parent = on("a", "parent", json!({"latestRunId": "r", "status": "running"}));
+        let asked = |threads: &[ThreadShell]| child_requests(threads).get(&("a", "parent")).copied();
+        let inputs = |threads: &[ThreadShell]| -> Vec<String> {
+            child_thread_inputs(threads, "a", "parent")
+                .iter()
+                .map(|t| format!("{}/{}", t.environment_id, t.id))
+                .collect()
+        };
+
+        // The task on B asks for an approval itself.
+        let threads = [parent.clone(), task("b", "task", ("a", "parent"), Some("command"))];
+        assert_eq!(asked(&threads), Some(ChildRequest::Approval));
+        assert_eq!(inputs(&threads), ["b/task"]);
+        // Its question goes to its coordinator, but the card still shows under the parent.
+        let threads = [parent.clone(), task("b", "task", ("a", "parent"), Some("user_input"))];
+        assert_eq!(asked(&threads), None);
+        assert_eq!(inputs(&threads), ["b/task"]);
+
+        // Through the task's own subagent on B.
+        let sub = on(
+            "b",
+            "sub",
+            json!({"status": "running", "pendingRuntimeRequest": {"kind": "command"},
+            "lineage": {"rootThreadId": "task", "parentThreadId": "task", "relationshipToParent": "subagent"}}),
+        );
+        let threads = [parent.clone(), sub, task("b", "task", ("a", "parent"), None)];
+        assert_eq!(asked(&threads), Some(ChildRequest::Approval));
+        assert_eq!(inputs(&threads), ["b/sub"]);
+
+        // Through a task it delegated on to C, listed before the hop it rides on.
+        let threads = [
+            task("c", "onward", ("b", "task"), Some("command")),
+            parent.clone(),
+            task("b", "task", ("a", "parent"), None),
+        ];
+        assert_eq!(asked(&threads), Some(ChildRequest::Approval));
+        assert_eq!(inputs(&threads), ["c/onward"]);
+
+        // A finished task's request is stale, and the same id on another environment is not the parent.
+        let mut done = task("b", "task", ("a", "parent"), Some("command"));
+        done.status = "idle".into();
+        assert_eq!(asked(&[parent.clone(), done]), None);
+        let elsewhere = [parent, task("b", "task", ("z", "parent"), Some("command"))];
+        assert_eq!(asked(&elsewhere), None);
+        assert!(inputs(&elsewhere).is_empty());
+
+        // Environments delegating to each other settle.
+        let threads = [task("a", "parent", ("b", "task"), None), task("b", "task", ("a", "parent"), Some("command"))];
+        assert_eq!(asked(&threads), Some(ChildRequest::Approval));
     }
 
     fn running(id: &str, working: bool, extra: Value) -> ThreadShell {
@@ -1365,18 +1641,35 @@ mod tests {
     fn a_thread_that_stops_working_is_held_then_stamped_at_its_deadline() {
         let mut tracker = ReturnTracker::default();
         observe(&mut tracker, &[running("a", true, json!({})), running("b", false, json!({}))], 10_000);
-        assert_eq!(tracker.returned_at("a"), None, "never stamped on the first observation");
+        assert_eq!(tracker.returned_at(("", "a")), None, "never stamped on the first observation");
         observe(&mut tracker, &[running("a", false, json!({})), running("b", false, json!({}))], 10_000);
-        assert!(tracker.is_working("a") && !tracker.is_working("b"));
+        assert!(tracker.is_working(("", "a")) && !tracker.is_working(("", "b")));
         assert_eq!(tracker.next_deadline(), Some(12_000));
         observe(&mut tracker, &[running("a", false, json!({}))], 11_999);
-        assert!(tracker.is_working("a"));
+        assert!(tracker.is_working(("", "a")));
         // The clock wakes a little late; the return still reads as the deadline.
         observe(&mut tracker, &[running("a", false, json!({}))], 12_005);
-        assert!(!tracker.is_working("a"));
-        assert_eq!(tracker.returned_at("a"), Some(12_000));
-        assert_eq!(tracker.returned_at("b"), None);
+        assert!(!tracker.is_working(("", "a")));
+        assert_eq!(tracker.returned_at(("", "a")), Some(12_000));
+        assert_eq!(tracker.returned_at(("", "b")), None);
         assert_eq!(tracker.next_deadline(), None);
+    }
+
+    #[test]
+    fn a_hold_belongs_to_its_environments_thread() {
+        let mut tracker = ReturnTracker::default();
+        let on = |env: &str, working: bool| {
+            let mut thread = running("a", working, json!({}));
+            thread.environment_id = env.to_owned().into();
+            thread
+        };
+        observe(&mut tracker, &[on("local", true), on("remote", false)], 10_000);
+        assert!(tracker.is_working(("local", "a")));
+        assert!(!tracker.is_working(("remote", "a")), "the other environment's thread never worked");
+        observe(&mut tracker, &[on("local", false), on("remote", false)], 10_000);
+        observe(&mut tracker, &[on("local", false), on("remote", false)], 12_000);
+        assert_eq!(tracker.returned_at(("local", "a")), Some(12_000));
+        assert_eq!(tracker.returned_at(("remote", "a")), None);
     }
 
     #[test]
@@ -1387,10 +1680,10 @@ mod tests {
         observe(&mut tracker, std::slice::from_ref(&idle), 10_000);
         observe(&mut tracker, std::slice::from_ref(&busy), 11_500);
         observe(&mut tracker, &[busy], 12_500);
-        assert_eq!(tracker.returned_at("a"), None);
+        assert_eq!(tracker.returned_at(("", "a")), None);
         observe(&mut tracker, std::slice::from_ref(&idle), 12_500);
         observe(&mut tracker, &[idle], 14_500);
-        assert_eq!(tracker.returned_at("a"), Some(14_500));
+        assert_eq!(tracker.returned_at(("", "a")), Some(14_500));
     }
 
     #[test]
@@ -1411,8 +1704,8 @@ mod tests {
             observe(&mut tracker, &[running("a", true, json!({}))], 10_000);
             observe(&mut tracker, &[running("a", false, json!({}))], 10_000);
             observe(&mut tracker, &[running("a", false, change.clone())], 10_000);
-            assert!(!tracker.is_working("a"), "{change}");
-            assert_eq!(tracker.returned_at("a"), Some(10_000), "{change}");
+            assert!(!tracker.is_working(("", "a")), "{change}");
+            assert_eq!(tracker.returned_at(("", "a")), Some(10_000), "{change}");
             assert_eq!(tracker.next_deadline(), None, "{change}");
         }
     }
@@ -1426,7 +1719,7 @@ mod tests {
         observe(&mut tracker, &[a.clone(), running("b", true, json!({}))], 10_000);
         observe(&mut tracker, &[a.clone(), b.clone()], 10_500);
         observe(&mut tracker, &[a.clone(), b.clone()], 12_000);
-        assert_eq!((tracker.returned_at("a"), tracker.returned_at("b")), (Some(12_000), None));
+        assert_eq!((tracker.returned_at(("", "a")), tracker.returned_at(("", "b"))), (Some(12_000), None));
         let threads = [a, b];
         let sections = partition(&threads, 12_500, true, false, &mut tracker, |_| true);
         assert_eq!(ids(&sections.active), ["b", "a"]);
@@ -1435,7 +1728,7 @@ mod tests {
 
         observe(&mut tracker, &[running("c", true, json!({}))], 13_000);
         observe(&mut tracker, &[], 13_000);
-        assert_eq!((tracker.returned_at("a"), tracker.next_deadline()), (None, None));
+        assert_eq!((tracker.returned_at(("", "a")), tracker.next_deadline()), (None, None));
     }
 
     #[test]

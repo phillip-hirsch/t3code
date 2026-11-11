@@ -47,6 +47,16 @@ pub fn hour12(timestamp_format: &str) -> bool {
     }
 }
 
+/// The system locale as a BCP 47 tag (`navigator.language`), read once.
+pub fn locale_tag() -> &'static str {
+    static TAG: OnceLock<String> = OnceLock::new();
+    TAG.get_or_init(|| {
+        let (tag, _) = system_locale();
+        let base = tag.split(['@', '.']).next().unwrap_or_default().replace('_', "-");
+        if base.is_empty() { "en-US".to_owned() } else { base }
+    })
+}
+
 /// The system locale's clock, read once like the web's `timestampLocale`.
 fn system_hour12() -> bool {
     static HOUR12: OnceLock<bool> = OnceLock::new();

@@ -15,7 +15,7 @@ use gpui_kit::component::text::{RangeHighlight, RenderedText};
 use gpui_kit::component::{Disableable as _, Sizable as _, WindowExt as _, h_flex};
 use gpui_kit::{
     AnyElement, AppContext as _, Context, Entity, Hsla, InteractiveElement as _, IntoElement, ParentElement as _,
-    SharedString, Styled as _, Subscription, Task, Window, div, px, rgb,
+    SharedString, Styled as _, Subscription, Task, Window, div, px,
 };
 use serde_json::{Value, json};
 
@@ -245,8 +245,8 @@ pub(super) struct ThreadFind {
     offset: i64,
     /// The entry the timeline last scrolled to.
     revealed: Option<String>,
-    /// Per markdown view, the text, active occurrence and query it was last painted for.
-    painted: HashMap<SharedString, (RenderedText, Option<usize>, String)>,
+    /// Per markdown view, the text, active occurrence, query and match colors it was last painted for.
+    painted: HashMap<SharedString, (RenderedText, Option<usize>, String, [Hsla; 2])>,
     _search: Option<Task<()>>,
     _refresh: Option<Task<()>>,
     _subscription: Subscription,
@@ -526,37 +526,34 @@ impl Workspace {
     }
 
     fn paint_all_find(&mut self, cx: &mut Context<Self>) {
-        for key in self.markdown_keys() {
+        for key in self.markdown_keys(super::side_chat::ChatPane::Main) {
             self.paint_find(&key, cx);
         }
     }
 
-    /// Paints the find's matches in the markdown view under `key`; a no-op when nothing changed,
-    /// so the view's own notifications don't repaint it.
+    /// Paints the find's matches in the main timeline's markdown view under `key`; a no-op when
+    /// nothing changed, so the view's own notifications don't repaint it.
     pub(super) fn paint_find(&mut self, key: &SharedString, cx: &mut Context<Self>) {
         let open = self.open_find().is_some();
-        if !open {
+        if !open || super::chat::view_pane(key).0 != super::side_chat::ChatPane::Main {
             return;
         }
         let Some(view) = self.markdown_view(key) else { return };
         let projection = self.thread.as_ref().and_then(|t| t.state.projection.as_ref());
         let entry = projection.and_then(|p| item_entry(p, key));
-        let dark = crate::theme::tokens(cx).dark;
+        let colors = crate::theme::tokens(cx).search_match;
+        // `::highlight(t3-thread-find)` and `t3-thread-find-active`.
+        let (inactive, current) = (colors.background, colors.active_background);
         let Some(find) = self.find.as_mut().filter(|_| open) else { return };
         let matched = find.result.as_ref().and_then(|r| r.matched.as_ref());
         // Painted once the server confirms a match, as the web paints `findQuery`.
         let query = if matched.is_some() { find.query.clone() } else { String::new() };
         let active = matched.filter(|m| Some(&m.entry_id) == entry.as_ref()).map(|m| m.occurrence);
         let text = view.read(cx).rendered_text();
-        let painted = (text.clone(), active, query.clone());
+        let painted = (text.clone(), active, query.clone(), [inactive, current]);
         if find.painted.get(key) == Some(&painted) {
             return;
         }
-        let (inactive, current): (Hsla, Hsla) = if dark {
-            (rgb(0x8c6c1f).into(), rgb(0xeea52b).into())
-        } else {
-            (rgb(0xffde8b).into(), rgb(0xeea52b).into())
-        };
         let highlights: Vec<RangeHighlight> = occurrences(text.as_str(), &query)
             .into_iter()
             .enumerate()

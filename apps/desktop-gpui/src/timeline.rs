@@ -8,12 +8,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use gpui_kit::SharedString;
 use serde_json::Value;
 
 use crate::model::{self, Run, ThreadProjection, TurnItem, is_active_run_status};
 pub use crate::queue::Attribution;
+pub use crate::user_message::UserContent;
 use crate::work_log::{self, Activity, Entry, Status, Tone, WorkIcon};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -32,6 +34,8 @@ pub enum Row {
         /// Who sent it when not the user (`resolveUserMessagePresentation`); such a message is
         /// not the user's own words, so it never groups.
         attribution: Option<Attribution>,
+        /// Its attachments and context records, which its media and chips show.
+        content: Arc<UserContent>,
     },
     Assistant {
         id: SharedString,
@@ -100,7 +104,7 @@ pub enum Row {
     },
     /// A subagent's card, opening its thread (`SubagentTimelineLink`).
     Subagent(Rc<SubagentCard>),
-    /// A page an agent rendered (`html_render`) or an MCP app, opened in the browser.
+    /// A page an agent rendered (`html_render`) or an MCP app (`McpAppTimelineRow`).
     Embed(Rc<Embed>),
     /// A thread the turn created, summarized under its last reply (`resourceSummary`).
     CreatedThread {
@@ -162,8 +166,57 @@ pub struct Embed {
     pub id: SharedString,
     pub title: SharedString,
     pub attachment_id: SharedString,
-    /// The MCP server, for an app; `None` for a rendered page.
-    pub app_server: Option<SharedString>,
+    /// The app, for an MCP app; `None` for a rendered page.
+    pub app: Option<Rc<crate::mcp_apps::AppReference>>,
+    /// `turnItemDetailRevision`: `"live"` until the item settles, then its `updatedAt`.
+    pub revision: SharedString,
+    /// A rendered page's measured size (`HtmlRenderReference`); `None` for an app.
+    pub page: Option<PageSize>,
+}
+
+/// `HTML_RENDER_MIN_HEIGHT` and `HTML_RENDER_MAX_HEIGHT`.
+pub const PAGE_MIN_HEIGHT: f32 = 80.;
+pub const PAGE_MAX_HEIGHT: f32 = 2000.;
+
+/// `clampHtmlRenderHeight`.
+pub fn clamp_page_height(height: f32) -> f32 {
+    height.round().clamp(PAGE_MIN_HEIGHT, PAGE_MAX_HEIGHT)
+}
+
+/// The height the agent gave a page and the heights the server measured it at, by width
+/// (ascending), as `readHtmlRenderReference` validates them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PageSize {
+    pub height: f32,
+    pub heights: Vec<(u32, f32)>,
+}
+
+impl PageSize {
+    #[expect(clippy::cast_possible_truncation, reason = "finite values the server measured")]
+    fn read(page: &Value) -> Option<Self> {
+        let height = page.get("height").and_then(Value::as_f64).filter(|h| h.is_finite())?;
+        // `readMeasuredHeights`: up to 24 `[width, height]` pairs, all valid or none kept.
+        let heights = page
+            .get("heights")
+            .and_then(Value::as_array)
+            .filter(|list| !list.is_empty() && list.len() <= 24)
+            .and_then(|list| {
+                list.iter()
+                    .map(|entry| {
+                        let pair = entry.as_array().filter(|pair| pair.len() == 2)?;
+                        let width = pair[0].as_u64().filter(|w| (1..=10_000).contains(w))?;
+                        let height = pair[1].as_f64().filter(|h| h.is_finite())?;
+                        Some((width as u32, clamp_page_height(height as f32)))
+                    })
+                    .collect::<Option<Vec<_>>>()
+            })
+            .map(|mut heights| {
+                heights.sort_by_key(|(width, _)| *width);
+                heights
+            })
+            .unwrap_or_default();
+        Some(Self { height: clamp_page_height(height as f32), heights })
+    }
 }
 
 impl Embed {
@@ -189,25 +242,31 @@ fn embed(item: &TurnItem) -> Option<Embed> {
         return None;
     }
     let tool = item.str("toolName").unwrap_or_default();
-    if let Some(app) = output.get("t3McpApp") {
-        let (server, name) = (text(app, "server")?, text(app, "tool")?);
-        if tool != format!("{server}.{name}") && tool != format!("mcp__{server}__{name}") {
-            return None;
-        }
+    let revision: SharedString = match item.status.as_str() {
+        "idle" | "pending" | "running" | "waiting" => "live".into(),
+        _ => item.str("updatedAt").unwrap_or_default().to_owned().into(),
+    };
+    if output.get(crate::mcp_apps::OUTPUT_KEY).is_some() {
+        let app = crate::mcp_apps::AppReference::from_tool(tool, output)?;
         return Some(Embed {
             id: item.id.clone().into(),
-            title: format!("{server} app").into(),
-            attachment_id: text(app, "attachmentId")?.to_owned().into(),
-            app_server: Some(server.to_owned().into()),
+            title: format!("{} app", app.server).into(),
+            attachment_id: app.attachment_id.clone().into(),
+            app: Some(Rc::new(app)),
+            revision,
+            page: None,
         });
     }
     let page = output.get("htmlRender").filter(|_| item.status == "completed" && tool.ends_with("html_render"))?;
+    page.get("title").filter(|title| title.is_string())?;
     let title: String = text(page, "title").unwrap_or("HTML").chars().take(200).collect();
     Some(Embed {
         id: item.id.clone().into(),
         title: title.into(),
-        attachment_id: text(page, "attachmentId")?.to_owned().into(),
-        app_server: None,
+        attachment_id: text(page, "attachmentId").filter(|id| id.len() <= 256)?.to_owned().into(),
+        app: None,
+        revision,
+        page: Some(PageSize::read(page)?),
     })
 }
 
@@ -271,6 +330,8 @@ pub enum RequestKind {
     Secret {
         label: SharedString,
         placeholder: Option<SharedString>,
+        /// The page the agent asks the user to sign in on, if it named one.
+        url: Option<SharedString>,
         /// `delivery: "file"`: the agent's commands can read the value.
         file: bool,
     },
@@ -279,6 +340,8 @@ pub enum RequestKind {
         url: Option<SharedString>,
         environment_id: Option<SharedString>,
         requested_access: Option<SharedString>,
+        /// How the agent described the machine (`my box`), to rank the user's machines.
+        hint: Option<SharedString>,
     },
 }
 
@@ -309,6 +372,7 @@ fn request_card(item: &TurnItem) -> RequestCard {
         "secret_request" => RequestKind::Secret {
             label: text("label").unwrap_or_else(|| "Secret".into()),
             placeholder: text("placeholder"),
+            url: text("url"),
             file: item.str("delivery") == Some("file"),
         },
         _ => RequestKind::Link {
@@ -316,6 +380,7 @@ fn request_card(item: &TurnItem) -> RequestCard {
             url: text("url"),
             environment_id: text("environmentId"),
             requested_access: text("requestedAccess"),
+            hint: text("hint"),
         },
     };
     RequestCard {
@@ -759,6 +824,7 @@ enum Kind {
         fresh_context: bool,
         /// `modelSwitch`: the model or effort change that took effect with it.
         model_switch: Option<Rc<(model::ModelSelection, model::ModelSelection)>>,
+        content: Arc<UserContent>,
     },
     Assistant {
         text: SharedString,
@@ -917,8 +983,12 @@ fn timeline_entry(item: &Rc<TurnItem>, inherited: bool) -> Option<TimelineEntry>
             };
             let revertible = matches!(intent, Some("turn_start" | "queued_turn"));
             let (shown, attribution) = crate::queue::user_message_presentation(item);
+            // The agent needs words to start a turn; people sent only the attachments.
+            let shown =
+                if attribution.is_none() { crate::user_message::without_bootstrap_prompt(&shown) } else { &shown };
             Kind::User {
-                text: shown.into(),
+                content: Arc::new(UserContent::parse(&item.raw)),
+                text: shown.to_owned().into(),
                 steer,
                 revertible,
                 attribution,
@@ -2089,7 +2159,7 @@ pub fn rows(
                     });
                 }
             }
-            Kind::User { text, steer, attribution, fresh_context, model_switch, .. } => {
+            Kind::User { text, steer, attribution, fresh_context, model_switch, content, .. } => {
                 if *fresh_context {
                     rows.push(Row::System(Rc::new(SystemDivider {
                         id: format!("fresh-session:{}", entry.id).into(),
@@ -2115,6 +2185,7 @@ pub fn rows(
                     created_at: entry.created_at.clone(),
                     revert: reverts.get(&entry.id).cloned(),
                     attribution: attribution.clone(),
+                    content: content.clone(),
                 });
             }
             Kind::Assistant { text, streaming } => rows.push(Row::Assistant {
@@ -2418,6 +2489,7 @@ mod tests {
             created_at: SharedString::default(),
             revert: None,
             attribution: None,
+            content: Default::default(),
         }
     }
 
@@ -3058,20 +3130,32 @@ mod tests {
                 json!({"id": "t", "type": "dynamic_tool", "status": "completed", "toolName": tool, "output": output});
             embed(&serde_json::from_value(value).unwrap())
         };
-        let page =
-            tool("mcp__t3-code__html_render", json!({"htmlRender": {"attachmentId": "a1", "title": "Q3: plan?"}}));
+        let page = tool(
+            "mcp__t3-code__html_render",
+            json!({"htmlRender": {"attachmentId": "a1", "title": "Q3: plan?", "height": 12.4,
+                "heights": [[640, 900.6], [320, 3000]]}}),
+        );
         assert_eq!(
             page.as_ref().map(|p| (p.attachment_id.as_ref(), p.file_name())),
             Some(("a1", "Q3 plan.html".into()))
         );
-        let app =
-            tool("mcp__maps__show", json!({"t3McpApp": {"attachmentId": "a2", "server": "maps", "tool": "show"}}));
-        assert_eq!(app.map(|a| a.title), Some("maps app".into()));
-        // An app reference from another tool is ignored, so tools cannot pose as an app.
+        // `readHtmlRenderReference`: heights clamp and sort by width.
+        assert_eq!(page.and_then(|p| p.page), Some(PageSize { height: 80., heights: vec![(320, 2000.), (640, 901.)] }));
+        let page = |value: Value| tool("mcp__t3-code__html_render", json!({"htmlRender": value})).and_then(|p| p.page);
+        // One bad measurement drops them all; a page needs its height and a title.
         assert_eq!(
-            tool("mcp__other__x", json!({"t3McpApp": {"attachmentId": "a2", "server": "maps", "tool": "show"}})),
-            None
+            page(json!({"attachmentId": "a", "title": "", "height": 300, "heights": [[640, 900], [0, 1]]})),
+            Some(PageSize { height: 300., heights: vec![] })
         );
+        assert_eq!(page(json!({"attachmentId": "a", "title": "x"})), None);
+        assert_eq!(page(json!({"attachmentId": "a", "height": 300})), None);
+        let reference =
+            json!({"attachmentId": "a2", "server": "maps", "tool": "show", "resourceUri": "ui://maps/show"});
+        let app = tool("mcp__maps__show", json!({"t3McpApp": reference}));
+        assert_eq!(app.as_ref().map(|a| (a.title.as_ref(), a.revision.as_ref())), Some(("maps app", "")));
+        assert_eq!(app.and_then(|a| a.app).map(|a| a.resource_uri.clone()), Some("ui://maps/show".into()));
+        // An app reference from another tool is ignored, so tools cannot pose as an app.
+        assert_eq!(tool("mcp__other__x", json!({"t3McpApp": reference})), None);
         assert_eq!(
             tool("mcp__t3-code__html_render", json!({"isError": true, "htmlRender": {"attachmentId": "a1"}})),
             None
@@ -3161,6 +3245,15 @@ mod tests {
         };
         assert_eq!(sender_thread.as_deref(), Some("parent"));
         assert!(matches!(rows[1], Row::User { attribution: None, grouped_with_previous: false, .. }));
+
+        // Attachments sent alone show without the words the agent was given to start its turn.
+        let files_only = json!({"text": format!("Ultrathink:\n{}", crate::composer_text::ATTACHMENT_ONLY_PROMPT),
+            "attachments": [{"type": "image", "id": "a1", "name": "a.png", "mimeType": "image/png", "sizeBytes": 1}],
+            "context": {"version": 1, "records": [{"kind": "image", "contextId": "c1", "label": "a.png", "attachmentId": "a1"}]}});
+        let p = projection(vec![item("u7", "user_message", "r4", "2026-11-04T10:00:00.000Z", files_only)], json!([]));
+        let rows = super::rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default());
+        let Row::User { text, content, .. } = &rows[0] else { panic!("{:?}", describe(&rows)) };
+        assert_eq!((text.as_ref(), content.attachments.len(), content.records.len()), ("", 1, 1));
 
         // An automation names its task; a legacy one loses its trigger line. A guest's message
         // shows the guest's own words and name. Neither groups with the user's own.

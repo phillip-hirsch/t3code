@@ -19,7 +19,7 @@ pub const PAGE_SIZE: u32 = 99;
 pub const MAX_PAGE_SIZE: u32 = 500;
 const MATCHED_ELSEWHERE_SCORE: u32 = 10;
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Actor {
     pub login: String,
@@ -110,14 +110,15 @@ pub struct Entry {
 }
 
 impl Entry {
-    /// `pullRequestEntryKey`: unique across hosts and repositories.
+    /// `pullRequestEntryKey`: unique across environments, hosts and repositories.
     pub fn key(&self) -> String {
-        format!("{}:{}#{}", self.host, self.repository, self.number)
+        let scope = if self.environment_id.is_empty() { String::new() } else { format!("{}:", self.environment_id) };
+        format!("{scope}{}:{}#{}", self.host, self.repository, self.number)
     }
 
     /// `pullRequestDiffStatKey`, which `pullRequests.listStats` answers by.
     pub fn stat_key(&self) -> String {
-        stat_key(&self.project_id, &self.repository, self.number)
+        stat_key(&self.environment_id, &self.project_id, self.number)
     }
 
     pub fn reference(&self) -> Value {
@@ -125,8 +126,9 @@ impl Entry {
     }
 }
 
-pub fn stat_key(project_id: &str, repository: &str, number: u64) -> String {
-    format!("{project_id}\u{0}{}#{number}", repository.to_lowercase())
+/// `pullRequestDiffStatKey`: a project id names a project only within its environment.
+pub fn stat_key(environment_id: &str, project_id: &str, number: u64) -> String {
+    format!("{environment_id} {project_id} {number}")
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -136,6 +138,9 @@ pub struct ProviderSummary {
     pub kind: String,
     #[serde(default)]
     pub searches_on_host: bool,
+    /// The actions the host can run on its change requests; absent from older servers.
+    #[serde(default)]
+    pub actions: Option<Vec<String>>,
     #[serde(default)]
     pub configured: bool,
     #[serde(default)]
@@ -412,8 +417,18 @@ fn normalize(value: &str) -> Option<String> {
     (!trimmed.is_empty()).then_some(trimmed)
 }
 
+/// `pullRequestViewerKey`: one host can be signed in as different people on different machines.
+fn viewer_key(environment_id: &str, host: &str) -> String {
+    format!("{environment_id} {host}")
+}
+
+/// `pullRequestEntryViewer`: the row's machine's viewer, else an unmerged answer's by host.
 pub fn viewer_for<'a>(entry: &Entry, viewers: &'a HashMap<String, String>) -> Option<&'a str> {
-    viewers.get(&entry.host).map(String::as_str).filter(|viewer| !viewer.trim().is_empty())
+    viewers
+        .get(&viewer_key(&entry.environment_id, &entry.host))
+        .or_else(|| viewers.get(&entry.host))
+        .map(String::as_str)
+        .filter(|viewer| !viewer.trim().is_empty())
 }
 
 fn authored_by_viewer(entry: &Entry, viewers: &HashMap<String, String>) -> bool {
@@ -945,7 +960,7 @@ pub fn merge_lists(answers: Vec<(String, ListResult)>) -> ListResult {
     let mut merged = ListResult::default();
     for (environment_id, answer) in answers {
         for (host, login) in answer.viewers {
-            merged.viewers.entry(host).or_insert(login);
+            merged.viewers.insert(viewer_key(&environment_id, &host), login);
         }
         for provider in answer.providers {
             match merged.providers.iter_mut().find(|held| held.host == provider.host) {
@@ -972,6 +987,23 @@ pub fn merge_lists(answers: Vec<(String, ListResult)>) -> ListResult {
     }
     merged.entries.sort_by(|l, r| by_recency(l, r));
     merged
+}
+
+/// One machine's part of a merged list, as it last answered: a machine whose read fails keeps
+/// showing it, as the web's per-environment query keeps its previous success.
+pub fn held_answer(held: &ListResult, environment_id: &str) -> ListResult {
+    let prefix = format!("{environment_id} ");
+    let next_cursors = held.next_cursors.get(environment_id).and_then(Value::as_object).cloned().unwrap_or_default();
+    ListResult {
+        viewers: (held.viewers.iter())
+            .filter_map(|(key, login)| Some((key.strip_prefix(&prefix)?.to_owned(), login.clone())))
+            .collect(),
+        providers: held.providers.clone(),
+        entries: held.entries.iter().filter(|e| e.environment_id == environment_id).cloned().collect(),
+        errors: Vec::new(),
+        truncated: !next_cursors.is_empty(),
+        next_cursors,
+    }
 }
 
 /// The error text the web shows for a failed read (`formatEnvironmentQueryError`, which reads
@@ -1005,6 +1037,7 @@ pub fn open_on_host_label(provider: &str) -> &'static str {
         "gitlab" => "Open on GitLab",
         "bitbucket" => "Open on Bitbucket",
         "azure-devops" => "Open on Azure DevOps",
+        "cursor-origin" => "Open on Cursor Origin",
         _ => "Open on host",
     }
 }
@@ -1015,6 +1048,7 @@ pub fn provider_name(kind: &str) -> &'static str {
         "gitlab" => "GitLab",
         "bitbucket" => "Bitbucket",
         "azure-devops" => "Azure DevOps",
+        "cursor-origin" => "Cursor Origin",
         _ => "Source control",
     }
 }
@@ -1029,6 +1063,76 @@ pub fn resync_follows<K: Eq + std::hash::Hash, S, T>(
 ) -> Vec<usize> {
     follows.retain(|id, (socket, _)| connected.iter().any(|(c, s)| c == id && same_socket(s, socket)));
     (0..connected.len()).filter(|&i| !follows.contains_key(&connected[i].0)).collect()
+}
+
+/// `pullRequestHostActions`: what the row's host reported it can do, else what its kind can do
+/// when a server does not say (`changeRequestActionsWhenUnreported`).
+pub fn host_actions<'a>(providers: &'a [ProviderSummary], entry: &Entry) -> Vec<&'a str> {
+    let reported =
+        providers.iter().find(|p| p.host.eq_ignore_ascii_case(&entry.host)).and_then(|p| p.actions.as_deref());
+    match reported {
+        Some(actions) => actions.iter().map(String::as_str).collect(),
+        None if entry.provider == "github" => vec!["close", "merge", "ready", "reopen"],
+        None => Vec::new(),
+    }
+}
+
+/// The quick actions among a host kind's `changeRequestActions`, for a change request known only
+/// by its URL (`sourceControlClients.findByChangeRequestUrl`); an unknown host offers none.
+pub fn kind_actions(provider: &str) -> &'static [&'static str] {
+    match provider {
+        "github" | "gitlab" | "azure-devops" | "gitcafe" => &["merge", "ready", "close", "reopen"],
+        "forgejo" => &["merge", "close", "reopen"],
+        "bitbucket" => &["merge", "close"],
+        _ => &[],
+    }
+}
+
+/// `pullRequestQuickActions`: the Shift quick actions a row in this state offers.
+pub fn quick_actions(entry: &Entry, host_actions: &[&str]) -> Vec<&'static str> {
+    let for_state: &[&'static str] = match (entry.state, entry.is_draft) {
+        (State::Merged | State::Unknown, _) => &[],
+        (State::Closed, _) => &["reopen"],
+        (State::Open, true) => &["close", "ready"],
+        (State::Open, false) => &["close", "merge"],
+    };
+    for_state.iter().copied().filter(|action| host_actions.contains(action)).collect()
+}
+
+/// `resolveSidebarSweepKeys`: the rows from the sweep's origin to its target, in list order,
+/// that the sweep may act on.
+pub fn sweep_keys(ordered: &[String], origin: &str, target: &str, can_apply: impl Fn(&str) -> bool) -> Vec<String> {
+    let (Some(from), Some(to)) =
+        (ordered.iter().position(|key| key == origin), ordered.iter().position(|key| key == target))
+    else {
+        return Vec::new();
+    };
+    ordered[from.min(to)..=from.max(to)].iter().filter(|key| can_apply(key)).cloned().collect()
+}
+
+/// The row a sweep points at (`onMove`): of the rows in list order with their tops, the last one
+/// starting at or above `y`, else the first.
+pub fn row_at<K>(rows: impl IntoIterator<Item = (K, f32)>, y: f32) -> Option<K> {
+    let mut found = None;
+    for (key, top) in rows {
+        if found.is_some() && top > y {
+            break;
+        }
+        found = Some(key);
+    }
+    found
+}
+
+/// `usePullRequestCloseBatch`'s toast: whether any close failed, its title, and up to three
+/// failures (`#number: reason`) as its description.
+pub fn close_batch_toast(total: usize, failures: &[String]) -> (bool, String, Option<String>) {
+    let closed = total - failures.len();
+    if failures.is_empty() {
+        let plural = if closed == 1 { "" } else { "s" };
+        return (false, format!("Closed {closed} pull request{plural}"), None);
+    }
+    let description = failures.iter().take(3).map(String::as_str).collect::<Vec<_>>().join("\n");
+    (true, format!("Closed {closed} of {total} pull requests"), Some(description))
 }
 
 #[cfg(test)]
@@ -1080,6 +1184,104 @@ mod tests {
         assert_eq!(merged.entries.iter().map(|e| e.environment_id.as_str()).collect::<Vec<_>>(), ["b", "a"]);
         assert_eq!(merged.next_cursors, *json!({"a": {"github.com": "c1"}}).as_object().unwrap());
         assert_eq!(merged.providers.len(), 1);
+    }
+
+    #[test]
+    fn each_machine_keeps_its_own_viewer_for_a_shared_host() {
+        let answer = |environment: &str, login: &str| {
+            let row = entry(1, json!({"author": {"login": "bob"}}));
+            let viewers = HashMap::from([("github.com".to_owned(), login.to_owned())]);
+            (environment.to_owned(), ListResult { entries: vec![row], viewers, ..Default::default() })
+        };
+        let merged = merge_lists(vec![answer("a", "alice"), answer("b", "bob")]);
+        let on = |environment: &str| merged.entries.iter().find(|e| e.environment_id == environment).unwrap();
+        assert_eq!(viewer_for(on("a"), &merged.viewers), Some("alice"));
+        assert_eq!(viewer_for(on("b"), &merged.viewers), Some("bob"));
+        let groups = group_by_involvement(merged.entries.clone(), &merged.viewers);
+        let authored: Vec<&str> = groups[0].entries.iter().map(|e| e.environment_id.as_str()).collect();
+        assert_eq!((groups[0].key, authored), ("authored", vec!["b"]));
+        // An unmerged answer still names its viewers by bare host.
+        let single = HashMap::from([("github.com".to_owned(), "carol".to_owned())]);
+        assert_eq!(viewer_for(on("a"), &single), Some("carol"));
+    }
+
+    #[test]
+    fn a_failed_machine_keeps_its_last_answer_beside_fresh_ones() {
+        let answer = |environment: &str, number: u64, cursors: Value| {
+            let viewers = HashMap::from([("github.com".to_owned(), format!("{environment}-login"))]);
+            let next_cursors = cursors.as_object().cloned().unwrap_or_default();
+            let entries = vec![entry(number, json!({}))];
+            (environment.to_owned(), ListResult { viewers, entries, next_cursors, ..Default::default() })
+        };
+        let held = merge_lists(vec![answer("a", 1, json!({})), answer("b", 2, json!({"github.com": "c2"}))]);
+        let merged = merge_lists(vec![answer("a", 3, json!({})), ("b".into(), held_answer(&held, "b"))]);
+        let rows: Vec<(&str, u64)> = merged.entries.iter().map(|e| (e.environment_id.as_str(), e.number)).collect();
+        assert_eq!(rows, [("a", 3), ("b", 2)], "a's fresh rows replace its old ones; b keeps its own");
+        assert_eq!(merged.next_cursors, *json!({"b": {"github.com": "c2"}}).as_object().unwrap());
+        assert!(merged.truncated, "b can still continue");
+        let on_b = merged.entries.iter().find(|e| e.environment_id == "b").unwrap();
+        assert_eq!(viewer_for(on_b, &merged.viewers), Some("b-login"));
+    }
+
+    #[test]
+    fn one_pull_request_listed_by_two_machines_stays_two_rows() {
+        let answer = |environment: &str| {
+            (environment.to_owned(), ListResult { entries: vec![entry(1, json!({}))], ..Default::default() })
+        };
+        let merged = merge_lists(vec![answer("a"), answer("b")]);
+        let keys: HashSet<String> = merged.entries.iter().map(|e| e.key()).collect();
+        let stat_keys: HashSet<String> = merged.entries.iter().map(|e| e.stat_key()).collect();
+        assert_eq!((keys.len(), stat_keys.len()), (2, 2), "the same project id names a project per machine");
+    }
+
+    #[test]
+    fn quick_actions_follow_the_state_and_what_the_host_can_do() {
+        let reported = |host: &str, actions: Option<&[&str]>| ProviderSummary {
+            host: host.into(),
+            actions: actions.map(|a| a.iter().map(|s| (*s).to_owned()).collect()),
+            ..Default::default()
+        };
+        let open = entry(1, json!({}));
+        let quick =
+            |entry: &Entry, providers: &[ProviderSummary]| quick_actions(entry, &host_actions(providers, entry));
+        assert_eq!(quick(&open, &[]), ["close", "merge"], "GitHub's actions when the server does not say");
+        assert_eq!(quick(&open, &[reported("GitHub.com", Some(&["close"]))]), ["close"], "what the host reported");
+        assert!(quick(&open, &[reported("github.com", Some(&[]))]).is_empty());
+        assert_eq!(quick(&entry(2, json!({"isDraft": true})), &[]), ["close", "ready"]);
+        assert_eq!(quick(&entry(3, json!({"state": "closed"})), &[]), ["reopen"]);
+        assert!(quick(&entry(4, json!({"state": "merged"})), &[]).is_empty());
+        assert!(quick(&entry(5, json!({"provider": "gitlab", "host": "gitlab.com"})), &[]).is_empty(), "unreported");
+    }
+
+    #[test]
+    fn a_close_sweep_takes_the_closable_rows_between_its_ends() {
+        let ordered: Vec<String> = ["a", "b", "c", "d", "e"].map(str::to_owned).to_vec();
+        let closable = |key: &str| key != "c";
+        assert_eq!(sweep_keys(&ordered, "b", "e", closable), ["b", "d", "e"]);
+        assert_eq!(sweep_keys(&ordered, "d", "a", closable), ["a", "b", "d"], "upward sweeps keep list order");
+        assert_eq!(sweep_keys(&ordered, "b", "b", closable), ["b"]);
+        assert!(sweep_keys(&ordered, "gone", "a", closable).is_empty(), "a row the list dropped ends it");
+    }
+
+    #[test]
+    fn a_sweep_points_at_the_row_the_pointer_is_over() {
+        let rows = [("a", 0.), ("b", 50.), ("c", 100.)];
+        assert_eq!(row_at(rows, 75.), Some("b"));
+        assert_eq!(row_at(rows, 100.), Some("c"), "a row's top edge is on it");
+        assert_eq!(row_at(rows, 400.), Some("c"));
+        assert_eq!(row_at(rows, -10.), Some("a"), "above the first row is the first row");
+        assert_eq!(row_at(Vec::<(&str, f32)>::new(), 0.), None);
+    }
+
+    #[test]
+    fn a_close_batch_reports_how_many_closed() {
+        assert_eq!(close_batch_toast(1, &[]), (false, "Closed 1 pull request".to_owned(), None));
+        assert_eq!(close_batch_toast(3, &[]).1, "Closed 3 pull requests");
+        let failures: Vec<String> = (1..=4).map(|n| format!("#{n}: refused")).collect();
+        let (error, title, description) = close_batch_toast(5, &failures);
+        assert!(error);
+        assert_eq!(title, "Closed 1 of 5 pull requests");
+        assert_eq!(description.as_deref(), Some("#1: refused\n#2: refused\n#3: refused"));
     }
 
     #[test]

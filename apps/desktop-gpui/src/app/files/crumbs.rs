@@ -20,8 +20,10 @@ use super::logic::{self, Entry, EntryKind};
 use crate::app::Workspace;
 use crate::theme::Tokens;
 
-/// The open crumb menu: the crumb's folder, the folder it lists now, and the menu showing it.
+/// The open crumb menu: its checkout, the crumb's folder, the folder it lists now, and the menu
+/// showing it.
 pub(super) struct CrumbMenu {
+    root: Checkout,
     crumb: String,
     /// The file the panel showed when it opened; another file's crumbs have their own menus.
     current: String,
@@ -29,6 +31,18 @@ pub(super) struct CrumbMenu {
     /// Set while a row moves the menu to another folder, so the close that follows reopens it.
     moving: bool,
     menu: Option<WeakEntity<PopupMenu>>,
+}
+
+impl CrumbMenu {
+    fn is_for(&self, root: &Checkout, crumb: &str) -> bool {
+        self.root == *root && self.crumb == crumb
+    }
+}
+
+/// Whether `crumb`'s menu shows open for `current` in `root`: a menu opened on another checkout,
+/// or for another file, stays closed here.
+fn shows(state: Option<&CrumbMenu>, root: &Checkout, crumb: &str, current: &str) -> bool {
+    state.is_some_and(|menu| menu.is_for(root, crumb) && menu.current == current)
 }
 
 /// `fileBreadcrumbParent`, offered as "Back" only within the crumb's folder `root`.
@@ -87,7 +101,7 @@ impl FolderMenu {
     /// The folder the menu lists now: where it moved to, else the crumb's own.
     fn directory(&self, cx: &App) -> String {
         match &self.view.read(cx).files.crumb_menu {
-            Some(open) if open.crumb == self.crumb => open.directory.clone(),
+            Some(open) if open.is_for(&self.root, &self.crumb) => open.directory.clone(),
             _ => self.crumb.clone(),
         }
     }
@@ -97,7 +111,7 @@ impl FolderMenu {
     fn navigate(&self, folder: String, window: &mut Window, cx: &mut App) {
         self.load(&folder, window, cx);
         self.view.update(cx, |this, cx| {
-            if let Some(open) = this.files.crumb_menu.as_mut().filter(|open| open.crumb == self.crumb) {
+            if let Some(open) = this.files.crumb_menu.as_mut().filter(|open| open.is_for(&self.root, &self.crumb)) {
                 open.directory = folder;
                 open.moving = true;
             }
@@ -191,12 +205,14 @@ impl FolderMenu {
 
     /// The menu for the folder it lists now, rebuilt when that folder's listing lands or fails.
     fn build(&self, menu: PopupMenu, window: &mut Window, cx: &mut Context<PopupMenu>) -> PopupMenu {
+        super::track_dropdown_menu(&self.view, cx);
         let folder = self.directory(cx);
-        let (handle, view, crumb) = (cx.entity().downgrade(), self.view.clone(), self.crumb.clone());
+        let (handle, view, root, crumb) =
+            (cx.entity().downgrade(), self.view.clone(), self.root.clone(), self.crumb.clone());
         // The builder runs while the window draws, so the handle lands after the frame.
         cx.defer(move |cx| {
             view.update(cx, |this, _| {
-                if let Some(open) = this.files.crumb_menu.as_mut().filter(|open| open.crumb == crumb) {
+                if let Some(open) = this.files.crumb_menu.as_mut().filter(|open| open.is_for(&root, &crumb)) {
                     open.menu = Some(handle);
                 }
             });
@@ -236,7 +252,7 @@ impl Workspace {
         let label = if folder.is_empty() { project_name.as_ref() } else { logic::file_name(folder) };
         let tooltip = format!("Browse {label}");
         let id = gpui_kit::ElementId::Name(format!("crumb-menu:{folder}").into());
-        let open = self.files.crumb_menu.as_ref().is_some_and(|m| m.crumb == folder && m.current == current);
+        let open = shows(self.files.crumb_menu.as_ref(), root, folder, current);
         let open_change = super::menu_open_change(view.clone());
         let (opener, back, builder) = (menu.clone(), menu.clone(), menu);
         let trigger = Button::new(id)
@@ -256,7 +272,8 @@ impl Workspace {
             .open(open)
             .on_open_change(move |open, window, cx| {
                 let stays = view.update(cx, |this, cx| {
-                    let stays = open_changed(&mut this.files.crumb_menu, &opener.crumb, &opener.current, *open);
+                    let stays =
+                        open_changed(&mut this.files.crumb_menu, &opener.root, &opener.crumb, &opener.current, *open);
                     cx.notify();
                     stays
                 });
@@ -276,14 +293,15 @@ impl Workspace {
 
 /// Whether `crumb`'s menu stays open after its popover opened or closed: the close that
 /// follows a move to another folder reopens it there, and opening starts at the crumb's folder.
-fn open_changed(state: &mut Option<CrumbMenu>, crumb: &str, current: &str, open: bool) -> bool {
+fn open_changed(state: &mut Option<CrumbMenu>, root: &Checkout, crumb: &str, current: &str, open: bool) -> bool {
     match state {
-        Some(menu) if !open && menu.crumb == crumb && menu.moving => {
+        Some(menu) if !open && menu.is_for(root, crumb) && menu.moving => {
             menu.moving = false;
             true
         }
         _ if open => {
             *state = Some(CrumbMenu {
+                root: root.clone(),
                 crumb: crumb.to_owned(),
                 current: current.to_owned(),
                 directory: crumb.to_owned(),
@@ -301,22 +319,30 @@ fn open_changed(state: &mut Option<CrumbMenu>, crumb: &str, current: &str, open:
 
 #[cfg(test)]
 mod tests {
-    use super::{back_target, open_changed};
+    use super::{Checkout, back_target, open_changed, shows};
+
+    fn checkout(env: &str) -> Checkout {
+        Checkout { env: env.to_owned().into(), cwd: "/repo".into() }
+    }
 
     #[test]
     fn moving_to_another_folder_keeps_the_menu_open_there() {
+        let (a, b) = (checkout("a"), checkout("b"));
         let mut state = None;
-        assert!(open_changed(&mut state, "src", "src/a.rs", true));
+        assert!(open_changed(&mut state, &a, "src", "src/a.rs", true));
+        assert!(shows(state.as_ref(), &a, "src", "src/a.rs"));
+        // The same file and crumb on another environment's checkout has its own menu.
+        assert!(!shows(state.as_ref(), &b, "src", "src/a.rs"));
         let menu = state.as_mut().expect("opened");
         assert_eq!(menu.directory, "src");
         // A folder row moves the menu, then its click closes it: it reopens on that folder.
         (menu.directory, menu.moving) = ("src/app".into(), true);
-        assert!(open_changed(&mut state, "src", "src/a.rs", false));
+        assert!(open_changed(&mut state, &a, "src", "src/a.rs", false));
         assert_eq!(state.as_ref().map(|m| (m.directory.as_str(), m.moving)), Some(("src/app", false)));
         // Any other close closes it, and the next open starts at the crumb's folder again.
-        assert!(!open_changed(&mut state, "src", "src/a.rs", false));
+        assert!(!open_changed(&mut state, &a, "src", "src/a.rs", false));
         assert!(state.is_none());
-        assert!(open_changed(&mut state, "src", "src/a.rs", true));
+        assert!(open_changed(&mut state, &a, "src", "src/a.rs", true));
         assert_eq!(state.map(|m| m.directory), Some("src".into()));
     }
 

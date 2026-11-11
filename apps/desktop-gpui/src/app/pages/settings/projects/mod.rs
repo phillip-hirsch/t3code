@@ -33,6 +33,7 @@ use crate::app::pages::settings::connections::logic::ORCHESTRATION_OPERATE;
 use crate::app::pages::settings::connections::ui::tooltip;
 use crate::app::pages::settings::widgets::{RowFrame, SettingsView, card, reset_button, settings_section};
 use crate::app::{Workspace, new_id};
+use crate::model::ScopedId;
 use crate::rpc::RpcClient;
 use crate::settings::scope::ScopeKind;
 use crate::theme::{self, Tokens};
@@ -92,9 +93,6 @@ impl Workspace {
         let group = self.scoped_project_group(view);
         let detail = group.as_ref().is_some_and(|scoped| !scoped.group.members.is_empty());
         let content = match (group, &view.scope.kind) {
-            (Some(scoped), _) if scoped.group.members.is_empty() => {
-                vec![self.render_scope_unavailable("This project has no checkout on this environment.", &t, cx)]
-            }
             (Some(scoped), _) => self.render_project_detail(&panel, view, &scoped, window, cx),
             (None, ScopeKind::Unavailable { message }) => vec![self.render_scope_unavailable(message, &t, cx)],
             (None, _) => vec![self.render_project_choices(view, &t, cx)],
@@ -112,11 +110,12 @@ impl Workspace {
         )
     }
 
-    /// The group the scope picked, while it resolves, narrowed to the picked machine.
+    /// The group the scope picked, while it resolves, narrowed to the picked machine or checkout.
     fn scoped_project_group(&self, view: &SettingsView) -> Option<ScopedGroup> {
-        let key = self.settings_ui.scope.project.as_ref().filter(|_| view.scope.is_project())?;
+        let scope = &self.settings_ui.scope;
+        let key = scope.project.as_ref().filter(|_| view.scope.is_project())?;
         let whole = view.groups.iter().find(|group| &group.key == key)?;
-        Some(groups::narrow(whole, self.settings_ui.scope.machine.as_deref()))
+        Some(groups::narrow(whole, scope.machine.as_deref(), scope.checkout.as_deref()))
     }
 
     /// Whether this connection may change projects on `environment` (`orchestration:operate`).
@@ -147,13 +146,15 @@ impl Workspace {
             .filter(|(last_key, _)| *last_key == key)
             .and_then(|(_, members)| groups::successor(&view.groups, members));
         let Some(successor) = successor else { return false };
-        self.settings_ui.scope = self.settings_ui.scope.with_project(Some(successor.key.clone()));
+        // The machine and checkout picks follow the project to its new group.
+        self.settings_ui.scope.project = Some(successor.key.clone());
         true
     }
 
     /// The scope's message, with a way back to every environment (`ProjectsSettings`).
     fn render_scope_unavailable(&mut self, message: &str, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
-        let show_all = self.settings_ui.scope.machine.is_some().then(|| {
+        let scope = &self.settings_ui.scope;
+        let show_all = (scope.machine.is_some() || scope.checkout.is_some()).then(|| {
             Button::new("settings-scope-show-all")
                 .outline()
                 .xsmall()
@@ -290,14 +291,13 @@ impl Workspace {
 
     /// Each checkout with its own environment's socket (none while that one is disconnected)
     /// and that environment's name: a group can span machines.
-    fn member_targets(&self, members: Vec<(String, String)>) -> Vec<(String, String, Option<RpcClient>, String)> {
+    fn member_targets(&self, members: Vec<(ScopedId, String)>) -> Vec<(ScopedId, String, Option<RpcClient>, String)> {
         members
             .into_iter()
-            .map(|(id, title)| {
-                let environment = self.project_environment(&id);
-                let label = environment.as_deref().and_then(|e| self.env_info(e)?.environment_label.clone());
-                let client = environment.and_then(|e| self.env_client(&e));
-                (id, title, client, label.unwrap_or_else(|| "the current environment".into()))
+            .map(|(project, title)| {
+                let label = self.env_info(&project.env).and_then(|info| info.environment_label.clone());
+                let client = self.env_client(&project.env);
+                (project, title, client, label.unwrap_or_else(|| "the current environment".into()))
             })
             .collect()
     }
@@ -306,7 +306,7 @@ impl Workspace {
     /// environment, and reports the first failure. `done` runs either way.
     fn update_projects(
         &mut self,
-        members: Vec<(String, String)>,
+        members: Vec<(ScopedId, String)>,
         update: Value,
         failure_title: &'static str,
         window: &mut Window,
@@ -317,13 +317,13 @@ impl Workspace {
         let targets = self.member_targets(members);
         cx.spawn_in(window, async move |this, cx| {
             let mut failure = None;
-            for (id, _, client, environment) in &targets {
+            for (project, _, client, environment) in &targets {
                 let Some(client) = client else {
                     let error = format!("Connect {environment} and try again.");
                     failure = Some((environment.clone(), error));
                     break;
                 };
-                let mut command = json!({"type": "project.update", "commandId": new_id(), "projectId": id});
+                let mut command = json!({"type": "project.update", "commandId": new_id(), "projectId": project.id});
                 if let (Some(command), Value::Object(fields)) = (command.as_object_mut(), update.clone()) {
                     command.extend(fields);
                 }
@@ -348,7 +348,7 @@ impl Workspace {
     fn set_project_icon(
         &mut self,
         panel: &Entity<ProjectsPanel>,
-        members: Vec<(String, String)>,
+        members: Vec<(ScopedId, String)>,
         update: Value,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -372,7 +372,7 @@ impl Workspace {
     fn organize_project(
         &mut self,
         panel: &Entity<ProjectsPanel>,
-        members: Vec<(String, String)>,
+        members: Vec<(ScopedId, String)>,
         update: Value,
         failure_title: &'static str,
         window: &mut Window,
@@ -425,6 +425,12 @@ impl Workspace {
             &group.display_name,
             environment_label.as_deref(),
             &self.shell.threads,
+            refs.iter()
+                .map(|m| {
+                    let project = std::slice::from_ref(&m.project.id);
+                    self.shell.unloaded_older_settled(&m.project.environment_id, Some(project))
+                })
+                .sum(),
         );
         let clear_selection = whole_group && !scoped.has_other_members;
         let (title, description) = message.split_once('\n').unwrap_or((&message, ""));
@@ -450,18 +456,18 @@ impl Workspace {
 
     fn delete_projects(
         &mut self,
-        members: Vec<(String, String)>,
+        members: Vec<(ScopedId, String)>,
         clear_selection: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let targets = self.member_targets(members);
         cx.spawn_in(window, async move |this, cx| {
-            for (id, title, client, environment) in &targets {
+            for (project, title, client, environment) in &targets {
                 let result = match client {
                     Some(client) => {
                         let command =
-                            json!({"type": "project.delete", "commandId": new_id(), "projectId": id, "force": true});
+                            json!({"type": "project.delete", "commandId": new_id(), "projectId": project.id, "force": true});
                         client.request("projects.mutate", command).await.map_err(|error| error.message())
                     }
                     None => Err(format!("Connect {environment} and try again.")),
@@ -471,13 +477,7 @@ impl Workspace {
                         toast_error(window, cx, format!("Failed to remove \"{title}\""), error);
                         return true;
                     }
-                    // The project's draft goes with it.
-                    if let Some(draft) = this.draft_target(id) {
-                        this.composer_drafts.remove(&draft);
-                        if this.target.as_ref() == Some(&draft) {
-                            this.target = None;
-                        }
-                    }
+                    this.forget_scoped_project_drafts(project, cx);
                     false
                 });
                 if failed.unwrap_or(true) {
@@ -518,17 +518,17 @@ impl Workspace {
             return None;
         }
         let resource = icon::favicon_resource(&member.project.workspace_root, member.project.favicon_path.as_deref());
-        let id = &member.project.id;
-        let (client, endpoint) = (self.project_client(id), self.project_endpoint(id).cloned());
+        let env = &member.project.environment_id;
+        let (client, endpoint) = (self.env_client(env), self.env_endpoint(env).cloned());
         images.update(cx, |images, cx| images.get(resource, client, endpoint, cx))
     }
 
     /// The file picker's "Open in Explorer" needs each checkout's server on this machine.
     fn can_pick_external_favicon(&self, members: &[Member]) -> bool {
         let local = |member: &Member| {
-            let id = &member.project.id;
-            (!self.environment_remote && self.project_environment(id).as_ref() == self.primary_environment())
-                || self.project_endpoint(id).is_some_and(|endpoint| {
+            let env = &member.project.environment_id;
+            (!self.environment_remote && Some(env) == self.primary_environment())
+                || self.env_endpoint(env).is_some_and(|endpoint| {
                     let host = endpoint.http_base.split("://").nth(1).unwrap_or_default();
                     ["127.0.0.1", "localhost", "[::1]"].iter().any(|local| host.starts_with(local))
                 })
@@ -616,26 +616,28 @@ impl Workspace {
             let open_files = {
                 let (ids, panel, images) = (ids, panel.clone(), images.clone());
                 let cwd = representative.project.workspace_root.clone();
-                let representative_id = representative.project.id.clone();
+                let representative_env = representative.project.environment_id.clone();
                 let project_name: SharedString = group.display_name.clone().into();
                 let pick_external = self.can_pick_external_favicon(&group.members);
-                cx.listener(move |this, _, window, cx| {
+                cx.listener(move |_, _, window, cx| {
                     let workspace = cx.weak_entity();
                     let (ids, panel) = (ids.clone(), panel.clone());
-                    let on_pick: favicon_picker::OnPick = Rc::new(move |path, window, cx| {
-                        let update = json!({"faviconPath": path, "projectIcon": null});
-                        let _ = workspace
-                            .update(cx, |this, cx| this.set_project_icon(&panel, ids.clone(), update, window, cx));
+                    let on_pick: favicon_picker::OnPick = Rc::new({
+                        let workspace = workspace.clone();
+                        move |path, window, cx| {
+                            let update = json!({"faviconPath": path, "projectIcon": null});
+                            let _ = workspace
+                                .update(cx, |this, cx| this.set_project_icon(&panel, ids.clone(), update, window, cx));
+                        }
                     });
-                    let client = this.project_client(&representative_id);
-                    let endpoint = this.project_endpoint(&representative_id).cloned();
                     let (cwd, project_name, images) = (cwd.clone(), project_name.clone(), images.clone());
+                    let environment = representative_env.clone();
                     let picker = cx.new(|cx| {
                         favicon_picker::FaviconPicker::new(
                             cwd,
                             project_name,
-                            client,
-                            endpoint,
+                            workspace,
+                            environment,
                             images,
                             pick_external,
                             on_pick,
@@ -766,12 +768,12 @@ impl Workspace {
             .child(Icon::new(IconName::Info).size(px(16.)).text_color(tokens.info))
             .child("Can't find a setting? Keep this project picked above and hop to any other settings page.");
 
-        let project_id = group.representative().id.clone();
+        let project = ScopedId::of_project(group.representative());
         vec![
             alert.into_any_element(),
             card(overview, &tokens),
             self.new_threads_section(view, false, window, cx),
-            self.render_project_actions(&project_id, window, cx),
+            self.render_project_actions(&project, window, cx),
             checkouts,
             danger,
         ]
@@ -908,7 +910,7 @@ impl Workspace {
     }
 }
 
-/// (project id, title) for each checkout, as the update and delete loops need them.
-fn member_ids(members: &[Member]) -> Vec<(String, String)> {
-    members.iter().map(|m| (m.project.id.clone(), m.project.title.clone())).collect()
+/// (project on its environment, title) for each checkout, as the update and delete loops need them.
+fn member_ids(members: &[Member]) -> Vec<(ScopedId, String)> {
+    members.iter().map(|m| (ScopedId::of_project(&m.project), m.project.title.clone())).collect()
 }

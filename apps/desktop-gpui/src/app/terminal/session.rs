@@ -1,24 +1,17 @@
-//! One terminal pane: an `alacritty_terminal` emulator fed by the server's
+//! One terminal pane: a libghostty-vt emulator ([`Core`]) fed by the server's
 //! `terminal.attach` stream, plus keyboard, mouse selection, scrollback and
 //! clipboard. Output only re-renders this view.
 
-use std::cell::{Cell, RefCell};
-use std::ops::{Deref, DerefMut, Range};
+use std::cell::Cell;
+use std::ops::Range;
 use std::rc::Rc;
 use std::time::Duration;
 
-use alacritty_terminal::Term;
-use alacritty_terminal::event::{Event, EventListener, WindowSize};
-use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::Side;
-use alacritty_terminal::selection::{Selection, SelectionType};
-use alacritty_terminal::term::{Config, TermMode};
-use alacritty_terminal::vte::ansi::{CursorShape, CursorStyle, Processor};
 use gpui_kit::{
     AppContext as _, Bounds, ClipboardItem, Context, EntityInputHandler, EventEmitter, FocusHandle,
-    InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ParentElement as _, Pixels, Render, Styled as _, Subscription, Task, UTF16Selection, Window, canvas, div, fill,
-    point, px, size,
+    InteractiveElement as _, IntoElement, KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, NativeKey, ParentElement as _, Pixels, Render, Styled as _, Subscription, Task, UTF16Selection,
+    Window, canvas, div, fill, point, px, size,
 };
 use serde_json::{Value, json};
 
@@ -28,32 +21,21 @@ mod pointer;
 use gpui_kit::component::input;
 use gpui_kit::component::menu::ContextMenuExt as _;
 
-use super::grid::{Batched, Geometry, TerminalGrid, TerminalTheme, batch};
-use super::keys::{KeyAction, key_action};
-use super::scrollbar::{self, ScrollState};
+use super::core::{Core, KeyInput, Locks};
+use super::grid::{Batched, CursorCell, Frame, Geometry, TerminalGrid, TerminalTheme, batch};
+use super::keys::{self, KeyAction, key_action};
+use super::model::{ScreenLink, ViewportPoint};
+use super::scrollbar;
 use crate::rpc::{RpcClient, RpcError, StreamEvent};
 
 /// `TerminalWriteInput.data` is capped at 65,536 UTF-16 units.
 const MAX_WRITE_UNITS: usize = 65_536;
 /// Drawer drags resize every frame; the PTY hears the size once it settles.
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(50);
-/// `CURSOR_BLINK_INTERVAL_MS`: a focused cursor blinks unless the app or reduced motion stops it.
+/// `CURSOR_BLINK_INTERVAL_MS`: a focused cursor blinks unless the program or reduced motion stops it.
 const CURSOR_BLINK: Duration = Duration::from_millis(500);
-
-/// Ghostty's defaults as the web sets them: the cursor blinks from the start and after a
-/// `DECSCUSR` reset.
-fn term_config() -> Config {
-    Config { default_cursor_style: CursorStyle { shape: CursorShape::Block, blinking: true }, ..Config::default() }
-}
-
-#[derive(Clone, Default)]
-pub(super) struct Listener(Rc<RefCell<Vec<Event>>>);
-
-impl EventListener for Listener {
-    fn send_event(&self, event: Event) {
-        self.0.borrow_mut().push(event);
-    }
-}
+/// `SYNCHRONIZED_OUTPUT_RENDER_TIMEOUT_MS`: a synchronized frame that never ends is shown anyway.
+const SYNCHRONIZED_OUTPUT_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct GridSize {
@@ -76,36 +58,27 @@ impl GridSize {
     }
 }
 
-impl Dimensions for GridSize {
-    fn total_lines(&self) -> usize {
-        self.rows
-    }
-    fn screen_lines(&self) -> usize {
-        self.rows
-    }
-    fn columns(&self) -> usize {
-        self.columns
-    }
-}
-
 /// Where the shell starts (`terminal.open` / `terminal.attach` launch fields).
-#[derive(Clone, Debug, PartialEq)]
-pub(super) struct Launch {
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(in crate::app) struct Launch {
     pub cwd: String,
     pub worktree_path: Option<String>,
-    pub project_root: String,
+    /// A project's root, passed to the shell as `projectScriptRuntimeEnv`; `None` sends no env.
+    pub project_root: Option<String>,
     /// Set by project script runs: the server closes the terminal when the thread settles.
     pub stop_on_settle: Option<bool>,
+    /// The provider whose environment the shell starts in (agent setup terminals).
+    pub provider_instance_id: Option<String>,
 }
 
 impl Launch {
     /// `projectScriptRuntimeEnv`.
-    fn env(&self) -> Value {
-        let mut env = json!({"T3CODE_PROJECT_ROOT": self.project_root});
+    fn env(&self) -> Option<Value> {
+        let mut env = json!({"T3CODE_PROJECT_ROOT": self.project_root.as_ref()?});
         if let Some(path) = &self.worktree_path {
             env["T3CODE_WORKTREE_PATH"] = path.clone().into();
         }
-        env
+        Some(env)
     }
 
     /// The output stream a pane subscribes to: `terminal.attach` (which starts the shell when
@@ -128,18 +101,24 @@ impl Launch {
     }
 
     pub fn payload(&self, thread_id: &str, terminal_id: &str) -> Value {
-        let mut input = json!({"threadId": thread_id, "terminalId": terminal_id, "cwd": self.cwd, "env": self.env()});
+        let mut input = json!({"threadId": thread_id, "terminalId": terminal_id, "cwd": self.cwd});
+        if let Some(env) = self.env() {
+            input["env"] = env;
+        }
         if let Some(path) = &self.worktree_path {
             input["worktreePath"] = path.clone().into();
         }
         if let Some(stop) = self.stop_on_settle {
             input["stopOnSettle"] = stop.into();
         }
+        if let Some(id) = &self.provider_instance_id {
+            input["providerInstanceId"] = id.clone().into();
+        }
         input
     }
 }
 
-pub(super) enum SessionEvent {
+pub(in crate::app) enum SessionEvent {
     /// The process exited or the server closed the terminal.
     Exited,
     /// Pressed: the drawer makes this pane active.
@@ -150,74 +129,70 @@ pub(super) enum SessionEvent {
     OpenUrl { url: String, force_browser: bool },
     /// A clicked path that exists, resolved and with its `:line:column`.
     OpenPath(String),
+    /// A [`TerminalSession::sink`]'s typed input and query replies.
+    Input(String),
+    /// A [`TerminalSession::sink`]'s grid once it fits its pane, and after each resize.
+    Resize { columns: usize, rows: usize },
 }
 
 /// A selection for the composer (`TerminalContextSelection` without the label).
 #[derive(Clone, Debug, PartialEq)]
-pub(super) struct Selected {
+pub(in crate::app) struct Selected {
     pub line_start: usize,
     pub line_end: usize,
     pub text: String,
 }
 
-/// The emulator and a count of its mutable borrows, so the grid rebatches only after a change.
-pub(super) struct Emulator {
-    term: Term<Listener>,
-    revision: u64,
+/// Where a session's input and grid size go.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Wire {
+    /// `terminal.write` and `terminal.resize` on the session's PTY.
+    Pty,
+    /// [`SessionEvent::Input`] and [`SessionEvent::Resize`], for a terminal the server runs
+    /// elsewhere (a provider sign-in); Tab moves focus instead of reaching the program.
+    Events,
 }
 
-impl Emulator {
-    fn new(size: GridSize, events: &Listener) -> Self {
-        Self { term: Term::new(term_config(), &size, events.clone()), revision: 0 }
-    }
-}
-
-impl Deref for Emulator {
-    type Target = Term<Listener>;
-
-    fn deref(&self) -> &Term<Listener> {
-        &self.term
-    }
-}
-
-impl DerefMut for Emulator {
-    fn deref_mut(&mut self) -> &mut Term<Listener> {
-        self.revision += 1;
-        &mut self.term
-    }
-}
-
-pub(super) struct TerminalSession {
+pub(in crate::app) struct TerminalSession {
     pub thread_id: String,
     pub terminal_id: String,
     launch: Launch,
-    term: Emulator,
-    /// The last batch, with the emulator revision and theme it was built from.
+    core: Core,
+    /// The theme Ghostty last resolved colors with.
+    theme: TerminalTheme,
+    /// The last batch, with the snapshot revision and theme it was built from.
     batched: Option<(u64, TerminalTheme, Rc<Batched>)>,
-    parser: Processor,
-    events: Listener,
+    /// The cursor as last drawn, where the IME opens.
+    cursor: Option<ViewportPoint>,
     pub focus: FocusHandle,
     /// Written by the grid element each prepaint, read by mouse and IME handlers.
-    pub geometry: Cell<Geometry>,
+    pub(super) geometry: Cell<Geometry>,
     /// The grid that fits the pane; the PTY hears this one.
     size: Option<GridSize>,
     /// The PTY's grid as the server last reported it.
     shared_size: Option<GridSize>,
     sent_size: Option<GridSize>,
+    /// The cell size the grid was last laid out with, for Ghostty's pixel size reports.
+    cell: (Pixels, Pixels),
     running: bool,
     /// Without `terminal:operate` nothing is written to the PTY, and it is never resized.
     read_only: bool,
     exited: bool,
     /// The attach stream replied once; later attaches resume instead of opening a shell.
     attached: bool,
+    wire: Wire,
+    /// Selections can go to the composer (Add to chat); off outside a thread.
+    chat: bool,
     client: Option<RpcClient>,
     outbox: String,
     writing: bool,
-    selecting: bool,
+    keyboard: keys::Keyboard,
     scroll_remainder: f32,
     pointer: pointer::PointerState,
     _attach: Option<Task<()>>,
     _resize: Option<Task<()>>,
+    /// Shows a program's unfinished synchronized frame after a timeout.
+    _synchronized: Option<Task<()>>,
     scrollbar: Scrollbar,
     focused: bool,
     /// Lit, or in the dark half of a blink.
@@ -255,12 +230,18 @@ fn take_chunk(outbox: &mut String) -> Option<String> {
     Some(std::mem::replace(outbox, rest))
 }
 
-/// What a paste sends: bracketed when the app asked for it, else with `\r` line ends.
-fn paste_input(text: &str, bracketed: bool) -> String {
-    if bracketed {
-        format!("\x1b[200~{}\x1b[201~", text.replace('\x1b', ""))
-    } else {
-        text.replace("\r\n", "\r").replace('\n', "\r")
+/// `MAX_COMPARED_SELECTION_CELLS`: larger selections are not formatted on every output update.
+const MAX_COMPARED_SELECTION_CELLS: usize = 3_000;
+
+/// `synchronizeTerminalOutput`: output that changes the selected text ends the selection, as
+/// does any output under a selection too large to compare.
+fn write_output(core: &mut Core, data: &[u8]) {
+    let cells = core.selection_cells();
+    let compared = cells <= MAX_COMPARED_SELECTION_CELLS;
+    let before = if cells > 0 && compared { core.selection_text() } else { String::new() };
+    core.write(data);
+    if !compared || (cells > 0 && core.selection_text() != before) {
+        core.clear_selection();
     }
 }
 
@@ -274,7 +255,50 @@ impl TerminalSession {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let events = Listener::default();
+        let mut session = Self::unattached(thread_id, terminal_id, launch, read_only, window, cx);
+        if let Some(client) = client {
+            session.attach(client, cx);
+        }
+        session
+    }
+
+    /// A shell outside any thread's drawer (agent setup): attached, without Add to chat.
+    pub fn standalone(
+        thread_id: String,
+        terminal_id: String,
+        launch: Launch,
+        client: RpcClient,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut session = Self::unattached(thread_id, terminal_id, launch, false, window, cx);
+        session.chat = false;
+        session.attach(client, cx);
+        session
+    }
+
+    /// A surface its owner feeds with [`Self::write`] and [`Self::reset_and_write`]; typed input
+    /// and the grid's size come back as events (`GhosttyTerminalSurface`'s `onData` / `onResize`).
+    pub fn sink(id: String, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let mut session = Self::unattached(String::new(), id, Launch::default(), false, window, cx);
+        session.wire = Wire::Events;
+        session.chat = false;
+        session.running = true;
+        // Tab reaches it and leaves it, like any other control on the page.
+        session.focus = session.focus.clone().tab_stop(true);
+        session
+    }
+
+    fn unattached(
+        thread_id: String,
+        terminal_id: String,
+        launch: Launch,
+        read_only: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let theme = TerminalTheme::new(crate::theme::tokens(cx));
+        let core = Core::new(80, 24, &theme.core()).expect("libghostty-vt allocates a terminal");
         let focus = cx.focus_handle();
         let scrollbar = Scrollbar { focus: cx.focus_handle().tab_stop(true), track: Rc::default(), grab: None };
         let _focus = [
@@ -286,33 +310,38 @@ impl TerminalSession {
             }),
             cx.on_blur(&focus, window, |this, _, cx| {
                 this.focused = false;
+                // A composition the IME never ended must not keep the next keys from the shell.
+                this.keyboard.cancel_composition();
                 this.cursor_on = true;
                 cx.notify();
             }),
             cx.on_focus(&scrollbar.focus, window, |_, _, cx| cx.notify()),
             cx.on_blur(&scrollbar.focus, window, |_, _, cx| cx.notify()),
         ];
-        let mut session = Self {
+        Self {
             thread_id,
             terminal_id,
             launch,
-            term: Emulator::new(GridSize { columns: 80, rows: 24 }, &events),
+            core,
+            theme,
             batched: None,
-            parser: Processor::new(),
-            events,
+            cursor: None,
             focus,
             geometry: Cell::default(),
             size: None,
             shared_size: None,
             sent_size: None,
+            cell: (px(8.), px(16.)),
             running: false,
             read_only,
             exited: false,
             attached: false,
+            wire: Wire::Pty,
+            chat: true,
             client: None,
             outbox: String::new(),
             writing: false,
-            selecting: false,
+            keyboard: keys::Keyboard::default(),
             scroll_remainder: 0.,
             pointer: Default::default(),
             scrollbar,
@@ -322,35 +351,52 @@ impl TerminalSession {
             blinking: false,
             _attach: None,
             _resize: None,
+            _synchronized: None,
             _focus,
+        }
+    }
+
+    /// `surface.write`: more output for a [`Self::sink`]; its queries are answered.
+    pub fn write(&mut self, data: &str, cx: &mut Context<Self>) {
+        self.feed(data, cx);
+        cx.notify();
+    }
+
+    /// `surface.resetAndWrite`: the screen starts over from `data`.
+    pub fn reset_and_write(&mut self, data: &str, cx: &mut Context<Self>) {
+        self.replay(data, cx);
+        cx.notify();
+    }
+
+    /// What the grid draws: the snapshot's runs and spans, rebatched only after Ghostty changed a
+    /// row or the theme changed.
+    pub(super) fn frame(&mut self, theme: &TerminalTheme) -> Frame {
+        if *theme != self.theme {
+            self.theme = *theme;
+            self.core.set_theme(&theme.core());
+        }
+        let anchor_bottom = {
+            let state = self.core.scroll_state();
+            state.total > state.len
         };
-        if let Some(client) = client {
-            session.attach(client, cx);
-        }
-        session
-    }
-
-    pub fn term(&self) -> &Term<Listener> {
-        &self.term
-    }
-
-    /// The visible grid's runs and spans, rebatched only after the terminal or the theme changed.
-    pub fn batched(&mut self, theme: &TerminalTheme) -> Rc<Batched> {
-        if let Some((revision, cached_theme, batched)) = &self.batched
-            && *revision == self.term.revision
-            && cached_theme == theme
-        {
-            return batched.clone();
-        }
-        let term = &*self.term;
-        let batched = Rc::new(batch(term.renderable_content(), term.columns(), term.screen_lines(), theme));
-        self.batched = Some((self.term.revision, *theme, batched.clone()));
-        batched
+        let snapshot = self.core.snapshot();
+        let batched = match &self.batched {
+            Some((revision, cached, batched)) if *revision == snapshot.revision && cached == theme => batched.clone(),
+            _ => {
+                let batched = Rc::new(batch(snapshot, theme));
+                self.batched = Some((snapshot.revision, *theme, batched.clone()));
+                batched
+            }
+        };
+        let cursor = CursorCell::of(snapshot);
+        let (columns, rows) = (snapshot.cols, snapshot.rows.len());
+        self.cursor = cursor.as_ref().map(|cursor| cursor.at);
+        Frame { batched, cursor, columns, rows, anchor_bottom }
     }
 
     /// The link to underline, if the pointer is on one.
-    pub fn hovered_link(&self) -> Option<&pointer::HoveredLink> {
-        self.pointer.hovered.as_ref()
+    pub(super) fn hovered_link(&self) -> Option<&ScreenLink> {
+        self.pointer.hovered.as_ref().map(|hovered| &hovered.link)
     }
 
     /// Subscribes to the terminal's output; called again after a reconnect or a grant change.
@@ -396,8 +442,7 @@ impl TerminalSession {
             Some("snapshot" | "restarted") => {
                 let snapshot = &event["snapshot"];
                 self.shared_size = GridSize::shared(snapshot).or(self.shared_size);
-                self.reset();
-                self.feed(snapshot["history"].as_str().unwrap_or_default(), false, cx);
+                self.replay(snapshot["history"].as_str().unwrap_or_default(), cx);
                 let status = snapshot["status"].as_str().unwrap_or_default();
                 self.running = status == "running";
                 if status == "exited" {
@@ -410,9 +455,9 @@ impl TerminalSession {
                 }
             }
             Some("output") => {
-                self.feed(event["data"].as_str().unwrap_or_default(), true, cx);
+                self.feed(event["data"].as_str().unwrap_or_default(), cx);
             }
-            Some("cleared") => self.reset(),
+            Some("cleared") => self.replay("", cx),
             Some("activity") => {
                 if let Some(shared) = GridSize::shared(event) {
                     self.shared_size = Some(shared);
@@ -435,52 +480,62 @@ impl TerminalSession {
 
     fn apply_grid(&mut self) {
         let size = self.shown_size();
-        if (self.term.columns(), self.term.screen_lines()) != (size.columns, size.rows) {
-            self.term.resize(size);
+        if self.core.size() != (size.columns, size.rows) {
+            let (width, height) = self.cell;
+            self.core.resize(size.columns, size.rows, f32::from(width), f32::from(height));
         }
     }
 
-    fn reset(&mut self) {
-        let size = self.shown_size();
-        *self.term = Term::new(term_config(), &size, self.events.clone());
-        self.parser = Processor::new();
+    /// `resetAndWrite`: retained output from a fresh start. Replayed queries are not answered,
+    /// or the shell would read stale replies as typed input.
+    fn replay(&mut self, history: &str, cx: &mut Context<Self>) {
+        self.apply_grid();
+        self.core.reset_and_write(history.as_bytes());
+        self.pointer.end_drag();
+        self.after_output(cx);
     }
 
-    /// Replayed history and our own notices must not answer the queries in
-    /// them, or the shell would read stale replies as typed input.
-    fn feed(&mut self, data: &str, reply: bool, cx: &mut Context<Self>) {
-        self.parser.advance(&mut *self.term, data.as_bytes());
+    /// Live output, whose queries the terminal answers through the PTY.
+    fn feed(&mut self, data: &str, cx: &mut Context<Self>) {
+        write_output(&mut self.core, data.as_bytes());
+        if let Some(replies) = self.core.take_replies() {
+            self.send_input(&replies, cx);
+        }
+        if let Some(text) = self.core.take_clipboard() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+        self.after_output(cx);
+    }
+
+    fn after_output(&mut self, cx: &mut Context<Self>) {
         self.pointer.forget_hover();
         self.cursor_on = true;
         self.cursor_held = true;
         self.blink(cx);
-        let events = std::mem::take(&mut *self.events.0.borrow_mut());
-        for event in events {
-            match event {
-                Event::PtyWrite(text) if reply => self.send_input(&text, cx),
-                Event::TextAreaSizeRequest(format) if reply => {
-                    let geometry = self.geometry.get();
-                    #[expect(
-                        clippy::cast_possible_truncation,
-                        clippy::cast_sign_loss,
-                        reason = "cell sizes in whole pixels"
-                    )]
-                    let text = format(WindowSize {
-                        num_lines: u16::try_from(self.term.screen_lines()).unwrap_or(u16::MAX),
-                        num_cols: u16::try_from(self.term.columns()).unwrap_or(u16::MAX),
-                        cell_width: f32::from(geometry.cell_width) as u16,
-                        cell_height: f32::from(geometry.line_height) as u16,
-                    });
-                    self.send_input(&text, cx);
-                }
-                Event::ClipboardStore(_, text) => cx.write_to_clipboard(ClipboardItem::new_string(text)),
-                _ => {}
-            }
+        self.hold_synchronized_frame(cx);
+    }
+
+    /// `deferSynchronizedRender`: while a program draws a synchronized frame the last one stays
+    /// up; one that never ends is shown after a timeout.
+    fn hold_synchronized_frame(&mut self, cx: &mut Context<Self>) {
+        if !self.core.synchronized_output() {
+            self._synchronized = None;
+            return;
+        }
+        if self._synchronized.is_none() {
+            self._synchronized = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(SYNCHRONIZED_OUTPUT_TIMEOUT).await;
+                let _ = this.update(cx, |this, cx| {
+                    this._synchronized = None;
+                    this.core.end_synchronized_output();
+                    cx.notify();
+                });
+            }));
         }
     }
 
-    fn blinks(&self) -> bool {
-        self.focused && self.term.cursor_style().blinking && self.term.mode().contains(TermMode::SHOW_CURSOR)
+    fn blinks(&mut self) -> bool {
+        self.focused && self.core.cursor_visible() && self.core.snapshot().cursor_blinking
     }
 
     /// Starts the focused cursor's blink (`scheduleCursorBlink`) unless it already runs.
@@ -513,8 +568,7 @@ impl TerminalSession {
     }
 
     fn system_message(&mut self, message: &str) {
-        self.parser.advance(&mut *self.term, format!("\r\n[terminal] {message}\r\n").as_bytes());
-        self.events.0.borrow_mut().clear();
+        self.core.write_quietly(format!("\r\n[terminal] {message}\r\n").as_bytes());
     }
 
     fn on_exit(&mut self, message: &str, cx: &mut Context<Self>) {
@@ -529,6 +583,10 @@ impl TerminalSession {
     /// Queues `data` for the PTY; writes go out one at a time, in order.
     /// Without a connection the input is dropped: queued keystrokes would run on reconnect.
     fn send_input(&mut self, data: &str, cx: &mut Context<Self>) {
+        if self.wire == Wire::Events {
+            cx.emit(SessionEvent::Input(data.to_owned()));
+            return;
+        }
         let Some(client) = self.client.clone().filter(|_| !self.read_only) else { return };
         self.outbox.push_str(data);
         if self.writing {
@@ -560,18 +618,20 @@ impl TerminalSession {
 
     /// What the user typed or pasted: it follows the prompt, so scroll back down.
     fn input(&mut self, data: &str, cx: &mut Context<Self>) {
-        self.term.scroll_display(Scroll::Bottom);
-        self.term.selection = None;
+        self.core.scroll_to_bottom();
+        self.core.clear_selection();
+        self.pointer.end_drag();
         self.send_input(data, cx);
         cx.notify();
     }
 
     /// The grid that fits the pane, from the grid element's layout.
-    pub fn fit(&mut self, columns: usize, rows: usize, cx: &mut Context<Self>) {
+    pub fn fit(&mut self, columns: usize, rows: usize, cell: (Pixels, Pixels), cx: &mut Context<Self>) {
         let size = GridSize { columns, rows };
-        if self.size == Some(size) {
+        if self.size == Some(size) && self.cell == cell {
             return;
         }
+        self.cell = cell;
         self.size = Some(size);
         self.apply_grid();
         self._resize = Some(cx.spawn(async move |this, cx| {
@@ -591,6 +651,13 @@ impl TerminalSession {
     }
 
     fn send_size(&mut self, cx: &mut Context<Self>) {
+        if self.wire == Wire::Events {
+            if let Some(size) = self.size.filter(|size| self.sent_size != Some(*size)) {
+                self.sent_size = Some(size);
+                cx.emit(SessionEvent::Resize { columns: size.columns, rows: size.rows });
+            }
+            return;
+        }
         let (Some(size), Some(client)) = (self.size, self.client.clone()) else { return };
         if !self.running || self.read_only || self.sent_size == Some(size) {
             return;
@@ -612,57 +679,47 @@ impl TerminalSession {
 
     /// `selectAll`: every line, scrollback included.
     pub fn select_all(&mut self, cx: &mut Context<Self>) {
-        let grid = self.term.grid();
-        let top = alacritty_terminal::index::Point::new(
-            alacritty_terminal::index::Line(-super::line_count(grid.history_size())),
-            alacritty_terminal::index::Column(0),
-        );
-        let bottom = alacritty_terminal::index::Point::new(
-            alacritty_terminal::index::Line(super::line_count(grid.screen_lines()) - 1),
-            grid.last_column(),
-        );
-        let mut selection = Selection::new(SelectionType::Simple, top, Side::Left);
-        selection.update(bottom, Side::Right);
-        self.term.selection = Some(selection);
+        self.pointer.end_drag();
+        self.core.select_all();
         cx.notify();
     }
 
     /// `scrollToBottom`: back to the live screen.
     pub fn scroll_to_bottom(&mut self, cx: &mut Context<Self>) {
-        self.term.scroll_display(Scroll::Bottom);
+        self.core.scroll_to_bottom();
         cx.notify();
     }
 
     /// The selection as chat context: 1-based buffer lines (scrollback counts) and its text
     /// without surrounding blank lines (`readSelectionAction`).
     pub fn selected(&self) -> Option<Selected> {
-        let range = self.term.selection.as_ref()?.to_range(&*self.term)?;
-        let text = self.term.selection_to_string()?;
+        let text = self.core.selection_text();
         let text = text.replace("\r\n", "\n").trim_matches('\n').to_owned();
         if text.is_empty() {
             return None;
         }
-        let history = super::line_count(self.term.grid().history_size());
-        let line_start = usize::try_from(range.start.line.0 + history + 1).unwrap_or(0).max(1);
-        let line_end = usize::try_from(range.end.line.0 + history + 1).unwrap_or(0).max(1).max(line_start);
-        Some(Selected { line_start, line_end, text })
+        let (start, end) = self.core.selection_range()?;
+        let (start, end) = (start.min(end), start.max(end));
+        Some(Selected { line_start: start.y + 1, line_end: end.y + 1, text })
     }
 
+    /// `hasSelection`: Ghostty drops a selection once output replaces its cells.
     fn has_selection(&self) -> bool {
-        self.term.selection.as_ref().is_some_and(|selection| !selection.is_empty())
+        !self.core.selection_text().is_empty()
     }
 
     fn copy(&self, cx: &mut Context<Self>) {
-        if let Some(text) = self.term.selection_to_string().filter(|text| !text.is_empty()) {
+        let text = self.core.selection_text();
+        if !text.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
     }
 
     fn paste(&mut self, cx: &mut Context<Self>) {
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else { return };
-        if !text.is_empty() {
-            let bracketed = self.term.mode().contains(TermMode::BRACKETED_PASTE);
-            self.input(&paste_input(&text, bracketed), cx);
+        let data = self.core.encode_paste(&text);
+        if !data.is_empty() {
+            self.input(&data, cx);
         }
     }
 
@@ -671,21 +728,59 @@ impl TerminalSession {
         if !self.focus.is_focused(window) {
             return;
         }
-        let mode = *self.term.mode();
-        let (app_cursor, alt_screen) = (mode.contains(TermMode::APP_CURSOR), mode.contains(TermMode::ALT_SCREEN));
+        let keystroke = &keys::with_held_shift(&event.keystroke, window.modifiers().shift);
+        // The ContextMenu key opens the terminal's menu: the web's xterm leaves it to the
+        // browser. Shift+F10 is the shell's, as xterm encodes it.
+        if keystroke.key == "menu" && gpui_kit::component::menu::opens_context_menu(keystroke) {
+            return;
+        }
+        let modifiers = &keystroke.modifiers;
+        // `beforeKey: (event) => event.key !== "Tab"`: Tab leaves a sign-in terminal.
+        if self.wire == Wire::Events
+            && keystroke.key == "tab"
+            && !(modifiers.control || modifiers.alt || modifiers.platform)
+        {
+            if modifiers.shift {
+                window.focus_prev(cx);
+            } else {
+                window.focus_next(cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
+        let native = window.native_key();
+        let key = keys::PhysicalKey::of(keystroke, native);
+        self.keyboard.forget_missed_release(&key, event.is_held);
+        if self.keyboard.composing(keystroke, event.prefer_character_input) {
+            return;
+        }
         self.pointer.cancel_selection_menu();
-        match key_action(&event.keystroke, app_cursor, alt_screen, self.has_selection()) {
+        // Formatting the selection is not free; only copy chords need to know it is there.
+        let alt_screen = self.core.alt_screen();
+        let action = match key_action(keystroke, event.is_held, alt_screen, true) {
+            Some(KeyAction::Copy { .. }) if !self.has_selection() => {
+                key_action(keystroke, event.is_held, alt_screen, false)
+            }
+            action => action,
+        };
+        match action {
             None => return,
             Some(KeyAction::SelectAll) => self.select_all(cx),
-            Some(KeyAction::Scroll(scroll)) => {
-                self.term.scroll_display(scroll.scroll());
-                cx.notify();
+            Some(KeyAction::Scroll(history)) => {
+                if let Some(delta) = self.core.scroll_state().key_delta(history.key()) {
+                    self.scroll_rows(delta, cx);
+                }
             }
-            Some(KeyAction::Send(data)) => self.input(&data, cx),
+            Some(KeyAction::Send(data)) => self.input(data, cx),
+            Some(KeyAction::Encode(input)) => {
+                let input = KeyInput { locks: locks(window, native), ..input };
+                let Some(data) = self.keyboard.press(&mut self.core, &key, input) else { return };
+                self.input(&data, cx);
+            }
             Some(KeyAction::Copy { keep_selection }) => {
                 self.copy(cx);
                 if !keep_selection {
-                    self.term.selection = None;
+                    self.core.clear_selection();
                 }
                 cx.notify();
             }
@@ -693,17 +788,28 @@ impl TerminalSession {
         }
         cx.stop_propagation();
     }
+
+    /// Kitty sessions that asked for releases hear them, for the keys whose press they heard.
+    fn key_up(&mut self, event: &KeyUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let keystroke = keys::with_held_shift(&event.keystroke, window.modifiers().shift);
+        let native = window.native_key();
+        let key = keys::PhysicalKey::of(&keystroke, native);
+        let locks = locks(window, native);
+        if let Some(data) = self.keyboard.release(&mut self.core, &keystroke, &key, locks, cfg!(target_os = "macos")) {
+            self.send_input(&data, cx);
+            cx.stop_propagation();
+        }
+    }
 }
 
 impl TerminalSession {
     /// `scrollViewport`: `delta` rows toward the end of the scrollback, clamped.
-    fn scroll_rows(&mut self, delta: i64, cx: &mut Context<Self>) {
-        let delta = ScrollState::of(&self.term).clamp_delta(delta);
+    pub(super) fn scroll_rows(&mut self, delta: i64, cx: &mut Context<Self>) {
+        let delta = self.core.scroll_state().clamp_delta(delta);
         if delta == 0 {
             return;
         }
-        // Alacritty's display offset counts up from the live screen.
-        self.term.scroll_display(Scroll::Delta(i32::try_from(-delta).unwrap_or(i32::MAX)));
+        self.core.scroll(isize::try_from(delta).unwrap_or(0));
         self.pointer.forget_hover();
         cx.notify();
     }
@@ -713,7 +819,7 @@ impl TerminalSession {
         window.prevent_default();
         cx.stop_propagation();
         let track = self.scrollbar.track.get();
-        let Some(thumb) = scrollbar::thumb(ScrollState::of(&self.term), f32::from(track.size.height)) else { return };
+        let Some(thumb) = scrollbar::thumb(self.core.scroll_state(), f32::from(track.size.height)) else { return };
         let at = f32::from(event.position.y - track.top());
         let on_thumb = (thumb.top..thumb.top + thumb.height).contains(&at);
         self.scrollbar.grab = Some(if on_thumb { at - thumb.top } else { thumb.height / 2. });
@@ -723,7 +829,7 @@ impl TerminalSession {
     fn scrollbar_drag(&mut self, y: Pixels, cx: &mut Context<Self>) {
         let Some(grab) = self.scrollbar.grab else { return };
         let track = self.scrollbar.track.get();
-        let state = ScrollState::of(&self.term);
+        let state = self.core.scroll_state();
         let offset =
             scrollbar::offset_at_pointer(state, f32::from(track.size.height), f32::from(y - track.top()), grab);
         let delta = i64::try_from(offset).unwrap_or(i64::MAX) - i64::try_from(state.offset).unwrap_or(i64::MAX);
@@ -737,7 +843,7 @@ impl TerminalSession {
             "tab" if keystroke.modifiers.shift => window.focus_prev(cx),
             "tab" => window.focus_next(cx),
             key => {
-                let Some(delta) = ScrollState::of(&self.term).key_delta(key) else { return };
+                let Some(delta) = self.core.scroll_state().key_delta(key) else { return };
                 self.scroll_rows(delta, cx);
             }
         }
@@ -746,7 +852,7 @@ impl TerminalSession {
 
     /// The thumb over the right edge while there is scrollback (`updateScrollbar`).
     fn render_scrollbar(&self, window: &Window, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
-        let state = ScrollState::of(&self.term);
+        let state = self.core.scroll_state();
         if state.max_offset() == 0 {
             return None;
         }
@@ -807,6 +913,7 @@ impl Render for TerminalSession {
             .track_focus(&self.focus)
             .bg(theme.background)
             .on_key_down(cx.listener(Self::key_down))
+            .on_key_up(cx.listener(Self::key_up))
             // Edit › Copy, Paste and Select All; the keys reach `key_down` instead.
             .on_action(cx.listener(|this, _: &input::Copy, _, cx| this.copy(cx)))
             .on_action(cx.listener(|this, _: &input::Paste, _, cx| this.paste(cx)))
@@ -816,6 +923,11 @@ impl Render for TerminalSession {
             .children(self.render_selection_menu())
             .context_menu(menu)
     }
+}
+
+/// The lock keys the platform reports on (`getModifierState`); macOS reports no Num Lock.
+fn locks(window: &Window, native: NativeKey) -> Locks {
+    Locks { caps: window.capslock().on, num: native.num_lock.unwrap_or(false) }
 }
 
 /// Text and IME commits arrive here; the terminal has no editable text of its own.
@@ -834,26 +946,31 @@ impl EntityInputHandler for TerminalSession {
         Some(UTF16Selection { range: 0..0, reversed: false })
     }
 
+    /// Composing keys go to the IME first while this is set (macOS reads it before each key).
     fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
-        None
+        self.keyboard.preedit()
     }
 
-    fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {}
+    fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
+        self.keyboard.cancel_composition();
+    }
 
     fn replace_text_in_range(&mut self, _: Option<Range<usize>>, text: &str, _: &mut Window, cx: &mut Context<Self>) {
-        if !text.is_empty() {
+        if let Some(text) = self.keyboard.commit(text) {
             self.input(text, cx);
         }
     }
 
+    /// The terminal draws no preedit; it only keeps the composing keys from the encoder.
     fn replace_and_mark_text_in_range(
         &mut self,
         _: Option<Range<usize>>,
-        _: &str,
+        text: &str,
         _: Option<Range<usize>>,
         _: &mut Window,
         _: &mut Context<Self>,
     ) {
+        self.keyboard.set_preedit(text);
     }
 
     /// The cursor cell, so the IME window opens next to the prompt.
@@ -865,13 +982,9 @@ impl EntityInputHandler for TerminalSession {
         _: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         let geometry = self.geometry.get();
-        let grid = self.term.grid();
-        let cursor = grid.cursor.point;
-        let row = usize::try_from(cursor.line.0 + super::line_count(grid.display_offset()))
-            .ok()
-            .filter(|row| *row < geometry.rows)?;
+        let cursor = self.cursor.filter(|cursor| cursor.y < geometry.rows)?;
         let origin =
-            geometry.origin + point(geometry.cell_width * cursor.column.0 as f32, geometry.line_height * row as f32);
+            geometry.origin + point(geometry.cell_width * cursor.x as f32, geometry.line_height * cursor.y as f32);
         Some(Bounds::new(origin, size(geometry.cell_width, geometry.line_height)))
     }
 
@@ -890,14 +1003,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_cursor_blinks_until_the_app_asks_for_a_steady_one() {
-        let mut emulator = Emulator::new(GridSize { columns: 10, rows: 2 }, &Listener::default());
-        let mut parser: Processor = Processor::new();
-        assert!(emulator.cursor_style().blinking);
-        parser.advance(&mut *emulator, b"[2 q");
-        assert!(!emulator.cursor_style().blinking);
-        parser.advance(&mut *emulator, b"[0 q");
-        assert!(emulator.cursor_style().blinking);
+    fn a_selection_survives_a_redraw_until_its_text_changes() {
+        let mut core = super::super::core::tests::core(20, 3);
+        write_output(&mut core, b"* Working |");
+        let start = core.viewport_to_screen(super::super::model::ViewportPoint { x: 0, y: 0 }).unwrap();
+        core.set_selection(start, super::super::model::ScreenPoint { x: 10, ..start });
+        assert_eq!(core.selection_text(), "* Working |");
+        // A TUI repaints its spinner line in place, the way Claude Code redraws.
+        write_output(&mut core, b"\r\x1b[2K* Working |");
+        assert_eq!(core.selection_text(), "* Working |");
+        write_output(&mut core, b"\r\x1b[2K* Working /");
+        assert_eq!(core.selection_text(), "");
+        assert_eq!(core.selection_cells(), 0);
+    }
+
+    #[test]
+    fn output_under_a_selection_too_large_to_compare_ends_it() {
+        let mut core = super::super::core::tests::core(100, 40);
+        write_output(&mut core, "x\r\n".repeat(40).as_bytes());
+        core.select_all();
+        assert!(core.selection_cells() > MAX_COMPARED_SELECTION_CELLS);
+        write_output(&mut core, b"y");
+        assert_eq!(core.selection_text(), "");
     }
 
     #[test]
@@ -913,12 +1040,6 @@ mod tests {
     }
 
     #[test]
-    fn paste_brackets_when_asked_and_otherwise_sends_carriage_returns() {
-        assert_eq!(paste_input("a\r\nb\nc", false), "a\rb\rc");
-        assert_eq!(paste_input("ls\x1b[201~\n", true), "\x1b[200~ls[201~\n\x1b[201~");
-    }
-
-    #[test]
     fn panes_draw_the_shared_grid_capped_to_their_fit() {
         let fit = GridSize { columns: 100, rows: 30 };
         assert_eq!(GridSize::shown(fit, None), fit);
@@ -930,14 +1051,20 @@ mod tests {
 
     #[test]
     fn read_only_panes_observe_instead_of_attaching() {
-        let launch =
-            Launch { cwd: "/repo".into(), worktree_path: None, project_root: "/repo".into(), stop_on_settle: None };
+        let launch = Launch { cwd: "/repo".into(), project_root: Some("/repo".into()), ..Launch::default() };
         let (method, input) = launch.stream_request("t", "default", true, true);
         assert_eq!((method, input), ("terminal.observe", json!({"threadId": "t", "terminalId": "default"})));
         let (method, input) = launch.stream_request("t", "default", false, false);
         assert_eq!(method, "terminal.attach");
         assert_eq!(input["cwd"], "/repo");
+        assert_eq!(input["env"], json!({"T3CODE_PROJECT_ROOT": "/repo"}));
         assert!(input.get("resume").is_none());
         assert_eq!(launch.stream_request("t", "default", false, true).1["resume"], true);
+        // An agent setup shell gets no project env and starts in its provider's environment.
+        let setup = Launch { cwd: "/home".into(), provider_instance_id: Some("codex".into()), ..Launch::default() };
+        assert_eq!(
+            setup.payload("t", "setup"),
+            json!({"threadId": "t", "terminalId": "setup", "cwd": "/home", "providerInstanceId": "codex"})
+        );
     }
 }

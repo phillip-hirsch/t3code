@@ -14,7 +14,9 @@ use serde_json::{Value, json};
 
 use super::super::Workspace;
 use super::super::right_panel::Surface;
-use crate::preview::{self, FileDownload, NavStatus, Session};
+use crate::model::ProjectShell;
+use crate::preview::{self, FileDownload, NavStatus, Session, TabRef, ThreadRef};
+use crate::project_groups::{self, ProjectGroup};
 use crate::theme::Tokens;
 
 /// `PREVIEW_ERROR_CODE_MESSAGES`.
@@ -96,24 +98,57 @@ impl Discovery {
     }
 }
 
+/// `deriveHistoryProjectKey`: the key of the sidebar group listing `project`'s checkout, so equal
+/// ids on two environments keep their own history. Scratch projects keep their own too
+/// (`groupScratchProjects` is off there).
+fn history_key(groups: &[ProjectGroup], project: &ProjectShell) -> String {
+    let physical = project_groups::physical_key(&project.environment_id, &project.workspace_root);
+    groups
+        .iter()
+        .find(|group| group.members.iter().any(|member| member.physical_key == physical))
+        .filter(|group| !group.members.iter().any(|member| member.is_scratch))
+        .map_or(physical, |group| group.key.clone())
+}
+
+/// A thread's project's history key, and the bare project id history was once kept under.
+struct HistoryProject {
+    key: String,
+    legacy: String,
+}
+
 impl Workspace {
-    fn history_project(&self, thread_id: &str) -> Option<String> {
-        self.shell.threads.iter().find(|t| t.id == thread_id).map(|t| t.project_id.clone())
+    fn history_project(&self, thread: &ThreadRef) -> Option<HistoryProject> {
+        let thread =
+            self.shell.threads.iter().find(|t| t.id == thread.thread_id && t.environment_id == thread.environment)?;
+        let project = self
+            .shell
+            .projects
+            .iter()
+            .find(|p| p.id == thread.project_id && p.environment_id == thread.environment_id)?;
+        Some(HistoryProject { key: history_key(&self.project_groups(), project), legacy: project.id.clone() })
+    }
+
+    /// The history's key for `thread`'s project, with entries under its bare id moved there.
+    fn history_key_adopting(&mut self, thread: &ThreadRef) -> Option<String> {
+        let project = self.history_project(thread)?;
+        if self.preview.history.adopt(&project.legacy, &project.key) {
+            self.preview.history.save_in_background();
+        }
+        Some(project.key)
     }
 
     /// `recordVisitForThread`.
-    pub(super) fn record_visit(&mut self, thread_id: &str, url: &str) {
-        let Some(project) = self.history_project(thread_id) else { return };
+    pub(super) fn record_visit(&mut self, thread: &ThreadRef, url: &str) {
+        let Some(project) = self.history_key_adopting(thread) else { return };
         if self.preview.history.record_visit(&project, url, crate::timestamp::now_ms()) {
             self.preview.history.save_in_background();
         }
     }
 
     /// A settled page names its history entry (`recordPreviewTitles`).
-    pub(super) fn record_title(&mut self, thread_id: &str, status: &NavStatus) {
-        let (NavStatus::Success { url, title }, Some(project)) = (status, self.history_project(thread_id)) else {
-            return;
-        };
+    pub(super) fn record_title(&mut self, thread: &ThreadRef, status: &NavStatus) {
+        let NavStatus::Success { url, title } = status else { return };
+        let Some(project) = self.history_key_adopting(thread) else { return };
         if self.preview.history.set_title(&project, url, title) {
             self.preview.history.save_in_background();
         }
@@ -122,11 +157,11 @@ impl Workspace {
     /// The panel's blank tab, if one shows: its thread's environment and the project's script
     /// preview URLs.
     fn blank_browser(&self) -> Option<DiscoveryKey> {
-        let Some(Surface::Browser(tab)) = self.active_surface() else { return None };
-        let thread_id = self.preview_thread_id()?;
-        let session = self.preview.threads.get(thread_id).and_then(|p| p.get(tab));
-        let blank = !self.preview.tabs.contains_key(tab.as_str())
-            && session.is_none_or(|s| matches!(s.nav_status, NavStatus::Idle));
+        let Some(Surface::Browser(tab_id)) = self.active_surface() else { return None };
+        let tab = self.preview_thread()?.tab(tab_id);
+        let session = self.preview.threads.session(&tab);
+        let blank =
+            !self.preview.tabs.contains_key(&tab) && session.is_none_or(|s| matches!(s.nav_status, NavStatus::Idle));
         if !blank {
             return None;
         }
@@ -137,7 +172,7 @@ impl Workspace {
                 p.scripts.iter().filter_map(|s| s.preview_url.clone()).filter(|u| u.len() <= 2048).take(20).collect()
             })
             .unwrap_or_default();
-        Some((self.thread_environment(thread_id)?, urls))
+        Some((tab.thread.environment, urls))
     }
 
     /// `subscribeDiscoveredLocalServers` while a blank tab shows, so the server only probes then.
@@ -167,17 +202,17 @@ impl Workspace {
     /// Opens a card's URL in the blank tab (`handleOpenServerUrl`); a tab this computer hosts
     /// reaches a remote environment's loopback servers through the environment's host.
     fn open_in_blank_tab(&mut self, raw: String, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(thread_id) = self.preview_thread_id().map(str::to_owned) else { return };
-        let server = self.active_session(&thread_id).is_some_and(Session::server_hosted);
+        let Some(thread) = self.preview_thread() else { return };
+        let server = self.active_session(&thread).is_some_and(Session::server_hosted);
         let url = if server {
             preview::normalize_url(&raw).map_err(str::to_owned)
         } else {
-            Ok(self.discovered_url(&thread_id, &raw))
+            Ok(self.discovered_url(&thread, &raw))
         };
         match url {
             Ok(url) => {
-                self.record_visit(&thread_id, &raw);
-                self.navigate_preview(thread_id, url, window, cx);
+                self.record_visit(&thread, &raw);
+                self.navigate_preview(thread, url, window, cx);
             }
             Err(message) => {
                 self.error = Some(format!("Could not open this address. {message}").into());
@@ -186,14 +221,14 @@ impl Workspace {
         }
     }
 
-    /// `resolveDiscoveredServerUrl` for `thread_id`'s environment: only this app's own server
+    /// `resolveDiscoveredServerUrl` for `thread`'s environment: only this app's own server
     /// shares this computer's loopback.
-    pub(super) fn discovered_url(&self, thread_id: &str, raw: &str) -> String {
-        let environment = self.thread_environment(thread_id);
-        if !self.environment_remote && environment.as_ref() == self.primary_environment() {
+    pub(super) fn discovered_url(&self, thread: &ThreadRef, raw: &str) -> String {
+        let environment = &thread.environment;
+        if !self.environment_remote && self.primary_environment() == Some(environment) {
             return preview::resolve_discovered_url(raw, None);
         }
-        match environment.as_ref().and_then(|environment| self.env_endpoint(environment)) {
+        match self.env_endpoint(environment) {
             Some(endpoint) => preview::resolve_discovered_url(raw, Some(&endpoint.http_base)),
             None => raw.to_owned(),
         }
@@ -202,16 +237,18 @@ impl Workspace {
     /// `PreviewEmptyState`: recents and live servers, else the "No preview yet" note.
     pub(super) fn render_preview_empty_state(
         &self,
-        thread_id: &str,
+        thread: &ThreadRef,
         tokens: &Tokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let project = self.history_project(thread_id);
+        let project = self.history_project(thread);
         let now = crate::timestamp::now_ms();
         let recents: Vec<crate::browser_history::Entry> = project
-            .as_deref()
+            .as_ref()
             .map(|p| {
-                self.preview.history.recent(p, 8).iter().filter(|e| url::Url::parse(&e.url).is_ok()).cloned().collect()
+                // Entries still under the bare id show as a visit, title or removal will merge them.
+                let entries = self.preview.history.merged(&p.key, &p.legacy);
+                entries.into_iter().take(8).filter(|e| url::Url::parse(&e.url).is_ok()).collect()
             })
             .unwrap_or_default();
         let servers = &self.preview.discovery.servers;
@@ -288,9 +325,9 @@ impl Workspace {
                 };
                 let group: SharedString = format!("preview-recent-{}", entry.url).into();
                 let (open, remove) = (entry.url.clone(), entry.url.clone());
-                let project = project.clone();
-                h_flex()
-                    .id(ElementId::Name(group.clone()))
+                let history_thread = thread.clone();
+                let ring = super::super::chat::inset_ring(tokens.ring);
+                focusable(h_flex().id(ElementId::Name(group.clone())), tokens)
                     .group(group.clone())
                     .relative()
                     .w_full()
@@ -304,14 +341,17 @@ impl Workspace {
                     .child(favicon())
                     .child(text_block(title.into(), detail.into()))
                     .child(
+                        // Faded, not hidden: GPUI skips a hidden element's focus, so Tab could never reveal it.
                         div()
                             .id(ElementId::Name(format!("{group}-remove").into()))
+                            .tab_index(0)
+                            .focus_visible(move |s| s.opacity(1.).shadow(vec![ring]))
                             .absolute()
                             .right(px(12.))
                             .p_1()
                             .rounded(px(4.))
-                            .invisible()
-                            .group_hover(group, gpui_kit::Styled::visible)
+                            .opacity(0.)
+                            .group_hover(group, |s| s.opacity(1.))
                             .text_color(tokens.muted_foreground)
                             .hover(|s| s.bg(tokens.accent).text_color(tokens.foreground))
                             .tooltip(move |window, cx| {
@@ -320,8 +360,8 @@ impl Workspace {
                             })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
-                                if let Some(project) = &project {
-                                    this.preview.history.remove(project, &remove);
+                                if let Some(project) = this.history_key_adopting(&history_thread) {
+                                    this.preview.history.remove(&project, &remove);
                                     this.preview.history.save_in_background();
                                     cx.notify();
                                 }
@@ -335,21 +375,23 @@ impl Workspace {
             .iter()
             .map(|server| {
                 let url = server.url.clone();
-                h_flex()
-                    .id(ElementId::Name(format!("preview-server-{}:{}", server.host, server.port).into()))
-                    .w_full()
-                    .gap_3()
-                    .px_3()
-                    .py_3()
-                    .cursor_pointer()
-                    .hover(|s| s.bg(tokens.accent.opacity(0.4)))
-                    .on_click(cx.listener(move |this, _, window, cx| this.open_in_blank_tab(url.clone(), window, cx)))
-                    .child(favicon())
-                    .child(text_block(
-                        server.process_name.clone().unwrap_or_else(|| "Listening".into()).into(),
-                        format!("{}:{}", server.host, server.port).into(),
-                    ))
-                    .into_any_element()
+                focusable(
+                    h_flex().id(ElementId::Name(format!("preview-server-{}:{}", server.host, server.port).into())),
+                    tokens,
+                )
+                .w_full()
+                .gap_3()
+                .px_3()
+                .py_3()
+                .cursor_pointer()
+                .hover(|s| s.bg(tokens.accent.opacity(0.4)))
+                .on_click(cx.listener(move |this, _, window, cx| this.open_in_blank_tab(url.clone(), window, cx)))
+                .child(favicon())
+                .child(text_block(
+                    server.process_name.clone().unwrap_or_else(|| "Listening".into()).into(),
+                    format!("{}:{}", server.host, server.port).into(),
+                ))
+                .into_any_element()
             })
             .collect();
         div()
@@ -394,7 +436,7 @@ impl Workspace {
     /// `PreviewUnreachable` over a page that failed to load.
     pub(super) fn render_unreachable(
         &self,
-        tab_id: &str,
+        tab: &TabRef,
         status: &NavStatus,
         tokens: &Tokens,
         cx: &mut Context<Self>,
@@ -405,18 +447,18 @@ impl Workspace {
             .and_then(|u| u.host_str().map(|h| u.port().map_or_else(|| h.to_owned(), |p| format!("{h}:{p}"))))
             .unwrap_or_else(|| url.clone());
         if let Some(download) = download {
-            return Some(self.render_file_not_shown(tab_id, url, host, download, tokens, cx));
+            return Some(self.render_file_not_shown(tab, url, host, download, tokens, cx));
         }
         let label = if description.is_empty() {
             format!("ERR_{}", if *code == 0 { "FAILED".into() } else { code.abs().to_string() })
         } else {
             description.clone()
         };
-        let details = self.preview.unreachable_details.contains(tab_id);
-        let session =
-            self.preview_thread_id().and_then(|t| self.preview.threads.get(t)).and_then(|p| p.get(tab_id)).cloned();
-        let move_label = session.as_ref().filter(|s| !s.server_hosted()).and_then(|s| self.move_tab_label(s));
-        let (toggle_tab, reload_tab) = (tab_id.to_owned(), tab_id.to_owned());
+        let details = self.preview.unreachable_details.contains(tab);
+        let session = self.preview.threads.session(tab).cloned();
+        let move_label =
+            session.as_ref().filter(|s| !s.server_hosted()).and_then(|s| self.move_tab_label(&tab.thread, s));
+        let (toggle_tab, reload_tab, move_thread) = (tab.clone(), tab.clone(), tab.thread.clone());
         Some(
             div()
                 .id("preview-unreachable")
@@ -518,7 +560,7 @@ impl Workspace {
                                             .small()
                                             .label(label)
                                             .on_click(cx.listener(move |this, _, window, cx| {
-                                                this.move_preview_tab(session.clone(), window, cx);
+                                                this.move_preview_tab(move_thread.clone(), session.clone(), window, cx);
                                             })),
                                     )
                                 })
@@ -540,14 +582,14 @@ impl Workspace {
     /// `PreviewFileNotShown`: the navigation was a file the server's browser downloaded.
     fn render_file_not_shown(
         &self,
-        tab_id: &str,
+        tab: &TabRef,
         url: &str,
         host: String,
         download: &FileDownload,
         tokens: &Tokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let (open, tab, saving) = (url.to_owned(), tab_id.to_owned(), download.clone());
+        let (open, tab, saving) = (url.to_owned(), tab.clone(), download.clone());
         div()
             .id("preview-file-not-shown")
             .size_full()
@@ -613,25 +655,34 @@ impl Workspace {
     /// Download: fetches the file the server's browser kept and writes it where the user picks.
     fn save_preview_download(
         &self,
-        tab_id: &str,
+        tab: &TabRef,
         download: &FileDownload,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(thread_id) = self.preview_thread_id() else { return };
-        let Some(endpoint) = self.thread_environment(thread_id).and_then(|env| self.env_endpoint(&env).cloned()) else {
+        let environment = tab.thread.environment.clone();
+        if self.env_endpoint(&environment).is_none() {
             return;
-        };
+        }
         let query = url::form_urlencoded::Serializer::new(String::new())
-            .append_pair("threadId", thread_id)
-            .append_pair("tabId", tab_id)
+            .append_pair("threadId", &tab.thread.thread_id)
+            .append_pair("tabId", &tab.tab_id)
             .append_pair("id", &download.id)
             .finish();
-        let url = format!("{}/api/preview-stream/download?{query}", endpoint.http_base);
         let directory = std::env::home_dir().map(|home| home.join("Downloads")).unwrap_or_default();
         let picked = cx.prompt_for_new_path(&directory, Some(&download.file_name));
-        cx.spawn_in(window, async move |_, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(path))) = picked.await else { return };
+            // Read after the dialog: a reconnect while it was open can replace the address and token.
+            let endpoint = this.read_with(cx, |this, _| this.env_endpoint(&environment).cloned()).ok().flatten();
+            let Some(endpoint) = endpoint else {
+                let _ = cx.update(|window, cx| {
+                    let toast = Notification::error("Reconnect to the environment and try again.");
+                    window.push_notification(toast.title("Could not save file"), cx);
+                });
+                return;
+            };
+            let url = format!("{}/api/preview-stream/download?{query}", endpoint.http_base);
             let fetched = crate::runtime()
                 .spawn(async move {
                     let request = reqwest::Client::new().get(url).bearer_auth(endpoint.bearer_token);
@@ -654,6 +705,11 @@ impl Workspace {
         })
         .detach();
     }
+}
+
+/// A `<button>` row: a Tab stop that Enter and Space click, with `focus-visible:ring-2 ring-inset ring-ring`.
+fn focusable(element: gpui_kit::Stateful<gpui_kit::Div>, tokens: &Tokens) -> gpui_kit::Stateful<gpui_kit::Div> {
+    super::super::chat::ringed_tab_stop(element, tokens.ring)
 }
 
 /// `formatRelativeElapsed`.
@@ -695,6 +751,33 @@ fn no_preview(tokens: &Tokens) -> impl IntoElement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_follows_the_sidebar_group_on_each_environment() {
+        let project = |env: &str, id: &str, root: &str| {
+            let mut project: ProjectShell =
+                serde_json::from_value(json!({"id": id, "title": id, "workspaceRoot": root})).unwrap();
+            project.environment_id = env.to_owned().into();
+            project
+        };
+        let projects = [project("laptop", "p1", "/src/app"), project("server", "p1", "/srv/app")];
+        let groups = project_groups::build_groups(&projects, &Default::default(), &[], true);
+        let keys: Vec<String> = projects.iter().map(|p| history_key(&groups, p)).collect();
+        assert_ne!(keys[0], keys[1], "one id on two environments");
+        assert_eq!(keys[0], groups[0].key);
+        // The sidebar's shared scratch group doesn't share its history.
+        let scratch = [project("laptop", "s1", "/tmp/a"), project("laptop", "s2", "/tmp/b")];
+        let roots: Vec<project_groups::ScratchRoot> = scratch
+            .iter()
+            .map(|p| project_groups::ScratchRoot {
+                environment_id: p.environment_id.clone(),
+                root: p.workspace_root.clone(),
+            })
+            .collect();
+        let groups = project_groups::build_groups(&scratch, &Default::default(), &roots, true);
+        assert_eq!(groups.len(), 1);
+        assert_ne!(history_key(&groups, &scratch[0]), history_key(&groups, &scratch[1]));
+    }
 
     #[test]
     fn configured_servers_come_first_then_ports_ascend() {

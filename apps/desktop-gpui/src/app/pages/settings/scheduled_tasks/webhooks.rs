@@ -32,20 +32,38 @@ use crate::theme::{Tokens, tokens};
 
 pub(super) use webhook_logic::DEFAULT_WEBHOOK_PROMPT;
 
-/// What webhook controls need from the window's connection.
+const ROTATE: &str = "scheduledTasks.rotateWebhookToken";
+const NOT_CONNECTED: &str = "This environment is not connected.";
+
+/// What webhook controls need from the task's environment, looked up when used: a reconnect
+/// replaces its socket and can change its address.
 #[derive(Clone)]
 pub(super) struct WebhookContext {
-    client: RpcClient,
-    /// `useEnvironmentHttpBaseUrl`, and the session that reads `/api/connect/link-state`.
-    endpoint: Option<crate::backend::Endpoint>,
+    /// The environment the task lives on.
+    environment: SharedString,
     workspace: WeakEntity<Workspace>,
 }
 
 impl WebhookContext {
     /// `environment` is the one the task lives on, whose address the webhook URL uses.
-    pub(super) fn new(client: RpcClient, environment: &str, workspace: &Entity<Workspace>, cx: &App) -> Self {
-        let endpoint = workspace.read(cx).env_endpoint(environment).cloned();
-        Self { client, endpoint, workspace: workspace.downgrade() }
+    pub(super) fn new(environment: &str, workspace: &Entity<Workspace>) -> Self {
+        Self { environment: environment.to_owned().into(), workspace: workspace.downgrade() }
+    }
+
+    /// `useEnvironmentHttpBaseUrl`, and the session that reads `/api/connect/link-state`.
+    fn endpoint(&self, cx: &App) -> Option<crate::backend::Endpoint> {
+        self.workspace.upgrade()?.read(cx).env_endpoint(&self.environment).cloned()
+    }
+
+    /// `permissionAtom`: this connection may send `method` with `payload` to the task's environment.
+    fn permits(&self, method: &str, payload: &Value, cx: &App) -> bool {
+        let workspace = self.workspace.upgrade();
+        workspace.is_some_and(|w| w.read(cx).env_permits(&self.environment, method, payload))
+    }
+
+    /// The task environment's socket now, which a reconnect replaces.
+    fn live_client(&self, cx: &App) -> Option<RpcClient> {
+        self.workspace.upgrade()?.read(cx).env_client(&self.environment)
     }
 }
 
@@ -149,7 +167,7 @@ impl WebhookFields {
         let relay_url = |task: Option<&Value>| task.map(|task| !task["webhook"]["url"].is_null());
         let link_changed = relay_url(task.as_ref()) != relay_url(self.task.as_ref());
         self.task = task;
-        let address = self.address().map(|address| address.address).unwrap_or_default();
+        let address = self.address(cx).map(|address| address.address).unwrap_or_default();
         if self.url.read(cx).value() != address.as_str() {
             self.url.update(cx, |url, cx| url.set_value(address, window, cx));
         }
@@ -203,9 +221,10 @@ impl WebhookFields {
         })
     }
 
-    fn address(&self) -> Option<webhook_logic::WebhookAddress> {
+    fn address(&self, cx: &App) -> Option<webhook_logic::WebhookAddress> {
         let endpoint = self.task.as_ref()?.get("webhook").filter(|e| e.is_object())?;
-        let http_base = self.context.endpoint.as_ref().map(|e| e.http_base.as_str());
+        let server = self.context.endpoint(cx);
+        let http_base = server.as_ref().map(|e| e.http_base.as_str());
         Some(webhook_logic::webhook_address(endpoint, http_base))
     }
 
@@ -229,7 +248,7 @@ impl WebhookFields {
     fn read_link_state(&mut self, cx: &mut Context<Self>) {
         self.hold_while_offline = None;
         let relay = self.task.as_ref().is_some_and(|task| task["webhook"]["url"].is_string());
-        let Some(endpoint) = self.context.endpoint.clone().filter(|_| relay) else {
+        let Some(endpoint) = self.context.endpoint(cx).filter(|_| relay) else {
             self._link_state = None;
             return;
         };
@@ -282,10 +301,14 @@ impl WebhookFields {
 
     fn rotate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.task.as_ref().and_then(|task| task["id"].as_str()).map(str::to_owned) else { return };
-        let client = self.context.client.clone();
+        let input = json!({"id": id});
+        if !self.context.permits(ROTATE, &input, cx) {
+            return;
+        }
+        let Some(client) = self.context.live_client(cx) else { return };
         self.rotating = true;
         cx.spawn_in(window, async move |this, cx| {
-            let result = client.request("scheduledTasks.rotateWebhookToken", json!({"id": id})).await;
+            let result = client.request(ROTATE, input).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.rotating = false;
                 match result {
@@ -300,10 +323,11 @@ impl WebhookFields {
     }
 
     fn render_endpoint(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
-        let Some(address) = self.address() else {
+        let Some(address) = self.address(cx) else {
             return text_sm(div(), t.muted_foreground).child("The URL appears after you save.").into_any_element();
         };
         let relay = self.task.as_ref().is_some_and(|task| task["webhook"]["url"].is_string());
+        let rotate_input = json!({"id": self.task.as_ref().map(|task| task["id"].clone())});
         v_flex()
             .gap(px(6.))
             .child(
@@ -320,7 +344,9 @@ impl WebhookFields {
                     .child(
                         outline_button("webhook-url-rotate")
                             .label("Rotate")
-                            .disabled(self.rotating || self.disabled)
+                            .disabled(
+                                self.rotating || self.disabled || !self.context.permits(ROTATE, &rotate_input, cx),
+                            )
                             .on_click(cx.listener(|this, _, window, cx| this.confirm_rotate(window, cx))),
                     ),
             )
@@ -526,19 +552,19 @@ pub(super) fn webhook_menu_item(menu: PopupMenu, context: &WebhookContext, task:
     if task["schedule"]["type"] != "webhook" {
         return menu;
     }
-    let (client, task) = (context.client.clone(), task.clone());
+    let (context, task) = (context.clone(), task.clone());
     menu.item(
         PopupMenuItem::new("Deliveries")
             .icon(Icon::new(Lucide::Inbox))
-            .on_click(move |_, window, cx| open_deliveries(client.clone(), &task, window, cx)),
+            .on_click(move |_, window, cx| open_deliveries(context.clone(), &task, window, cx)),
     )
 }
 
 /// `WebhookDeliveriesDialog`: recent requests to a task's URL, and one request in full.
-pub(super) fn open_deliveries(client: RpcClient, task: &Value, window: &mut Window, cx: &mut App) {
+fn open_deliveries(context: WebhookContext, task: &Value, window: &mut Window, cx: &mut App) {
     let view = cx.new(|cx| {
         let mut deliveries = Deliveries {
-            client,
+            context,
             task_id: task["id"].as_str().unwrap_or_default().to_owned(),
             title: task["title"].as_str().unwrap_or_default().to_owned().into(),
             list: None,
@@ -553,7 +579,7 @@ pub(super) fn open_deliveries(client: RpcClient, task: &Value, window: &mut Wind
 }
 
 struct Deliveries {
-    client: RpcClient,
+    context: WebhookContext,
     task_id: String,
     title: SharedString,
     /// Kept while a refresh runs, as the web query keeps its data.
@@ -572,7 +598,12 @@ struct Selected {
 
 impl Deliveries {
     fn refresh(&mut self, cx: &mut Context<Self>) {
-        let (client, id) = (self.client.clone(), self.task_id.clone());
+        let Some(client) = self.context.live_client(cx) else {
+            self.list_error = Some(NOT_CONNECTED.into());
+            cx.notify();
+            return;
+        };
+        let id = self.task_id.clone();
         self.listing = Some(cx.spawn(async move |this, cx| {
             let input = json!({"id": id, "acceptAnyOutcome": true});
             let result = client.request("scheduledTasks.listWebhookDeliveries", input).await;
@@ -592,8 +623,17 @@ impl Deliveries {
     }
 
     fn select(&mut self, delivery_id: String, cx: &mut Context<Self>) {
-        let (client, id) = (self.client.clone(), self.task_id.clone());
+        let (client, id) = (self.context.live_client(cx), self.task_id.clone());
         let load = cx.spawn(async move |this, cx| {
+            let Some(client) = client else {
+                let _ = this.update(cx, |this, cx| {
+                    if let Some(selected) = &mut this.selected {
+                        selected.error = Some(NOT_CONNECTED.into());
+                    }
+                    cx.notify();
+                });
+                return;
+            };
             let input = json!({"id": id, "deliveryId": delivery_id, "acceptAnyOutcome": true});
             let result = client.request("scheduledTasks.getWebhookDelivery", input).await;
             let _ = this.update(cx, |this, cx| {

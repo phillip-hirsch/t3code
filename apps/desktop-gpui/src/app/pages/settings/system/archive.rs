@@ -21,7 +21,7 @@ use super::super::widgets::{RowFrame, settings_section};
 use super::{notify_error, now_ms, relative_label, text};
 use crate::app::pages::settings::connections::logic::ORCHESTRATION_OPERATE;
 use crate::app::pages::settings::widgets::SettingsView;
-use crate::app::{Workspace, new_id, sidebar};
+use crate::app::{Workspace, deleted_thread, new_id, sidebar};
 use crate::model::{DelegatedFrom, Lineage, ProjectShell};
 use crate::project_groups::ProjectGroup;
 use crate::rpc::RpcClient;
@@ -276,9 +276,7 @@ fn group_pages<'a>(
     for project in projects {
         let env = project.environment_id.as_ref();
         let Some(threads) = by_project.remove(&(env, project.id.as_str())) else { continue };
-        let on_env = |group: &&ProjectGroup| group.members.iter().any(|m| m.project.environment_id.as_ref() == env);
-        let logical =
-            if multiple { logical.iter().find(|group| on_env(group) && group.contains(&project.id)) } else { None };
+        let logical = if multiple { logical.iter().find(|group| group.contains_project(project)) } else { None };
         let key = logical.map_or_else(|| format!("{env}:{}", project.id), |group| group.key.clone());
         match groups.iter_mut().find(|group| group.key == key) {
             Some(group) => group.threads.extend(threads),
@@ -631,6 +629,7 @@ fn delete(
 }
 
 /// Runs a row's command, then frees the row and, once it lands, reloads that environment's page.
+/// A delete also clears what this client kept for the thread and its side chats.
 fn dispatch_and_reload(
     view: &Entity<Workspace>,
     state: &Entity<ArchiveState>,
@@ -644,12 +643,29 @@ fn dispatch_and_reload(
         release(state, target, cx);
         return;
     };
-    let (state, target) = (state.clone(), target.clone());
+    let deletes = command["type"] == "thread.delete";
+    let (environment, thread_id) = (target.environment_id.clone(), target.thread_id.to_string());
+    let workspace = view.read(cx);
+    let listed = deletes.then(|| workspace.listed_side_chats(&environment, &thread_id));
+    let ask_family = deletes && workspace.lists_thread_families(&environment);
+    let (view, state, target) = (view.clone(), state.clone(), target.clone());
     window
         .spawn(cx, async move |cx| {
+            let mut side_chats = listed;
+            if ask_family
+                && let Ok(family) =
+                    client.request("orchestration.getThreadFamily", json!({"threadId": thread_id})).await
+            {
+                side_chats = Some(deleted_thread::family_side_chats(&family, &thread_id));
+            }
             let result = client.request("orchestration.dispatchCommand", command).await;
             let _ = cx.update(|window, cx| match result {
                 Ok(_) => {
+                    if let Some(side_chats) = &side_chats {
+                        view.update(cx, |workspace, cx| {
+                            workspace.forget_deleted_thread(&environment, &thread_id, side_chats, cx);
+                        });
+                    }
                     release(&state, &target, cx);
                     state.update(cx, |state, cx| state.load(target.environment_id.to_string(), client, cx));
                 }

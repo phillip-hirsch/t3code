@@ -5,7 +5,7 @@
 pub(in crate::app) mod agents;
 mod chat;
 pub(in crate::app) mod code;
-mod connections;
+pub(in crate::app) mod connections;
 pub(in crate::app) use connections::check_filesystem_read;
 pub(in crate::app) use connections::check_scope;
 pub(in crate::app) use connections::logic::{machine_icon, one_password_account};
@@ -22,12 +22,19 @@ mod model_select;
 
 mod providers;
 mod row_layout;
-pub(in crate::app) use providers::{chatgpt_usage_button, redacted_email, uses_chatgpt_sharing};
+pub(in crate::app) use providers::{
+    ModeChange, chatgpt_usage_button, codex_setup_managed, idle_compaction, provider_summary, redacted_email,
+    uses_chatgpt_sharing, with_setup_mode,
+};
 pub(in crate::app) use widgets::device_only;
 mod search;
+pub(in crate::app) mod secret_source;
+pub(in crate::app) use secret_source::source_select;
 mod snap_shot;
 mod star_prompt;
 mod system;
+pub(in crate::app) use fields::resolve_pasted_path;
+pub(in crate::app) use system::format_bytes;
 pub(in crate::app) mod theme_import;
 pub(in crate::app) mod theme_library;
 mod typography;
@@ -260,6 +267,8 @@ pub(in crate::app) struct SettingsUi {
     open_marker: Option<SharedString>,
     /// Open "Advanced" folds, by section id.
     advanced_open: HashSet<&'static str>,
+    /// A pull request routing grant is being saved; the pickers wait for it.
+    pull_request_routing_saving: bool,
     /// The Typography rows' family pickers, by setting key.
     font_pickers: HashMap<&'static str, typography::FontPicker>,
     project_picker: Option<widgets::ScopeProjectPicker>,
@@ -285,6 +294,8 @@ pub(in crate::app) struct SettingsUi {
     focused_field: Option<fields::FieldFlush>,
     /// Each connected environment's session check, for its `settings:write` grant.
     grants: HashMap<String, (gpui_kit::Task<()>, connections::SessionLoad)>,
+    /// Each environment's text generator model lists, shared by the pickers that offer them.
+    text_generators: providers::TextGeneratorCatalog,
     _search_subscription: Subscription,
 }
 
@@ -327,6 +338,7 @@ impl SettingsUi {
             sliders: HashMap::new(),
             open_marker: None,
             advanced_open: HashSet::new(),
+            pull_request_routing_saving: false,
             font_pickers: HashMap::new(),
             star_prompt_shown: false,
             project_picker: None,
@@ -343,6 +355,7 @@ impl SettingsUi {
             nav_reveal: Rc::default(),
             focused_field: None,
             grants: HashMap::new(),
+            text_generators: providers::TextGeneratorCatalog::default(),
             _search_subscription: subscription,
         }
     }
@@ -385,7 +398,7 @@ const RESTORE: &[(&str, &[&str])] = &[
     ("Rich text composer", &["composerRichTextEnabled"]),
     ("Send shortcut", &["sendShortcut"]),
     ("Follow-up behavior", &["followUpBehavior"]),
-    ("Context window indicator", &["contextWindowMeterEnabled"]),
+    ("Tool calls in chat", &["toolCallVisibility"]),
     ("Response streaming", &["responseStreamingMode"]),
     ("Provider update checks", &["enableProviderUpdateChecks"]),
     ("Continue threads after restarts", &["continueThreadsAfterServerUpdate"]),
@@ -636,7 +649,20 @@ impl Workspace {
     }
 
     fn settings_results(&self, cx: &gpui_kit::App) -> Vec<&'static SearchItem> {
-        search::search(&self.settings_ui.search.read(cx).value(), search::shipped())
+        let mut results = search::search(&self.settings_ui.search.read(cx).value(), search::shipped());
+        results.retain(|item| self.setting_offered(item));
+        results
+    }
+
+    /// Whether the connected environments offer an item that depends on them
+    /// (`useAvailableSettingsSearchItems`); the rest follow the build (`search::available`).
+    pub(in crate::app) fn setting_offered(&self, item: &SearchItem) -> bool {
+        (!item.fast_worktree_checkout_only
+            || self.sessions.iter().any(|s| s.is_connected() && s.server_info.capability("fastWorktreeCheckout")))
+            && (!item.text_generators_only
+                || self.sessions.iter().any(|s| {
+                    !s.server_info.config.is_null() && providers::text_generators_allowed(&s.server_info.managed_policy)
+                }))
     }
 
     /// Opens the result's section and scrolls its row into view (`handleSearchResultClick`).

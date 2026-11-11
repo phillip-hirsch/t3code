@@ -1,9 +1,13 @@
 //! The macOS menu bar, as Electron's `DesktopApplicationMenu` builds it for darwin: the app
 //! menu (About, Check for Updates, Settings, Services, Hide, Quit), File › Close Window, Edit
 //! (with Paste as Text, Delete and Speech), View (Reload, Force Reload, Toggle Developer Tools,
-//! Toggle Full Screen), Window and Help. Windows and Linux hide Electron's menu bar, so they get
-//! none, but keep its accelerators: Settings (Ctrl+,), Paste as Text (Ctrl+Shift+V), Reload
-//! (Ctrl+R, Ctrl+Shift+R) and Toggle Full Screen (F11).
+//! Actual Size, Zoom In, Zoom Out, Toggle Full Screen), Window and Help. Windows and Linux hide
+//! Electron's menu bar, so they get none, but keep its accelerators: Settings (Ctrl+,), Paste as
+//! Text (Ctrl+Shift+V), Reload (Ctrl+R, Ctrl+Shift+R), the zoom keys (Ctrl+0, Ctrl+=, Ctrl+-, and
+//! Ctrl+wheel) and Toggle Full Screen (F11).
+//!
+//! App zoom scales the whole interface (`Window::set_ui_scale`) and is saved with the desktop
+//! settings. The keypad's 0, + and - arrive as the same keys as the number row's.
 //!
 //! The app has no web contents to reload: Reload and Force Reload start the backend connection
 //! over, which reads every stream again. Toggle Developer Tools is GPUI's inspector, which only
@@ -19,11 +23,13 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use gpui_kit::component::input;
 use gpui_kit::{
-    App, Context, Div, Focusable as _, Global, InteractiveElement as _, KeyBinding, Menu, MenuItem, OsAction,
-    PromptLevel, SystemMenuType, Window,
+    App, Context, DispatchPhase, Div, Focusable as _, Global, InteractiveElement as _, IntoElement, KeyBinding, Menu,
+    MenuItem, OsAction, PromptLevel, ScrollDelta, ScrollEvent, Styled as _, SystemMenuType, Window, canvas,
 };
 
 use super::Workspace;
+use crate::desktop::Desktop;
+use crate::desktop::zoom::{self, ZoomStep};
 
 gpui_kit::actions!(
     app_menu,
@@ -41,6 +47,9 @@ gpui_kit::actions!(
         StopSpeaking,
         Reload,
         ForceReload,
+        ActualSize,
+        ZoomIn,
+        ZoomOut,
         ToggleFullScreen,
         Minimize,
         Zoom,
@@ -63,6 +72,12 @@ pub fn init(cx: &mut App) {
             KeyBinding::new("cmd-shift-v", PasteAsText, Some("Input")),
             KeyBinding::new("cmd-r", Reload, None),
             KeyBinding::new("cmd-shift-r", ForceReload, None),
+            // The menu shows each action's first binding.
+            KeyBinding::new("cmd-0", ActualSize, None),
+            KeyBinding::new("cmd-=", ZoomIn, None),
+            KeyBinding::new("cmd-+", ZoomIn, None),
+            KeyBinding::new("cmd-shift-=", ZoomIn, None),
+            KeyBinding::new("cmd--", ZoomOut, None),
         ]);
     } else {
         // The terminal keeps Ctrl+R and Ctrl+Shift+R, as xterm takes them before Electron's menu.
@@ -72,6 +87,11 @@ pub fn init(cx: &mut App) {
             KeyBinding::new("ctrl-r", Reload, Some("!Terminal")),
             KeyBinding::new("ctrl-shift-r", ForceReload, Some("!Terminal")),
             KeyBinding::new("f11", ToggleFullScreen, None),
+            KeyBinding::new("ctrl-0", ActualSize, None),
+            KeyBinding::new("ctrl-=", ZoomIn, None),
+            KeyBinding::new("ctrl-+", ZoomIn, None),
+            // xterm sends Ctrl+- to the shell (^_), before Electron's menu sees it.
+            KeyBinding::new("ctrl--", ZoomOut, Some("!Terminal")),
         ]);
     }
     cx.on_action(|_: &HideApp, cx| cx.hide());
@@ -86,6 +106,9 @@ pub fn init(cx: &mut App) {
     cx.on_action(|_: &OpenSettings, cx| with_workspace(cx, |workspace, _, cx| workspace.open_settings("general", cx)));
     cx.on_action(|_: &Reload, cx| with_workspace(cx, Workspace::reconnect));
     cx.on_action(|_: &ForceReload, cx| with_workspace(cx, Workspace::reconnect));
+    cx.on_action(|_: &ActualSize, cx| zoom_app(ZoomStep::Reset, cx));
+    cx.on_action(|_: &ZoomIn, cx| zoom_app(ZoomStep::In, cx));
+    cx.on_action(|_: &ZoomOut, cx| zoom_app(ZoomStep::Out, cx));
     cx.on_action(|_: &StopSpeaking, cx| stop_speaking(cx));
     cx.on_action(|_: &About, _| show_about_panel());
     cx.on_action(|_: &CheckForUpdates, cx| {
@@ -163,6 +186,10 @@ fn menus() -> Vec<Menu> {
                 #[cfg(debug_assertions)]
                 MenuItem::action("Toggle Developer Tools", gpui_kit::component::ToggleInspector),
                 MenuItem::separator(),
+                MenuItem::action("Actual Size", ActualSize),
+                MenuItem::action("Zoom In", ZoomIn),
+                MenuItem::action("Zoom Out", ZoomOut),
+                MenuItem::separator(),
                 MenuItem::action("Toggle Full Screen", ToggleFullScreen),
             ],
             disabled: false,
@@ -203,6 +230,9 @@ impl Workspace {
     fn paste_as_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.composer.read(cx).focus_handle(cx).is_focused(window) {
             window.dispatch_action(Box::new(input::Paste), cx);
+            return;
+        }
+        if !self.question_takes_text(super::side_chat::ChatPane::Main) {
             return;
         }
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()).filter(|text| !text.is_empty()) else {
@@ -299,6 +329,53 @@ fn stop_speaking(cx: &mut App) {
     if let Some(child) = child {
         cx.background_executor().spawn(async move { end_speech(child) }).detach();
     }
+}
+
+/// `zoomWindow`: half a zoom level in or out, or back to Actual Size, saved and applied to the
+/// main window once GPUI hands the active window back.
+pub(super) fn zoom_app(step: ZoomStep, cx: &mut App) {
+    cx.defer(move |cx| {
+        let settings = &mut cx.global_mut::<Desktop>().settings;
+        let level = zoom::step(settings.zoom_level, step);
+        if (level - settings.zoom_level).abs() < f64::EPSILON {
+            return;
+        }
+        settings.zoom_level = level;
+        settings.save();
+        let Some(window) = cx.try_global::<super::main_window::MainWindow>().map(|main| main.window) else { return };
+        if let Err(error) = window.update(cx, |_, window, cx| apply_zoom(level, window, cx)) {
+            log::warn!("zoom could not reach the window: {error:#}");
+        }
+    });
+}
+
+/// Ctrl+wheel off macOS zooms the app instead of scrolling (Chromium's `ContentsZoomChange`), a
+/// step per wheel notch; touchpads' pixel scrolls don't zoom. The image viewer takes its own.
+pub(super) fn wheel_zoom_listener(image_viewer_open: bool) -> impl IntoElement {
+    canvas(
+        |_, _, _| {},
+        move |_, (), window, _| {
+            window.on_mouse_event(move |event: &ScrollEvent, phase, _, cx| {
+                let ScrollDelta::Lines(lines) = event.delta else { return };
+                if phase != DispatchPhase::Capture || !event.modifiers.control || lines.y == 0. || image_viewer_open {
+                    return;
+                }
+                cx.stop_propagation();
+                zoom_app(if lines.y > 0. { ZoomStep::In } else { ZoomStep::Out }, cx);
+            });
+        },
+    )
+    .absolute()
+    .size_0()
+}
+
+/// Scales `window`'s interface to `level`. macOS's traffic lights keep their size and stay
+/// centered on the zoomed top row (`syncMacosWindowButtons`).
+pub(super) fn apply_zoom(level: f64, window: &mut Window, cx: &mut App) {
+    let scale = zoom::factor(level);
+    window.set_ui_scale(scale, cx);
+    #[cfg(target_os = "macos")]
+    window.set_traffic_light_position(super::titlebar::traffic_lights(scale));
 }
 
 /// Acts on the focused window. GPUI runs app-level action handlers while it holds that window

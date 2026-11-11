@@ -1,31 +1,34 @@
 //! Files the web hands to the browser engine (`BrowserDocumentFrame`, `WorkspaceVideoPreview`,
-//! `WorkspaceAudioPreview`): PDFs, rendered HTML, video and audio play in a native WebView of
-//! the file's signed asset URL. Also "Open file in preview browser".
+//! `WorkspaceAudioPreview`): rendered HTML, video and audio play in a native WebView of the
+//! file's signed asset URL, and PDFs and Office files in viewer pages (`super::viewer`). Also
+//! "Open file in preview browser".
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, AppContext as _, Context, Entity, Hsla, InteractiveElement as _, IntoElement, ParentElement as _,
+    AnyElement, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _,
     StatefulInteractiveElement as _, Styled as _, Task, Window, div, px,
 };
 use gpui_webview::WebView;
 use serde_json::{Value, json};
 
 use super::FileKey;
-use super::logic::{self, FileKind};
+use super::logic::{self, FileKind, Office};
 use super::media::MediaKind;
+use crate::app::mermaid::{REFUSAL, Shown, css_color};
 use crate::app::{Target, Workspace};
 
 /// Document views kept alive while not drawn, so switching tabs back keeps the page.
 const KEPT_VIEWS: usize = 2;
 
-struct DocView {
+pub(super) struct DocView {
     kind: FileKind,
     view: Option<Entity<WebView>>,
     failed: Option<String>,
@@ -36,17 +39,20 @@ struct DocView {
     /// The workspace mutation and `fileRevision` the page loaded.
     mutation: (Option<String>, Option<String>),
     revision: Option<String>,
-    /// A rendered diagram's source revision.
-    content: u64,
     shown: bool,
     used: u64,
+    /// A viewer page's resource, signed again for each read of the file, and the theme it shows.
+    resource: Option<Value>,
+    theme: Option<super::viewer::ViewerTheme>,
     _task: Option<Task<()>>,
     _links: Option<Task<()>>,
     _media: Option<Task<()>>,
+    /// A viewer page's protocol and report listeners.
+    _viewer: Vec<Task<()>>,
 }
 
 impl DocView {
-    fn new(kind: FileKind, mutation: (Option<String>, Option<String>), content: u64) -> Self {
+    fn new(kind: FileKind, mutation: (Option<String>, Option<String>)) -> Self {
         Self {
             kind,
             view: None,
@@ -55,12 +61,14 @@ impl DocView {
             drawn: false,
             mutation,
             revision: None,
-            content,
             shown: false,
             used: 0,
+            resource: None,
+            theme: None,
             _task: None,
             _links: None,
             _media: None,
+            _viewer: Vec::new(),
         }
     }
 }
@@ -111,14 +119,73 @@ fn media_adopt_script(url: &str) -> String {
 const MEDIA_PAUSE_SCRIPT: &str = "window.t3Media&&window.t3Media.pause()";
 
 impl Documents {
+    /// Records that `key`'s view is on screen this frame: in the panel, or a draft's in its dialog.
+    fn mark_drawn(&mut self, key: &FileKey) {
+        if matches!(key.origin, super::Origin::Draft { .. }) {
+            self.dialog = Some((key.clone(), self.frame));
+        } else {
+            self.drawn = Some(key.clone());
+        }
+    }
+
+    /// The draft document a dialog drew last frame, if it is still open.
+    fn dialog_view(&self, dialog_open: bool) -> Option<&FileKey> {
+        self.dialog.as_ref().filter(|(_, frame)| dialog_open && frame + 1 >= self.frame).map(|(key, _)| key)
+    }
+
     /// Drops `key`'s view, so its next draw builds it again.
     pub(super) fn forget(&mut self, key: &FileKey) {
         self.views.remove(key);
     }
 
-    /// Whether `key`'s diagram must be built for source `revision`.
-    pub(super) fn stale(&self, key: &FileKey, revision: u64) -> bool {
-        self.views.get(key).is_none_or(|doc| doc.content != revision)
+    /// Marks `key`'s viewer page as starting, with the resource it reads and its listeners.
+    pub(super) fn begin_viewer(&mut self, key: &FileKey, resource: Option<Value>, tasks: Vec<Task<()>>) {
+        if let Some(doc) = self.views.get_mut(key) {
+            doc.resource = resource;
+            doc._viewer = tasks;
+            doc._task = Some(Task::ready(()));
+        }
+    }
+
+    /// `key`'s view while it shows.
+    pub(super) fn shown_view(&self, key: &FileKey) -> Option<&Entity<WebView>> {
+        self.views.get(key).filter(|doc| doc.shown)?.view.as_ref()
+    }
+
+    /// The open viewer pages' views.
+    pub(super) fn viewer_views(&self) -> impl Iterator<Item = &Entity<WebView>> {
+        self.views.values().filter(|doc| viewer_of(doc.kind).is_some()).filter_map(|doc| doc.view.as_ref())
+    }
+
+    pub(super) fn viewer_resource(&self, key: &FileKey) -> Option<&Value> {
+        self.views.get(key)?.resource.as_ref()
+    }
+
+    /// The `fileRevision` the viewer last read, which a workspace mutation compares against.
+    pub(super) fn set_revision(&mut self, key: &FileKey, revision: Option<String>) {
+        if let Some(doc) = self.views.get_mut(key) {
+            doc.revision = revision;
+        }
+    }
+
+    pub(super) fn set_theme(&mut self, key: &FileKey, theme: &super::viewer::ViewerTheme) {
+        if let Some(doc) = self.views.get_mut(key) {
+            doc.theme = Some(*theme);
+        }
+    }
+
+    /// `key`'s view when its page shows a theme other than `theme`, which it now records.
+    pub(super) fn theme_changed(
+        &mut self,
+        key: &FileKey,
+        theme: &super::viewer::ViewerTheme,
+    ) -> Option<Entity<WebView>> {
+        let doc = self.views.get_mut(key)?;
+        if doc.theme.is_none_or(|shown| shown == *theme) {
+            return None;
+        }
+        doc.theme = Some(*theme);
+        doc.view.clone()
     }
 }
 
@@ -127,42 +194,43 @@ pub(super) struct Documents {
     views: HashMap<FileKey, DocView>,
     /// The document drawn this frame.
     drawn: Option<FileKey>,
+    /// The draft attachment's document its preview dialog drew, and when. Dialogs draw after the
+    /// workspace syncs its views, so this one shows from the next frame while the dialog stays.
+    dialog: Option<(FileKey, u64)>,
     frame: u64,
+    /// PDF reading positions, kept after a viewer closes.
+    pub(super) pdf_positions: super::pdf::Positions,
+    /// The shell chords viewer pages hand back.
+    pub(super) chords: super::viewer::ViewerChords,
 }
 
-/// A colour as CSS: `#rrggbb`, or `rgba(...)` when translucent like many dark tokens.
-fn css_hex(color: Hsla) -> String {
-    let rgba = gpui_kit::Rgba::from(color);
-    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "clamped to 0..=255 before the cast")]
-    let byte = |v: f32| (v.clamp(0., 1.) * 255.).round() as u8;
-    let (r, g, b) = (byte(rgba.r), byte(rgba.g), byte(rgba.b));
-    if rgba.a < 1. { format!("rgba({r},{g},{b},{:.3})", rgba.a) } else { format!("#{r:02x}{g:02x}{b:02x}") }
+/// The viewer page that shows `kind`, and its global API's name.
+fn viewer_of(kind: FileKind) -> Option<(&'static super::viewer::ViewerSpec, &'static str)> {
+    match kind {
+        FileKind::Pdf => Some((&super::pdf::VIEWER, super::pdf::GLOBAL)),
+        // Notebooks render natively (`super::notebook`).
+        FileKind::Office(office) if office != Office::Ipynb => Some((&super::office::VIEWER, super::office::GLOBAL)),
+        _ => None,
+    }
 }
 
 fn escape_attribute(value: &str) -> String {
     value.replace('&', "&amp;").replace('"', "&quot;").replace('<', "&lt;")
 }
 
-/// The page a document's view opens: PDFs load their URL in the engine's own viewer
-/// (`#navpanes=0&view=FitH`, as `PdfDocumentRevision` does); HTML runs in a sandboxed frame with an
-/// opaque origin (`FileDocument`); media get the browser's controls on the panel's background.
-enum Page {
-    Url(String),
-    Html(String),
-}
-
-fn document_page(kind: FileKind, url: &str, background: &str, dark: bool) -> Page {
+/// The page a document's view opens: HTML runs in a sandboxed frame with an opaque origin
+/// (`FileDocument`); media get the browser's controls on the panel's background.
+fn document_page(kind: FileKind, url: &str, background: &str, dark: bool) -> String {
     let src = escape_attribute(url);
     let scheme = if dark { "dark" } else { "light" };
     let shell = |body_style: &str, body: String| {
-        Page::Html(format!(
+        format!(
             "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"color-scheme\" content=\"{scheme}\">\
              <style>html,body{{margin:0;height:100%;background:{background}}}body{{{body_style}}}</style></head>\
              <body>{body}</body></html>"
-        ))
+        )
     };
     match kind {
-        FileKind::Pdf => Page::Url(format!("{}#navpanes=0&view=FitH", url.split('#').next().unwrap_or(url))),
         FileKind::Video => shell(
             "display:flex;align-items:center;justify-content:center;padding:16px;box-sizing:border-box",
             format!(
@@ -187,65 +255,28 @@ fn document_page(kind: FileKind, url: &str, background: &str, dark: bool) -> Pag
     }
 }
 
-/// `pele` 1.8.0's global build (MIT, `assets/vendor/pele-LICENSE`), the web's Mermaid renderer.
-const PELE_GZ: &[u8] = include_bytes!("../../../assets/vendor/pele-1.8.0.global.js.gz");
-const MERMAID_SCHEME: &str = "t3mermaid";
-#[cfg(windows)]
-const MERMAID_PAGE_URL: &str = "http://t3mermaid.localhost/";
-#[cfg(not(windows))]
-const MERMAID_PAGE_URL: &str = "t3mermaid://localhost/";
-
-fn pele_script() -> &'static [u8] {
-    static SCRIPT: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
-    SCRIPT.get_or_init(|| {
-        let mut out = Vec::new();
-        let _ = std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(PELE_GZ), &mut out);
-        out
-    })
-}
-
-/// The colours pele reads (`.pele` in the web's CSS).
-pub(super) struct DiagramColors {
-    pub background: String,
-    pub foreground: String,
-    pub muted: String,
-    pub surface: String,
-    pub surface_alt: String,
-    pub accent: String,
-    pub critical: String,
-    pub dark: bool,
-}
-
-/// `MermaidViewer`: the diagram, or the web's refusal for sources that could load resources.
-/// The page may run only its own script and load nothing else.
-fn mermaid_page(source: &str, colors: &DiagramColors) -> String {
-    // JSON is valid JavaScript; `<` is escaped so the source cannot close the script.
-    let source = serde_json::to_string(source).unwrap_or_default().replace('<', "\\u003c");
-    let DiagramColors { background, foreground, muted, surface, surface_alt, accent, critical, dark } = colors;
-    let scheme = if *dark { "dark" } else { "light" };
+/// A chat video's page (`ChatMarkdownVideo`): the same element and bridge as the file panel's,
+/// filling an embed sized to the video (see [`crate::app::embed`]), rounded with a faint border on
+/// `background`, letterboxed in `fill`. It reports the video's natural size and pauses when its
+/// row unmounts.
+pub(in crate::app) fn inline_video_page(url: &str, background: &str, border: &str, fill: &str, dark: bool) -> String {
+    use crate::app::embed::{FRAME_CSS, FRAME_SCRIPT};
+    let src = escape_attribute(url);
+    let scheme = if dark { "dark" } else { "light" };
     format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" \
-         content=\"default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:\">\
-         <style>html{{color-scheme:{scheme};background:{background};color:{foreground}}}\
-         body{{margin:0;padding:24px;font:12px system-ui,sans-serif}}#d{{display:flex;justify-content:center}}\
-         #d svg{{max-width:100%;height:auto}}.note{{color:{muted};line-height:1.6}}.error{{color:{critical}}}\
-         .pele{{--pele-bg:{background};--pele-fg:{foreground};--pele-muted:{muted};--pele-line:{muted};\
-         --pele-surface:{surface};--pele-surface-alt:{surface_alt};\
-         --pele-border:color-mix(in srgb,{foreground} 28%,transparent);--pele-accent:{accent};--pele-critical:{critical}}}\
-         </style><script src=\"/pele.js\"></script></head><body><div id=\"d\" class=\"pele\"></div><script>\
-         const source = {source}; const root = document.getElementById('d');\
-         const note = (text, cls) => {{ const p = document.createElement('p'); p.className = cls; p.textContent = text; root.replaceChildren(p); }};\
-         if (/%%\\s*\\{{|^\\s*---|<\\/?[A-Za-z]|<[!?]|@\\s*\\{{|\\b(?:img|image)\\s*:|url\\s*\\(|@import|(?:https?|data|blob|file):/im.test(source)) {{\
-           note('This diagram contains resource URLs, markup, node metadata, or custom configuration. Show Mermaid source to inspect it safely.', 'note');\
-         }} else {{ try {{ pele.mount(root, source.trim(), {{ links: false, images: false, zoom: false, autoDirection: false,\
-           onError: (e) => note('Unable to render diagram: ' + (e && e.message || 'The diagram could not be rendered.'), 'error') }}); }}\
-           catch (e) {{ note('Unable to render diagram: ' + (e && e.message || 'The diagram could not be rendered.'), 'error'); }} }}\
-         </script></body></html>"
+        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"color-scheme\" content=\"{scheme}\">\
+         <style>{FRAME_CSS}html{{background:{background}}}video{{display:block;width:100%;height:100%;\
+         box-sizing:border-box;border:1px solid {border};border-radius:8px;background:{fill};object-fit:contain}}</style></head>\
+         <body><div id=\"t3-embed\"><video id=\"m\" controls playsinline preload=\"metadata\" src=\"{src}\"></video></div>\
+         <script>{FRAME_SCRIPT}{MEDIA_SCRIPT}m.addEventListener('loadedmetadata',()=>\
+         post({{type:'size',w:m.videoWidth,h:m.videoHeight}}));window.t3Hidden=()=>m.pause();</script></body></html>"
     )
 }
 
 const FONT_MAX_BYTES: u64 = 10 * 1024 * 1024;
 const FONT_UNSUPPORTED: &str = "The font is damaged or unsupported.";
+const FONT_TOO_LARGE: &str = "Font previews are limited to 10 MB.";
+
 const FONT_SCHEME: &str = "t3font";
 /// wry serves a custom protocol at `http://<name>.localhost` on Windows and `<name>://localhost` elsewhere.
 #[cfg(windows)]
@@ -317,15 +348,19 @@ pub(super) async fn mint_asset_url(
 impl Workspace {
     /// `workspaceAssetResource`: a draft reads `draft-workspace-file`; a thread reads `kind`
     /// inside the workspace, else the host `media-file`.
-    pub(super) fn asset_resource(&self, key: &FileKey, kind: &'static str) -> Value {
+    /// An attachment reads its `attachment` asset, `None` for a draft not uploaded yet.
+    pub(super) fn asset_resource(&self, key: &FileKey, kind: &'static str) -> Option<Value> {
+        if !key.in_workspace() {
+            return self.attachment_resource(key, false);
+        }
         let absolute = logic::absolute_path(&key.checkout.cwd, &key.path);
-        match &self.target {
+        Some(match &self.target {
             Some(Target::Thread { id: thread_id, .. }) => {
                 let inside = !logic::is_host_path(&key.path);
                 json!({"_tag": if inside { kind } else { "media-file" }, "threadId": thread_id, "path": absolute})
             }
             _ => json!({"_tag": "draft-workspace-file", "cwd": key.checkout.cwd, "path": absolute}),
-        }
+        })
     }
 
     /// The document's view, built on first draw and reloaded when a workspace mutation gives
@@ -338,17 +373,23 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let tokens = *crate::theme::tokens(cx);
-        let mutation = self.files.mutation.clone();
+        let mutation = self.key_mutation(key);
         let documents = &mut self.files.documents;
-        documents.drawn = Some(key.clone());
-        let state = documents.views.entry(key.clone()).or_insert_with(|| DocView::new(kind, mutation.clone(), 0));
+        documents.mark_drawn(key);
+        let state = documents.views.entry(key.clone()).or_insert_with(|| DocView::new(kind, mutation.clone()));
         if state.view.is_none() && state._task.is_none() && state.failed.is_none() {
-            self.start_document(key.clone(), kind, window, cx);
+            match viewer_of(kind) {
+                Some((spec, _)) => self.start_viewer(key.clone(), spec, window, cx),
+                None => self.start_document(key.clone(), kind, window, cx),
+            }
         } else if state.view.is_some() && state.mutation != mutation {
             state.mutation = mutation;
             self.refresh_document(key.clone(), kind, window, cx);
         }
-        let menu = (kind == FileKind::Video).then(|| self.render_media_menu()).flatten();
+        if let Some((_, global)) = viewer_of(kind) {
+            self.sync_viewer_theme(key, global, cx);
+        }
+        let menu = if kind == FileKind::Video { self.render_media_menu(key, window, cx) } else { None };
         let Some(state) = self.files.documents.views.get(key) else { return div().into_any_element() };
         match (&state.view, &state.failed) {
             (Some(view), _) => {
@@ -357,11 +398,11 @@ impl Workspace {
             (None, Some(error)) if kind == FileKind::Font => {
                 super::chrome::no_preview(format!("{error} Save it to open in another app."), &tokens)
             }
-            (None, Some(_)) if kind == FileKind::Video => {
+            (None, Some(_)) if kind == FileKind::Video && key.in_workspace() => {
                 let url = state.url.clone();
                 self.render_video_failure(key, url, menu, &tokens, cx)
             }
-            (None, Some(_)) if kind == FileKind::Audio => {
+            (None, Some(_)) if matches!(kind, FileKind::Audio | FileKind::Video) => {
                 let retry = key.clone();
                 let button = super::chrome::retry_button("document-retry", &tokens).on_click(cx.listener(
                     move |this, _, _, cx| {
@@ -369,7 +410,8 @@ impl Workspace {
                         cx.notify();
                     },
                 ));
-                super::chrome::failure("Unable to load audio.", Some(button), &tokens)
+                let message = if kind == FileKind::Audio { "Unable to load audio." } else { "Unable to load video." };
+                super::chrome::failure(message, Some(button), &tokens)
             }
             (None, Some(_)) => {
                 let retry = key.clone();
@@ -383,8 +425,7 @@ impl Workspace {
                     .text_xs()
                     .child(div().text_color(tokens.error).child(message))
                     .child(
-                        div()
-                            .id("document-retry")
+                        crate::app::chat::focusable(div().id("document-retry"), &tokens)
                             .px(px(10.))
                             .py(px(4.))
                             .rounded(px(6.))
@@ -410,7 +451,7 @@ impl Workspace {
         }
     }
 
-    fn document_resource(&self, key: &FileKey, kind: FileKind) -> Value {
+    fn document_resource(&self, key: &FileKey, kind: FileKind) -> Option<Value> {
         self.asset_resource(key, if kind == FileKind::Html { "workspace-file" } else { "media-file" })
     }
 
@@ -425,7 +466,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let name = logic::file_name(&key.path).to_owned();
-        let (retry, menu_key) = (key.clone(), key.clone());
+        let (retry, menu_key, keyboard_key) = (key.clone(), key.clone(), key.clone());
+        let view = cx.weak_entity();
         let label =
             if name.is_empty() { "Video unavailable".to_owned() } else { format!("Video unavailable · {name}") };
         let open = url.filter(|url| url.starts_with("http:") || url.starts_with("https:")).map(|url| {
@@ -468,6 +510,12 @@ impl Workspace {
                             this.open_media_menu(&menu_key, MediaKind::Video, None, event.position, window, cx);
                         }),
                     )
+                    // Retry and Open in browser take focus; the menu opens from them too.
+                    .on_context_menu_key(move |position, window, cx| {
+                        let _ = view.update(cx, |this, cx| {
+                            this.open_media_menu(&keyboard_key, MediaKind::Video, None, position, window, cx);
+                        });
+                    })
                     .child(
                         h_flex()
                             .gap(px(6.))
@@ -508,6 +556,8 @@ impl Workspace {
                 state.failed = Some("playback".into());
                 cx.notify();
             }
+            // An attachment's video has no `MediaActions` menu (`AttachmentFilePreview`).
+            MediaMessage::Menu { .. } if !key.in_workspace() => {}
             MediaMessage::Menu { x, y } => {
                 let Some(view) = &state.view else { return };
                 let origin = view.read(cx).bounds().origin;
@@ -518,11 +568,19 @@ impl Workspace {
     }
 
     fn start_document(&mut self, key: FileKey, kind: FileKind, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((client, endpoint)) = self.file_connection(&key) else { return };
-        let resource = self.document_resource(&key, kind);
+        // A draft's font is on this machine; every other page loads a signed URL.
+        let local = self.draft_bytes(&key).filter(|_| kind == FileKind::Font);
+        let fetch = match local {
+            Some(bytes) => super::asset::Fetch::Local(bytes),
+            None => {
+                let Some((client, endpoint)) = self.file_connection(&key) else { return };
+                let Some(resource) = self.document_resource(&key, kind) else { return };
+                super::asset::Fetch::Signed { client, http_base: endpoint.http_base, resource }
+            }
+        };
         let tokens = *crate::theme::tokens(cx);
-        let (background, dark) = (css_hex(tokens.background), self.dark_theme(cx));
-        let foreground = css_hex(tokens.foreground);
+        let (background, dark) = (css_color(tokens.background), self.dark_theme(cx));
+        let foreground = css_color(tokens.foreground);
         let request_key = key.clone();
         // A page's popup or `target=_blank` link opens in the system browser.
         let (links, opened) = async_channel::unbounded::<String>();
@@ -545,18 +603,28 @@ impl Workspace {
             })
         });
         let task = cx.spawn_in(window, async move |this, cx| {
-            let minted =
-                mint_asset_url(client, endpoint.http_base, resource).await.map_err(|e| logic::error_message(&e));
-            let font = match (&minted, kind) {
-                (Ok((url, _)), FileKind::Font) => Some(
-                    super::asset::fetch_bounded(url.clone(), FONT_MAX_BYTES, "Font previews are limited to 10 MB.")
-                        .await
-                        .and_then(|bytes| {
-                            font_mime(&bytes).map(|mime| (bytes, mime)).ok_or_else(|| FONT_UNSUPPORTED.to_owned())
-                        }),
-                ),
-                _ => None,
+            let (minted, font) = match fetch {
+                super::asset::Fetch::Local(bytes) => {
+                    let font = super::asset::Fetch::Local(bytes).read(FONT_MAX_BYTES, FONT_TOO_LARGE).await;
+                    (Ok((String::new(), None)), Some(font.map(|(bytes, _)| bytes).map_err(|error| error.to_string())))
+                }
+                super::asset::Fetch::Signed { client, http_base, resource } => {
+                    let minted =
+                        mint_asset_url(client, http_base, resource).await.map_err(|e| logic::error_message(&e));
+                    let font = match (&minted, kind) {
+                        (Ok((url, _)), FileKind::Font) => {
+                            Some(super::asset::fetch_bounded(url.clone(), FONT_MAX_BYTES, FONT_TOO_LARGE).await)
+                        }
+                        _ => None,
+                    };
+                    (minted, font)
+                }
             };
+            let font = font.map(|read| {
+                read.and_then(|bytes| {
+                    font_mime(&bytes).map(|mime| (bytes, mime)).ok_or_else(|| FONT_UNSUPPORTED.to_owned())
+                })
+            });
             let prepared = match (minted, font) {
                 (Ok(_), Some(Err(error))) | (Err(error), _) => Err(error),
                 (Ok((url, revision)), font) => {
@@ -588,8 +656,7 @@ impl Workspace {
                                 })
                                 .with_url(FONT_PAGE_URL)
                         }
-                        (_, Page::Url(url)) => builder.with_url(url),
-                        (_, Page::Html(html)) => builder.with_html(html),
+                        (_, html) => builder.with_html(html),
                     };
                     Ok((builder, revision, loaded))
                 }
@@ -612,7 +679,7 @@ impl Workspace {
     }
 
     /// Builds `key`'s native view from a task: see [`build_view`](crate::app::preview::build_view).
-    fn build_view(
+    pub(super) fn build_view(
         &mut self,
         key: FileKey,
         builder: wry::WebViewBuilder<'static>,
@@ -656,55 +723,31 @@ impl Workspace {
         cx.notify();
     }
 
-    /// A Mermaid file's diagram (`MermaidViewer`), rebuilt when its source changes.
+    /// A Mermaid file's diagram (`MermaidViewer`), or the refusal for a source that could load
+    /// resources; `source` is given when `id` is new. A click expands it.
     pub(super) fn render_mermaid(
         &mut self,
-        key: &FileKey,
-        revision: u64,
+        id: u64,
         source: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let tokens = *crate::theme::tokens(cx);
-        let dark = self.dark_theme(cx);
-        let mutation = self.files.mutation.clone();
-        let documents = &mut self.files.documents;
-        documents.drawn = Some(key.clone());
-        if let Some(source) = source {
-            documents.views.remove(key);
-            let colors = DiagramColors {
-                background: css_hex(tokens.background),
-                foreground: css_hex(tokens.foreground),
-                muted: css_hex(tokens.muted_foreground),
-                surface: css_hex(tokens.secondary),
-                surface_alt: css_hex(tokens.accent),
-                accent: css_hex(tokens.primary),
-                critical: css_hex(tokens.error),
-                dark,
-            };
-            let page = mermaid_page(&source, &colors);
-            let builder = wry::WebViewBuilder::new()
-                .with_custom_protocol(MERMAID_SCHEME.into(), move |_, request| {
-                    let (body, content_type): (Vec<u8>, &str) = if request.uri().path() == "/pele.js" {
-                        (pele_script().to_vec(), "text/javascript")
-                    } else {
-                        (page.clone().into_bytes(), "text/html")
-                    };
-                    wry::http::Response::builder()
-                        .header("content-type", content_type)
-                        .body(std::borrow::Cow::Owned(body))
-                        .unwrap_or_default()
-                })
-                .with_url(MERMAID_PAGE_URL);
-            documents.views.insert(key.clone(), DocView::new(FileKind::Text, mutation, revision));
-            self.build_view(key.clone(), builder, None, window, cx);
+        let (shown, source) = self.file_diagram(id, source, window, cx);
+        if matches!(shown, Shown::Refused) {
+            return div().p(px(24.)).text_xs().text_color(tokens.muted_foreground).child(REFUSAL).into_any_element();
         }
-        match self.files.documents.views.get(key).map(|doc| (&doc.view, &doc.failed)) {
-            Some((Some(view), _)) => div().flex_1().min_h_0().size_full().child(view.clone()).into_any_element(),
-            Some((None, Some(error))) => {
-                super::chrome::failure(format!("Unable to render diagram: {error}"), None, &tokens)
-            }
-            _ => super::chrome::loading(&tokens),
+        let this = cx.entity().downgrade();
+        match crate::app::mermaid::diagram_body(&this, id, &shown, &source, &tokens) {
+            Some(body) => div()
+                .id("mermaid-file")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .p(px(24.))
+                .child(body)
+                .into_any_element(),
+            None => super::chrome::loading(&tokens),
         }
     }
 
@@ -717,9 +760,9 @@ impl Workspace {
             return;
         }
         let Some((client, endpoint)) = self.file_connection(&key) else { return };
-        let resource = self.document_resource(&key, kind);
+        let Some(resource) = self.document_resource(&key, kind) else { return };
         let tokens = *crate::theme::tokens(cx);
-        let (background, dark) = (css_hex(tokens.background), self.dark_theme(cx));
+        let (background, dark) = (css_color(tokens.background), self.dark_theme(cx));
         let request_key = key.clone();
         let task = cx.spawn_in(window, async move |this, cx| {
             let Ok((url, revision)) = mint_asset_url(client, endpoint.http_base, resource).await else { return };
@@ -737,13 +780,12 @@ impl Workspace {
                 if let Some(view) = &state.view {
                     let raw = view.read(cx).raw();
                     // Media keep playing what they play; the new bytes load once playback pauses.
-                    let _ = if matches!(kind, FileKind::Video | FileKind::Audio) {
-                        raw.evaluate_script(&media_adopt_script(&url))
-                    } else {
-                        match document_page(kind, &url, &background, dark) {
-                            Page::Url(url) => raw.load_url(&url),
-                            Page::Html(html) => raw.load_html(&html),
-                        }
+                    // A viewer page reads the new revision itself: a PDF from where the reader is.
+                    let _ = match kind {
+                        FileKind::Video | FileKind::Audio => raw.evaluate_script(&media_adopt_script(&url)),
+                        FileKind::Pdf => raw.evaluate_script(super::pdf::RELOAD_SCRIPT),
+                        FileKind::Office(_) => raw.evaluate_script(super::office::RELOAD_SCRIPT),
+                        _ => raw.load_html(&document_page(kind, &url, &background, dark)),
                     };
                     state.url = Some(url);
                 }
@@ -757,13 +799,20 @@ impl Workspace {
     /// Shows the drawn document's view and hides the rest, after the panel recorded what it
     /// drew; like the browser's views, a GPUI overlay hides it. Views not drawn lately close.
     pub(in crate::app) fn sync_document_views(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settle_file_menu(window, cx);
+        self.sync_viewer_chords(cx);
         let covered = self.browser_covered(window, cx);
+        let dialog_open = window.has_active_dialog(cx);
+        let menu_open = self.files.menu_open;
         let documents = &mut self.files.documents;
         documents.frame += 1;
         let frame = documents.frame;
         let drawn = documents.drawn.take();
+        let dialog = documents.dialog_view(dialog_open).cloned();
         for (key, doc) in &mut documents.views {
-            let drawn = drawn.as_ref() == Some(key);
+            let in_dialog = dialog.as_ref() == Some(key);
+            let in_panel = drawn.as_ref() == Some(key);
+            let drawn = in_panel || in_dialog;
             if drawn {
                 doc.used = frame;
             }
@@ -772,7 +821,8 @@ impl Workspace {
                 let _ = view.read(cx).raw().evaluate_script(MEDIA_PAUSE_SCRIPT);
             }
             doc.drawn = drawn;
-            let shown = drawn && !covered;
+            // The dialog covers the panel, but its own document sits on top of it.
+            let shown = (in_panel && !covered) || (in_dialog && !menu_open);
             if let Some(view) = doc.view.as_ref().filter(|_| doc.shown != shown) {
                 doc.shown = shown;
                 let _ = view.read(cx).set_visible(shown);
@@ -789,11 +839,11 @@ impl Workspace {
     /// `openFileInPreview`: the file's asset URL in a new tab of the integrated browser.
     pub(super) fn open_file_in_browser(&mut self, key: &FileKey, window: &mut Window, cx: &mut Context<Self>) {
         let Some((client, endpoint)) = self.file_connection(key) else { return };
-        let Some(thread_id) = self.preview_thread_id().map(str::to_owned) else { return };
-        let resource = self.asset_resource(key, "workspace-file");
+        let Some(thread) = self.preview_thread() else { return };
+        let Some(resource) = self.asset_resource(key, "workspace-file") else { return };
         cx.spawn_in(window, async move |this, cx| match mint_asset_url(client, endpoint.http_base, resource).await {
             Ok((url, _)) => {
-                let _ = this.update_in(cx, |this, window, cx| this.open_preview_tab(thread_id, Some(url), window, cx));
+                let _ = this.update_in(cx, |this, window, cx| this.open_preview_tab(thread, Some(url), window, cx));
             }
             Err(error) => {
                 let _ = cx.update(|window, cx| {
@@ -816,13 +866,12 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let (Some(client), Some(endpoint)) = (self.client(), self.endpoint().cloned()) else { return };
-        let Some(thread_id) = self.preview_thread_id().map(str::to_owned) else { return };
+        let Some(thread) = self.preview_thread() else { return };
         let inside = crate::app::markdown_ui::workspace_relative(path, self.git_cwd().as_deref()).is_some();
-        let resource =
-            json!({"_tag": if inside { "workspace-file" } else { "media-file" }, "threadId": thread_id, "path": path});
+        let resource = json!({"_tag": if inside { "workspace-file" } else { "media-file" }, "threadId": thread.thread_id, "path": path});
         cx.spawn_in(window, async move |this, cx| match mint_asset_url(client, endpoint.http_base, resource).await {
             Ok((url, _)) => {
-                let _ = this.update_in(cx, |this, window, cx| this.open_preview_tab(thread_id, Some(url), window, cx));
+                let _ = this.update_in(cx, |this, window, cx| this.open_preview_tab(thread, Some(url), window, cx));
             }
             Err(error) => {
                 let _ = cx.update(|window, cx| {
@@ -843,41 +892,27 @@ mod tests {
 
     #[test]
     fn document_pages_follow_the_web_frames() {
-        let Page::Url(pdf) = document_page(FileKind::Pdf, "http://h/a.pdf#x", "#000", true) else { panic!() };
-        assert_eq!(pdf, "http://h/a.pdf#navpanes=0&view=FitH");
-        let Page::Html(html) = document_page(FileKind::Html, "http://h/a?x=1&y=\"2\"", "#000", false) else { panic!() };
+        let html = document_page(FileKind::Html, "http://h/a?x=1&y=\"2\"", "#000", false);
         assert!(html.contains("sandbox=\"allow-scripts allow-forms allow-popups allow-downloads\""));
         assert!(html.contains("src=\"http://h/a?x=1&amp;y=&quot;2&quot;\""), "the URL is escaped");
-        let Page::Html(audio) = document_page(FileKind::Audio, "u", "#123456", true) else { panic!() };
+        let audio = document_page(FileKind::Audio, "u", "#123456", true);
         assert!(audio.contains("<audio id=\"m\" controls") && audio.contains("background:#123456"));
         assert!(audio.contains("window.t3Media") && !audio.contains("contextmenu"), "audio has no media actions");
-        let Page::Html(video) = document_page(FileKind::Video, "u", "#000", true) else { panic!() };
+        let video = document_page(FileKind::Video, "u", "#000", true);
         assert!(video.contains("window.t3Media") && video.contains("'contextmenu'"));
         assert_eq!(media_adopt_script("http://h/a\"b"), r#"window.t3Media&&window.t3Media.adopt("http://h/a\"b")"#);
         assert!(audio.contains("content=\"dark\""));
+        let chat = inline_video_page("http://h/a\"b.mp4", "#fff", "#eee", "#000", false);
+        assert!(chat.contains("src=\"http://h/a&quot;b.mp4\"") && chat.contains("id=\"t3-embed\""));
+        assert!(chat.contains("window.t3Media") && chat.contains("type:'size'") && chat.contains("window.t3Hidden"));
+        assert!(chat.contains("background:#000;object-fit:contain"), "the letterbox fill");
         assert_eq!(resolve_asset_url("http://h:1/", "/api/assets/t/a.pdf"), "http://h:1/api/assets/t/a.pdf");
         assert_eq!(resolve_asset_url("http://h:1", "https://x/y"), "https://x/y");
         assert_eq!(resolve_asset_url("http://h:1", "httpx/y"), "http://h:1/httpx/y", "a path, not a URL");
-        assert_eq!(css_hex(gpui_kit::rgb(0x0a0b0c).into()), "#0a0b0c");
-        assert_eq!(css_hex(gpui_kit::rgba(0xffffff80).into()), "rgba(255,255,255,0.502)");
         assert_eq!(font_mime(b"wOF2...."), Some("font/woff2"));
         assert_eq!(font_mime(&[0, 1, 0, 0, 9]), Some("font/ttf"));
         assert_eq!(font_mime(b"PK\x03\x04"), None);
         assert!(font_specimen("#000", "#fff", true).contains("src:url('/font')"));
-        let colors = DiagramColors {
-            background: "#000".into(),
-            foreground: "#fff".into(),
-            muted: "#888".into(),
-            surface: "#111".into(),
-            surface_alt: "#222".into(),
-            accent: "#00f".into(),
-            critical: "#f00".into(),
-            dark: true,
-        };
-        let page = mermaid_page("graph TD\n A</script><b>x</b>", &colors);
-        assert!(page.contains("const source = \"graph TD\\n A\\u003c/script>\\u003cb>x\\u003c/b>\";"));
-        assert!(page.contains("default-src 'none'") && page.contains("--pele-bg:#000"));
-        assert!(pele_script().starts_with(b"/*! Pele 1.8.0"), "the vendored renderer decompresses");
     }
 
     #[test]

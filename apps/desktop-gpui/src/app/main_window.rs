@@ -3,7 +3,7 @@
 
 use gpui_kit::{
     AnyWindowHandle, App, AppContext as _, Entity, Global, TitlebarOptions, WeakEntity, WindowDecorations,
-    WindowOptions, point, px, size,
+    WindowOptions, px, size,
 };
 
 use super::Workspace;
@@ -29,13 +29,13 @@ pub fn open(cx: &mut App) -> Option<(AnyWindowHandle, Entity<Workspace>)> {
         Some(backend) => backend.restart(),
         None => cx.set_global(PrimaryBackend::start(crate::runtime().handle())),
     }
-    let (x, y) = super::TRAFFIC_LIGHTS;
+    let zoom_level = cx.global::<Desktop>().settings.zoom_level;
     let (min_width, min_height) = desktop::settings::MIN_WINDOW_SIZE;
     let options = WindowOptions {
         titlebar: Some(TitlebarOptions {
             title: Some("T3 Code".into()),
             appears_transparent: true,
-            traffic_light_position: Some(point(px(x), px(y))),
+            traffic_light_position: Some(super::titlebar::traffic_lights(desktop::zoom::factor(zoom_level))),
         }),
         window_bounds: Some(cx.global::<Desktop>().window_bounds(cx)),
         window_min_size: Some(size(px(min_width as f32), px(min_height as f32))),
@@ -47,6 +47,7 @@ pub fn open(cx: &mut App) -> Option<(AnyWindowHandle, Entity<Workspace>)> {
         ..Default::default()
     };
     let opened = gpui_kit::open_window(options, cx, |window, cx| {
+        super::menu::apply_zoom(zoom_level, window, cx);
         crate::theme::sync(window, cx);
         cx.new(|cx| Workspace::new(window, cx))
     });
@@ -84,16 +85,34 @@ pub fn ensure(cx: &mut App) -> Option<(AnyWindowHandle, Entity<Workspace>)> {
     Some((window, workspace))
 }
 
-/// Later launches' command lines ([`desktop::activation`]) and, on macOS, URLs the OS opens
-/// with the app: each brings the main window forward, reopening it if needed, and opens its
-/// app links there.
+/// Later launches' command lines ([`desktop::activation`]): each brings the main window
+/// forward, reopening it if needed, and opens its app links there.
 pub fn receive_launches(launches: async_channel::Receiver<Vec<String>>, cx: &mut App) {
+    deliver(launches, Workspace::receive_launch, cx);
+}
+
+/// URLs macOS opens with the app, which may also be ordinary web pages and HTML files.
+pub fn receive_opened_urls(urls: async_channel::Receiver<Vec<String>>, cx: &mut App) {
+    deliver(urls, Workspace::receive_opened_urls, cx);
+}
+
+/// `t3 app` requests ([`desktop::app_control`]): each brings the main window forward, reopening
+/// it if needed, as the broker's `activate` does. A request that finds no window is answered so.
+pub fn receive_activations(requests: async_channel::Receiver<desktop::app_control::Incoming>, cx: &mut App) {
+    deliver(requests, Workspace::receive_activation, cx);
+}
+
+fn deliver<T: 'static>(
+    receiver: async_channel::Receiver<T>,
+    receive: fn(&mut Workspace, T, &mut gpui_kit::Window, &mut gpui_kit::Context<Workspace>),
+    cx: &mut App,
+) {
     cx.spawn(async move |cx| {
-        while let Ok(args) = launches.recv().await {
+        while let Ok(item) = receiver.recv().await {
             cx.update(|cx| {
                 let Some((window, workspace)) = ensure(cx) else { return };
-                let received = window
-                    .update(cx, |_, window, cx| workspace.update(cx, |this, cx| this.receive_launch(args, window, cx)));
+                let received =
+                    window.update(cx, |_, window, cx| workspace.update(cx, |this, cx| receive(this, item, window, cx)));
                 if let Err(error) = received {
                     log::warn!("a later launch could not reach the window: {error:#}");
                 }

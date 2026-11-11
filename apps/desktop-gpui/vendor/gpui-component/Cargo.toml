@@ -275,6 +275,9 @@ version = "0.4.38"
 [dependencies.enum-iterator]
 version = "2.1.0"
 
+[dependencies.fancy-regex]
+version = "0.20.1"
+
 [dependencies.gpui]
 version = "=0.3.11"
 package = "gpui-pre"

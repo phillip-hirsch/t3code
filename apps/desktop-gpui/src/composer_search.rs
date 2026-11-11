@@ -3,7 +3,7 @@
 //! (`components/chat/composerSlashCommandSearch.ts`) and `scoreQueryMatch`
 //! (`packages/shared/src/searchRanking.ts`).
 
-use crate::model::{Provider, ProviderSkill, SlashCommand};
+use crate::model::{Provider, ProviderModel, ProviderSkill, SlashCommand};
 
 /// One row of the `@` / `$` / `/` menu.
 #[derive(Clone, Debug, PartialEq)]
@@ -31,8 +31,6 @@ pub enum MenuAction {
     },
     /// `/model` opens the model picker.
     Model,
-    /// `/plan` or `/default` switches the interaction mode.
-    Mode(&'static str),
     /// `/clear` arms a fresh session for the next message.
     Clear,
     /// `/side` or `/btw` puts its command at the prompt start, ready to send as a side chat.
@@ -41,6 +39,14 @@ pub enum MenuAction {
     Environment {
         environment_id: String,
         machine: String,
+    },
+    /// `#` a pull request: a review-comment reference to it.
+    PullRequest(Box<crate::pull_request_completions::Reference>),
+    /// `@` a model: names it for the agent, as `model:<instance>/<model>`.
+    ModelMention {
+        instance_id: String,
+        model: String,
+        driver: String,
     },
 }
 
@@ -197,8 +203,7 @@ pub fn skill_items(skills: &[ProviderSkill], query: &str) -> Vec<MenuItem> {
     skills.into_iter().map(|s| skill_item(s, display_name(s).to_owned(), "Run provider skill")).collect()
 }
 
-/// The `/` menu: `/model`, `/plan` and `/default` while plan mode is on, `/side` and `/btw`
-/// where side chats are available, `/clear` where a fresh session can start, then the
+/// The `/` menu: `/model`, `/side` and `/btw` where side chats are available, `/clear` where a fresh session can start, then the
 /// provider's commands, then skills as `/skill:name`. `side_chat` is `None` where side chats
 /// aren't available, else why one can't start yet. Provider commands, `/side`, `/btw` and
 /// `/clear` work only at the very start of the prompt.
@@ -207,7 +212,6 @@ pub fn slash_items(
     commands: &[SlashCommand],
     query: &str,
     at_start: bool,
-    plan_mode: bool,
     side_chat: Option<Option<&str>>,
     fresh_session: bool,
 ) -> Vec<MenuItem> {
@@ -218,20 +222,6 @@ pub fn slash_items(
         description: "Switch response model for this thread".into(),
         action: MenuAction::Model,
     }];
-    if plan_mode {
-        items.extend(
-            [
-                ("plan", "Switch this thread into plan mode"),
-                ("default", "Switch this thread back to normal build mode"),
-            ]
-            .map(|(mode, description)| MenuItem {
-                id: format!("slash:{mode}"),
-                label: format!("/{mode}"),
-                description: description.into(),
-                action: MenuAction::Mode(mode),
-            }),
-        );
-    }
     if let (true, Some(reason)) = (at_start, side_chat) {
         items.extend([("side", "Ask a side question in a new side chat"), ("btw", "Same as /side")].map(
             |(command, description)| MenuItem {
@@ -302,15 +292,37 @@ pub fn slash_items(
         },
         |item| match &item.action {
             MenuAction::Model => "0\0model".into(),
-            MenuAction::Mode(mode) => format!("0\0{mode}"),
             MenuAction::Clear => "0\0clear".into(),
             MenuAction::SideChat(command) => format!("0\0{command}"),
             MenuAction::Command { name } => format!("1\0{name}"),
             MenuAction::Skill { name, .. } => format!("2\0{name}"),
             MenuAction::File { path, .. } => path.clone(),
             MenuAction::Environment { environment_id, .. } => environment_id.clone(),
+            MenuAction::PullRequest(reference) => reference.url.clone(),
+            MenuAction::ModelMention { instance_id, model, .. } => format!("{instance_id}/{model}"),
         },
     )
+}
+
+/// `matchComposerModelItems`: the models an `@` query names, labelled as the picker names them
+/// and described by their sub-provider, else their provider.
+pub fn model_items(candidates: &[(&Provider, &ProviderModel)], query: &str) -> Vec<MenuItem> {
+    crate::model_label::rank_mentions(candidates, query)
+        .into_iter()
+        .map(|(provider, model)| MenuItem {
+            id: format!("model:{}:{}", provider.instance_id, model.slug),
+            label: crate::model_label::display_model_name(model),
+            description: model
+                .sub_provider
+                .clone()
+                .unwrap_or_else(|| crate::model_label::provider_name(provider).to_owned()),
+            action: MenuAction::ModelMention {
+                instance_id: provider.instance_id.clone(),
+                model: model.slug.clone(),
+                driver: provider.driver.clone(),
+            },
+        })
+        .collect()
 }
 
 /// A `projects.searchEntries` result as menu rows: basename, then parent folder.
@@ -401,42 +413,33 @@ mod tests {
         let commands: Vec<SlashCommand> =
             serde_json::from_value(json!([{"name": "compact", "description": "Summarize"}, {"name": "review"}]))
                 .unwrap();
-        let all = slash_items(&skills, &commands, "", true, false, None, false);
+        let all = slash_items(&skills, &commands, "", true, None, false);
         assert_eq!(
             labels(&all),
             ["/model", "/compact", "/skill:review", "/skill:deploy-app"],
             "skills shadow commands"
         );
         assert_eq!(
-            labels(&slash_items(&skills, &commands, "", false, false, None, false)),
+            labels(&slash_items(&skills, &commands, "", false, None, false)),
             ["/model", "/skill:review", "/skill:deploy-app"]
         );
-        assert_eq!(labels(&slash_items(&skills, &commands, "/com", true, false, None, false)), ["/compact"]);
-        assert_eq!(
-            labels(&slash_items(&skills, &commands, "skill:dep", true, false, None, false)),
-            ["/skill:deploy-app"]
-        );
-        assert_eq!(
-            labels(&slash_items(&[], &commands, "", false, true, None, false)),
-            ["/model", "/plan", "/default"],
-            "plan mode adds its commands anywhere in the prompt"
-        );
-        assert_eq!(labels(&slash_items(&[], &commands, "pla", true, true, None, false)), ["/plan"]);
+        assert_eq!(labels(&slash_items(&skills, &commands, "/com", true, None, false)), ["/compact"]);
+        assert_eq!(labels(&slash_items(&skills, &commands, "skill:dep", true, None, false)), ["/skill:deploy-app"]);
         let with_clear: Vec<SlashCommand> = serde_json::from_value(json!([{"name": "clear"}])).unwrap();
         assert_eq!(
-            labels(&slash_items(&[], &with_clear, "", true, false, None, true)),
+            labels(&slash_items(&[], &with_clear, "", true, None, true)),
             ["/model", "/clear"],
             "T3's /clear replaces the provider's"
         );
-        assert_eq!(labels(&slash_items(&[], &with_clear, "", false, false, None, true)), ["/model"]);
-        assert_eq!(labels(&slash_items(&[], &with_clear, "", true, false, None, false)), ["/model", "/clear"]);
+        assert_eq!(labels(&slash_items(&[], &with_clear, "", false, None, true)), ["/model"]);
+        assert_eq!(labels(&slash_items(&[], &with_clear, "", true, None, false)), ["/model", "/clear"]);
         assert_eq!(
-            labels(&slash_items(&[], &with_clear, "", true, true, Some(None), true)),
-            ["/model", "/plan", "/default", "/side", "/btw", "/clear"],
-            "side chats list after the mode commands"
+            labels(&slash_items(&[], &with_clear, "", true, Some(None), true)),
+            ["/model", "/side", "/btw", "/clear"],
+            "side chats list after /model"
         );
-        assert_eq!(labels(&slash_items(&[], &[], "", false, false, Some(None), false)), ["/model"]);
-        let pending = slash_items(&[], &[], "bt", true, false, Some(Some("Not yet.")), false);
+        assert_eq!(labels(&slash_items(&[], &[], "", false, Some(None), false)), ["/model"]);
+        let pending = slash_items(&[], &[], "bt", true, Some(Some("Not yet.")), false);
         assert_eq!(labels(&pending), ["/btw"]);
         assert_eq!(pending[0].description, "Not yet.", "the reason replaces the description");
     }

@@ -22,7 +22,7 @@ pub(super) const CAPTURE_CONTEXT: &str = "KeybindingCapture";
 /// The browser surface and its chrome (`[data-preview-panel-mode]`).
 pub(super) const PREVIEW_CONTEXT: &str = "PreviewPanel";
 const TERMINAL_CONTEXT: &str = "Terminal";
-const INPUT_CONTEXT: &str = "Input";
+pub(super) const INPUT_CONTEXT: &str = "Input";
 /// An open combobox: the palette or a project picker (`[role="combobox"][aria-expanded="true"]`).
 pub(super) const COMBOBOX_CONTEXT: &str = "Combobox";
 pub(super) const MAC: bool = cfg!(target_os = "macos");
@@ -107,7 +107,7 @@ fn web_key(key: &str) -> &str {
 
 /// `US_SHIFTED_TO_UNSHIFTED_KEYS`: GPUI on Windows reports Shift+4 as `$` with Shift
 /// consumed, where the web still sees `Digit4` with Shift held.
-fn unshifted(key: &str) -> Option<&'static str> {
+pub(super) fn unshifted(key: &str) -> Option<&'static str> {
     const PAIRS: [(&str, &str); 21] = [
         ("!", "1"),
         ("@", "2"),
@@ -208,22 +208,122 @@ fn resolve_on<'a>(rules: &'a [Rule], keystroke: &Keystroke, context: &ShortcutCo
         .filter(|command| !(context.combobox_focus && *command == "thread.pin"))
 }
 
-/// `effectiveShortcutsForCommand(…)[0]`: the command's newest shortcut no later rule claims.
-fn effective_shortcut(rules: &[Rule], command: &str, context: &ShortcutContext, mac: bool) -> Option<Shortcut> {
-    let normalize =
-        |s: &Shortcut| (s.meta_key || (s.mod_key && mac), s.ctrl_key || (s.mod_key && !mac), s.shift_key, s.alt_key);
-    let mut claimed: Vec<std::borrow::Cow<'_, Shortcut>> = Vec::new();
-    for rule in rules.iter().rev().filter(|rule| context.admits(rule)) {
+/// `effectiveShortcutsForCommand`: the command's shortcuts no later rule claims, newest first.
+fn effective_shortcuts<'a>(
+    rules: &'a [Rule],
+    command: &'a str,
+    context: &'a ShortcutContext,
+    mac: bool,
+) -> impl Iterator<Item = Shortcut> + 'a {
+    let normalize = move |s: &Shortcut| {
+        (s.meta_key || (s.mod_key && mac), s.ctrl_key || (s.mod_key && !mac), s.shift_key, s.alt_key)
+    };
+    let mut claimed: Vec<std::borrow::Cow<'a, Shortcut>> = Vec::new();
+    rules.iter().rev().filter(|rule| context.admits(rule)).filter_map(move |rule| {
         let shortcut = shortcut_for_context(rule, context);
         if claimed.iter().any(|seen| seen.key == shortcut.key && normalize(seen) == normalize(&shortcut)) {
-            continue;
+            return None;
         }
-        if rule.command == command {
-            return Some(shortcut.into_owned());
-        }
+        let effective = (rule.command == command).then(|| shortcut.clone().into_owned());
         claimed.push(shortcut);
+        effective
+    })
+}
+
+/// `effectiveShortcutsForCommand(…)[0]`.
+fn effective_shortcut(rules: &[Rule], command: &str, context: &ShortcutContext, mac: bool) -> Option<Shortcut> {
+    effective_shortcuts(rules, command, context, mac).next()
+}
+
+/// `PREVIEW_FORWARDED_COMMANDS`: the shell commands a focused browser page hands back to the app
+/// (`ReopenClosedViewShortcut.tsx`), after `view.reopenClosed` while there are closed views.
+pub(super) const PAGE_FORWARDED_COMMANDS: [&str; 6] = [
+    "workspace.focusNext",
+    "workspace.focusPrevious",
+    "sidebar.toggle",
+    "rightPanel.toggle",
+    "rightPanel.toggleMaximized",
+    "preview.focusUrl",
+];
+
+/// `PreviewForwardedShortcut`, with `mod` resolved to the platform's modifier for the page.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub(super) struct PageChord<C = &'static str> {
+    pub command: C,
+    pub key: String,
+    pub meta: bool,
+    pub ctrl: bool,
+    pub shift: bool,
+    pub alt: bool,
+}
+
+/// The chords a focused browser page forwards, resolved as the web registers them: the preview
+/// focused and open, the terminal as it is, nothing else focused.
+pub(super) fn page_chords(rules: &[Rule], terminal_open: bool, closed_views: bool) -> Vec<PageChord> {
+    page_chords_on(rules, terminal_open, closed_views, MAC)
+}
+
+fn page_chords_on(rules: &[Rule], terminal_open: bool, closed_views: bool, mac: bool) -> Vec<PageChord> {
+    let context = &ShortcutContext { preview_focus: true, preview_open: true, terminal_open, ..Default::default() };
+    closed_views
+        .then_some("view.reopenClosed")
+        .into_iter()
+        .chain(PAGE_FORWARDED_COMMANDS)
+        .flat_map(|command| effective_shortcuts(rules, command, context, mac).map(move |s| page_chord(command, s, mac)))
+        .collect()
+}
+
+fn page_chord<C>(command: C, s: Shortcut, mac: bool) -> PageChord<C> {
+    PageChord {
+        command,
+        meta: s.meta_key || (s.mod_key && mac),
+        ctrl: s.ctrl_key || (s.mod_key && !mac),
+        shift: s.shift_key,
+        alt: s.alt_key,
+        key: s.key,
     }
-    None
+}
+
+/// What a file viewer page keeps with `mod` alone: the PDF's Find, and copying, selecting and
+/// editing in its fields.
+const VIEWER_KEYS: [&str; 6] = ["a", "c", "f", "v", "x", "z"];
+
+/// The chords a focused file viewer page (PDF, Office) hands back. The web's viewers sit in its
+/// DOM, where the shell's shortcuts reach the app as `context` resolves them (project scripts from
+/// `scripts`, as [`resolve_chat`] does); a page forwards those with Cmd, Ctrl, a function key, or
+/// Alt on a named key such as an arrow, which type no text, but the viewer's own.
+pub(super) fn viewer_chords(primary: &[Rule], scripts: &[Rule], context: &ShortcutContext) -> Vec<PageChord<String>> {
+    viewer_chords_on(primary, scripts, context, MAC)
+}
+
+fn viewer_chords_on(
+    primary: &[Rule],
+    scripts: &[Rule],
+    context: &ShortcutContext,
+    mac: bool,
+) -> Vec<PageChord<String>> {
+    let mut commands: Vec<(&[Rule], &str)> = Vec::new();
+    for (rules, scripted) in [(primary, false), (scripts, true)] {
+        for rule in rules {
+            let command = rule.command.as_str();
+            if script_id(command).is_some() == scripted && !commands.iter().any(|(_, known)| *known == command) {
+                commands.push((rules, command));
+            }
+        }
+    }
+    let function = |key: &str| key.strip_prefix('f').is_some_and(|n| n.parse::<u8>().is_ok());
+    // Alt on a character key types one (Option+G is ©, AltGr letters).
+    let named = |key: &str| key.chars().count() > 1;
+    commands
+        .into_iter()
+        .flat_map(|(rules, command)| {
+            effective_shortcuts(rules, command, context, mac).map(move |s| page_chord(command.to_owned(), s, mac))
+        })
+        .filter(|c| {
+            let own = (c.meta, c.ctrl, c.shift, c.alt) == (mac, !mac, false, false) && VIEWER_KEYS.contains(&&*c.key);
+            (c.meta || c.ctrl || function(&c.key) || (c.alt && named(&c.key))) && !own
+        })
+        .collect()
 }
 
 /// `formatShortcutKeyLabel`.
@@ -569,6 +669,90 @@ mod tests {
         let shortcut = compile("mod+shift+arrowup", "x", None).unwrap().shortcut;
         assert_eq!(format_label(&shortcut, true), "\u{21e7}\u{2318}Up");
         assert_eq!(format_label(&compile("esc", "x", None).unwrap().shortcut, false), "Esc");
+    }
+
+    #[test]
+    fn pages_forward_the_shell_chords_the_keymap_resolves() {
+        let chord =
+            |command, key: &str, ctrl, shift, alt, meta| PageChord { command, key: key.into(), meta, ctrl, shift, alt };
+        assert_eq!(
+            page_chords_on(defaults(), false, false, false),
+            [
+                chord("workspace.focusNext", "f6", true, false, false, false),
+                chord("workspace.focusNext", "f6", false, false, false, false),
+                chord("workspace.focusPrevious", "f6", true, true, false, false),
+                chord("workspace.focusPrevious", "f6", false, true, false, false),
+                chord("sidebar.toggle", "b", true, false, false, false),
+                chord("rightPanel.toggle", "b", true, false, true, false),
+                chord("preview.focusUrl", "l", true, false, false, false),
+            ],
+            "every shortcut of each command, with `mod` as Ctrl; nothing binds toggleMaximized"
+        );
+        let mac = page_chords_on(defaults(), false, false, true);
+        assert!(mac.contains(&chord("sidebar.toggle", "b", false, false, false, true)), "`mod` is Cmd on macOS");
+
+        let custom = merge_with_defaults(&[
+            compile("mod+shift+m", "rightPanel.toggleMaximized", None).unwrap(),
+            compile("mod+l", "usage.open", None).unwrap(),
+            compile("mod+alt+s", "sidebar.toggle", Some("terminalOpen")).unwrap(),
+        ]);
+        let commands = |terminal_open| {
+            page_chords_on(&custom, terminal_open, false, false)
+                .into_iter()
+                .map(|chord| (chord.command, chord.key))
+                .collect::<Vec<_>>()
+        };
+        let closed = commands(false);
+        assert!(closed.contains(&("rightPanel.toggleMaximized", "m".into())), "a user binding joins the set");
+        assert!(!closed.iter().any(|(command, _)| *command == "preview.focusUrl"), "a later rule claims its chord");
+        assert!(!closed.contains(&("sidebar.toggle", "s".into())), "its condition needs an open terminal");
+        assert!(commands(true).contains(&("sidebar.toggle", "s".into())));
+        // Reopen Closed Tab forwards only while there is something to reopen.
+        assert_eq!(
+            page_chords_on(defaults(), false, true, false).first(),
+            Some(&chord("view.reopenClosed", "t", true, true, false, false))
+        );
+    }
+
+    #[test]
+    fn viewer_pages_forward_shell_chords_but_their_own() {
+        let rest = ShortcutContext::default();
+        let chord = |command: &str, key: &str, ctrl, shift, alt, meta| PageChord {
+            command: command.to_owned(),
+            key: key.into(),
+            meta,
+            ctrl,
+            shift,
+            alt,
+        };
+        let chords = viewer_chords_on(defaults(), &[], &rest, false);
+        assert!(chords.contains(&chord("commandPalette.toggle", "k", true, false, false, false)));
+        assert!(chords.contains(&chord("thread.next", "]", true, true, false, false)));
+        assert!(chords.contains(&chord("projectSearch.toggle", "f", true, true, false, false)));
+        assert!(
+            chords.contains(&chord("workspace.focusNext", "f6", false, false, false, false)),
+            "F-keys type nothing"
+        );
+        assert!(!chords.iter().any(|c| c.command == "chat.find"), "Mod+F opens the PDF's own find");
+        assert!(!chords.iter().any(|c| c.command == "thread.undo"), "Mod+Z undoes in the find field");
+        assert!(!chords.iter().any(|c| c.command == "terminal.split"), "its condition does not hold");
+        let mac = viewer_chords_on(defaults(), &[], &rest, true);
+        assert!(mac.contains(&chord("commandPalette.toggle", "k", false, false, false, true)), "`mod` is Cmd");
+
+        let primary = merge_with_defaults(&[
+            compile("g", "chat.new", None).unwrap(),
+            compile("mod+shift+r", "script.lint.run", None).unwrap(),
+            compile("alt+arrowleft", "navigation.back", None).unwrap(),
+            compile("alt+g", "chat.newLocal", None).unwrap(),
+        ]);
+        let scripts = [compile("mod+shift+y", "script.build.run", None).unwrap()];
+        let commands: Vec<_> =
+            viewer_chords_on(&primary, &scripts, &rest, false).into_iter().map(|c| (c.command, c.key)).collect();
+        assert!(!commands.contains(&("chat.new".into(), "g".into())), "a plain key stays the page's text");
+        assert!(commands.contains(&("navigation.back".into(), "arrowleft".into())), "Alt on a key that types nothing");
+        assert!(!commands.contains(&("chat.newLocal".into(), "g".into())), "Alt on a letter types text (Option+G)");
+        assert!(commands.contains(&("script.build.run".into(), "y".into())), "the environment's project scripts");
+        assert!(!commands.iter().any(|(command, _)| command == "script.lint.run"), "the primary binds no script");
     }
 
     #[test]

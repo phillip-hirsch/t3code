@@ -1,0 +1,65 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self' blob: data:; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'none'; form-action 'none'"
+    />
+    <style id="theme">
+      {{theme}}
+    </style>
+    <link rel="stylesheet" href="/viewer.css" />
+    <script type="application/json" id="state">
+      {{state}}
+    </script>
+    <script type="module" src="/viewer.mjs"></script>
+  </head>
+  <body>
+    <div class="toolbar">
+      <span class="page-label" id="page-label" aria-live="polite">PDF</span>
+      <button type="button" class="action" id="previous" aria-label="Previous page" disabled>
+        <svg viewBox="0 0 24 24"><path d="m18 15-6-6-6 6" /></svg>
+      </button>
+      <button type="button" class="action" id="next" aria-label="Next page" disabled>
+        <svg viewBox="0 0 24 24"><path d="m6 9 6 6 6-6" /></svg>
+      </button>
+      <button type="button" class="action" id="zoom-out" aria-label="Zoom out">
+        <svg viewBox="0 0 24 24"><path d="M5 12h14" /></svg>
+      </button>
+      <span class="zoom-label" id="zoom-label">Fit width</span>
+      <button type="button" class="action" id="zoom-in" aria-label="Zoom in">
+        <svg viewBox="0 0 24 24">
+          <path d="M5 12h14" />
+          <path d="M12 5v14" />
+        </svg>
+      </button>
+      <button type="button" class="action" id="fit" aria-label="Fit width">
+        <svg viewBox="0 0 24 24">
+          <path d="M3 7V5a2 2 0 0 1 2-2h2" />
+          <path d="M17 3h2a2 2 0 0 1 2 2v2" />
+          <path d="M21 17v2a2 2 0 0 1-2 2h-2" />
+          <path d="M7 21H5a2 2 0 0 1-2-2v-2" />
+        </svg>
+      </button>
+      <span class="find">
+        <input id="find" type="search" aria-label="Find in PDF" placeholder="Find in PDF" />
+      </span>
+      <span id="find-status" role="status" hidden></span>
+      <button type="button" class="action" id="next-match" aria-label="Next matching page" hidden>
+        <svg viewBox="0 0 24 24"><path d="m6 9 6 6 6-6" /></svg>
+      </button>
+    </div>
+    <div class="scroll" id="scroll" role="region" tabindex="0">
+      <div class="loading" id="loading" role="status" aria-label="Loading file">
+        <svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-6.219-8.56" /></svg>
+      </div>
+      <div class="failure" id="failure" role="alert" hidden>
+        <p id="failure-message"></p>
+        <button type="button" id="retry">Try again</button>
+      </div>
+      <div class="pages" id="pages" hidden></div>
+    </div>
+    <div class="tooltip" id="tooltip" role="tooltip" hidden></div>
+  </body>
+</html>

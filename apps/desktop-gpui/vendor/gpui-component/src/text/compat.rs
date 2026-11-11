@@ -173,6 +173,14 @@ impl TextView {
         self.inner = self.inner.code_block_actions(f);
         self
     }
+    /// Draws chosen code blocks another way, or `None` to draw them as usual.
+    pub fn code_block_renderer<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&CodeBlock, &mut Window, &mut App) -> Option<AnyElement> + Send + Sync + 'static,
+    {
+        self.inner = self.inner.code_block_renderer(f);
+        self
+    }
     /// Renders an element in the corner of every table.
     pub fn table_actions<F, E>(mut self, f: F) -> Self
     where
@@ -188,6 +196,23 @@ impl TextView {
         F: Fn(&SharedString, &ClickEvent, &mut Window, &mut App) + Send + Sync + 'static,
     {
         self.inner = self.inner.on_link_click(f);
+        self
+    }
+    /// Reports the link under the pointer, `None` once it leaves; see
+    /// gpui-base's `TextView::on_link_hover`.
+    pub fn on_link_hover<F>(mut self, f: F) -> Self
+    where
+        F: Fn(Option<super::LinkHover>, &mut Window, &mut App) + Send + Sync + 'static,
+    {
+        self.inner = self.inner.on_link_hover(f);
+        self
+    }
+    /// Makes images outside links focusable and clickable, with the image's URL.
+    pub fn on_image_click<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&gpui::SharedUri, &mut Window, &mut App) + Send + Sync + 'static,
+    {
+        self.inner = self.inner.on_image_click(f);
         self
     }
     /// Makes task list checkboxes toggle, with the item's source offset and

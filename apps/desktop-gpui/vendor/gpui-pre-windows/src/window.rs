@@ -60,6 +60,8 @@ pub struct WindowsWindowState {
     pub pending_surrogate: Cell<Option<u16>>,
     pub last_reported_modifiers: Cell<Option<Modifiers>>,
     pub last_reported_capslock: Cell<Option<Capslock>>,
+    /// What the last key message said about its key besides the keystroke.
+    pub last_native_key: Cell<NativeKey>,
     pub hovered: Cell<bool>,
     pub last_visibility: Cell<Option<WindowVisibility>>,
     pub direct_manipulation: DirectManipulationHandler,
@@ -176,6 +178,7 @@ impl WindowsWindowState {
             pending_surrogate: Cell::new(pending_surrogate),
             last_reported_modifiers: Cell::new(last_reported_modifiers),
             last_reported_capslock: Cell::new(last_reported_capslock),
+            last_native_key: Cell::new(NativeKey::default()),
             hovered: Cell::new(hovered),
             last_visibility: Cell::new(None),
             renderer: RefCell::new(renderer),
@@ -710,6 +713,10 @@ impl PlatformWindow for WindowsWindow {
 
     fn capslock(&self) -> Capslock {
         current_capslock()
+    }
+
+    fn native_key(&self) -> NativeKey {
+        self.state.last_native_key.get()
     }
 
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler) {

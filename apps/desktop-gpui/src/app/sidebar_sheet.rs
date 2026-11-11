@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use gpui_kit::base::FocusTrapElement as _;
 use gpui_kit::{
     AnyElement, AnyView, Context, InteractiveElement as _, IntoElement as _, MouseButton, ParentElement as _, Pixels,
-    Styled as _, Window, div,
+    Styled as _, Window, div, px,
 };
 
 use super::Workspace;
@@ -190,6 +190,10 @@ impl Workspace {
     }
 
     pub(super) fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        // The Welcome page has no sidebar, and a hidden one would still save the toggle.
+        if self.welcome_open() {
+            return;
+        }
         if let (Some(docked), Some(path)) = (self.sidebar_open.toggle(), docked_path()) {
             write_docked(&path, docked);
         }
@@ -197,11 +201,10 @@ impl Workspace {
         cx.notify();
     }
 
-    /// The sidebar as a `Sheet` from the left; a press anywhere else closes it.
-    /// Electron sizes the sheet to its content: `SIDEBAR_WIDTH_MOBILE` puts `--spacing(3)` in an
-    /// inline style, where it is invalid, so the popup's width falls back to `auto`.
+    /// The sidebar as a `Sheet` from the left; a press anywhere else closes it. It is the
+    /// window's width less 12 px (`SIDEBAR_WIDTH_MOBILE`), whatever its content.
     pub(super) fn render_sidebar_sheet(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if !self.sidebar_open.sheet() {
+        if !self.sidebar_open.sheet() || self.welcome_open() {
             return None;
         }
         let sheet = AnyView::from(self.sidebar_view.clone());
@@ -228,7 +231,7 @@ impl Workspace {
                         .top_0()
                         .left_0()
                         .bottom_0()
-                        .max_w(window.viewport_size().width)
+                        .w(px((f32::from(window.viewport_size().width) - 12.).max(0.)))
                         .occlude()
                         .shadow_lg()
                         .focus_trap("sidebar-sheet-trap", &self.sheet_trap)

@@ -52,6 +52,10 @@ pub struct SearchItem {
     pub wsl_available_only: bool,
     pub managed_tunnel_only: bool,
     pub peer_links_only: bool,
+    /// Offered only while some connected environment can clone worktrees from a cached checkout.
+    pub fast_worktree_checkout_only: bool,
+    /// Offered only while some environment has no provider allow-list, which hides text generators.
+    pub text_generators_only: bool,
 }
 
 pub fn contract() -> &'static Contract {
@@ -183,6 +187,9 @@ const THEME_ID_KEY: &str = "themeId";
 const THEME_HALVES_KEY: &str = "themeHalves";
 /// `t3code:themes:v1`: the saved themes.
 const CUSTOM_THEMES_KEY: &str = "customThemes";
+/// `t3code:default-theme-applied:v2:<environment>`: each environment's default theme
+/// generation this device adopted, as `{ environmentId: generation }`.
+const DEFAULT_THEME_APPLIED_KEY: &str = "defaultThemeApplied";
 /// `t3code:typography-advanced`: prompt, code and terminal fonts set separately.
 pub const TYPOGRAPHY_ADVANCED_KEY: &str = "typographyAdvanced";
 
@@ -268,6 +275,8 @@ impl ClientSettings {
         if !matches!(self.stored_themes, StoredThemes::Ready(_)) {
             return Err(LIBRARY_READ_ERROR.to_owned());
         }
+        // The published palettes are the feed's, not the caller's copy of them.
+        let themes = themes.with_published(self.themes.published().clone());
         let previous_themes = std::mem::replace(&mut self.themes, themes);
         let previous_choice = (self.theme, self.theme_id.take(), std::mem::take(&mut self.theme_halves));
         (self.theme, self.theme_id, self.theme_halves) = (choice.mode, choice.base, choice.halves);
@@ -286,9 +295,33 @@ impl ClientSettings {
         self.save_or_warn();
     }
 
+    /// The default theme generation this device last adopted from `environment_id`.
+    pub fn applied_default_theme(&self, environment_id: &str) -> Option<&str> {
+        self.values.get(DEFAULT_THEME_APPLIED_KEY).get(environment_id)?.as_str()
+    }
+
+    /// Stores an adopted default theme with its generation, so it applies once.
+    pub fn adopt_default_theme(&mut self, choice: ThemeChoice, environment_id: &str, generation: String) {
+        let mut applied = self.values.get(DEFAULT_THEME_APPLIED_KEY).as_object().cloned().unwrap_or_default();
+        applied.insert(environment_id.to_owned(), generation.into());
+        self.values.set(DEFAULT_THEME_APPLIED_KEY, Value::Object(applied));
+        self.set_theme_choice(choice);
+    }
+
     pub fn apply(&mut self, patch: &Map<String, Value>) {
         self.values.apply(patch);
         self.save_or_warn();
+    }
+
+    /// [`Self::apply`], keeping the old values when the file can't be written.
+    pub fn try_apply(&mut self, patch: &Map<String, Value>) -> std::io::Result<()> {
+        let previous = self.values.clone();
+        self.values.apply(patch);
+        let saved = self.save();
+        if saved.is_err() {
+            self.values = previous;
+        }
+        saved
     }
 
     fn document(&self) -> Value {
@@ -475,6 +508,15 @@ mod tests {
         assert_eq!(reloaded.values.get("timestampFormat"), "24-hour");
         assert_eq!(reloaded.theme, ThemePreference::Dark);
         assert_eq!(reloaded.theme_choice(), choice);
+
+        let mut adopted = settings.theme_choice();
+        assert!(adopted.adopt("ember"));
+        settings.adopt_default_theme(adopted, "env-a", "ember@1".into());
+        let raw: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let reloaded = ClientSettings::from_stored(&raw, None);
+        assert_eq!((reloaded.theme_id.as_deref(), &reloaded.theme_halves), (Some("ember"), &ThemeHalves::default()));
+        assert_eq!(reloaded.applied_default_theme("env-a"), Some("ember@1"));
+        assert_eq!(reloaded.applied_default_theme("env-b"), None, "each environment's generation is its own");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -539,6 +581,24 @@ mod tests {
         assert!(settings.set_themes(themes, choice).is_err());
         assert!(settings.themes.custom().is_empty());
         assert_eq!(settings.theme_id, None);
+        std::fs::remove_dir_all(blocker.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_setting_that_must_land_reports_a_failed_write_and_keeps_the_old_value() {
+        let patch = Map::from_iter([("onboardingCompletedAt".to_owned(), json!("2026-11-09T00:00:00.000Z"))]);
+        let path = scratch("must-land");
+        let mut settings = ClientSettings::load_from(Some(path.clone()));
+        settings.try_apply(&patch).unwrap();
+        let reread = ClientSettings::load_from(Some(path.clone()));
+        assert_eq!(reread.values.get("onboardingCompletedAt"), &json!("2026-11-09T00:00:00.000Z"), "saved to disk");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+
+        let blocker = scratch("must-land-fails");
+        std::fs::write(&blocker, "").unwrap();
+        let mut settings = ClientSettings::from_stored(&json!({}), Some(blocker.join("client-settings.json")));
+        assert!(settings.try_apply(&patch).is_err());
+        assert!(settings.values.get("onboardingCompletedAt").is_null(), "a failed write leaves setup unfinished");
         std::fs::remove_dir_all(blocker.parent().unwrap()).unwrap();
     }
 }

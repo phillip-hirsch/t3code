@@ -3,6 +3,7 @@
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::diff::{DiffFile, DiffFileStatus, DiffState};
+use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -15,6 +16,7 @@ use super::super::Workspace;
 use super::super::git::{self, DiffColorScheme};
 use super::super::markdown_ui::workspace_relative;
 use super::diff_load::FileStat;
+use crate::model::ScopedId;
 use crate::theme::Tokens;
 
 /// The header the copy button shows on hover of.
@@ -81,8 +83,8 @@ impl Workspace {
     /// A diff's file in the open checkout: its workspace root and the path inside it.
     fn diff_file_in_workspace(&self, file_path: &str) -> Option<(String, String)> {
         let worktree = match &self.target {
-            Some(super::super::Target::Thread { id, .. }) => {
-                self.shell.threads.iter().find(|thread| &thread.id == id).and_then(|t| t.worktree_path.clone())
+            Some(super::super::Target::Thread { env, id }) => {
+                self.shell.thread(&ScopedId::new(env.clone(), id.as_str())).and_then(|t| t.worktree_path.clone())
             }
             _ => None,
         };
@@ -117,7 +119,7 @@ impl Workspace {
         } else {
             format!("{}/{path}", root.trim_end_matches('/'))
         };
-        self.open_file_menu(full, position, window, cx);
+        self.open_file_menu(full, None, position, window, cx);
     }
 }
 
@@ -172,7 +174,8 @@ pub(super) fn header(
     tokens: &Tokens,
     scheme: DiffColorScheme,
     suffix: Option<AnyElement>,
-    cx: &App,
+    window: &mut Window,
+    cx: &mut App,
 ) -> AnyElement {
     let name: SharedString = match (file.original_path(), file.modified_path()) {
         (Some(old), Some(new)) if old != new => format!("{old} → {new}").into(),
@@ -196,9 +199,10 @@ pub(super) fn header(
     };
     let path = file.path().clone();
     let collapsed = state.read(cx).is_file_collapsed(&path);
-    let copy = copy_path_button(&path, &view, tokens, cx);
+    let copy = copy_path_button(&path, &view, tokens, window, cx);
     let (open_path, menu_path, fold_path, fold_view) = (path.clone(), path.clone(), path, view.clone());
     let menu_view = view.clone();
+    let (key_view, key_path) = (view.clone(), menu_path.clone());
     // `[data-title]:hover`: the code foreground mixed 16% toward primary.
     let hover = tokens.foreground.blend(tokens.primary.opacity(0.16));
     let muted = tokens.muted_foreground;
@@ -213,8 +217,8 @@ pub(super) fn header(
             fold_view.update(cx, |this, cx| this.fold_diff_file(&fold_path, !collapsed, cx));
         })
         .child(
-            div()
-                .id("diff-file-title")
+            // A tab stop, so Enter opens the file and the keyboard opens its menu.
+            super::super::chat::focusable(div().id("diff-file-title"), tokens)
                 .min_w_0()
                 .truncate()
                 .font_weight(gpui_kit::FontWeight::MEDIUM)
@@ -229,6 +233,9 @@ pub(super) fn header(
                     menu_view
                         .update(cx, |this, cx| this.open_changed_file_menu(&menu_path, event.position, window, cx));
                 })
+                .on_context_menu_key(move |position, window, cx| {
+                    key_view.update(cx, |this, cx| this.open_changed_file_menu(&key_path, position, window, cx));
+                })
                 .child(name),
         )
         // `DiffFileHeaderSuffix`, after the filename: copy path, then the file's load status.
@@ -240,11 +247,22 @@ pub(super) fn header(
         .into_any_element()
 }
 
-/// `DiffFilePathCopyButton` (`icon-micro`, `ghost-muted`): shown on the header's hover, it
-/// copies the path and shows a check and "Copied" for a moment.
-fn copy_path_button(path: &SharedString, view: &Entity<Workspace>, tokens: &Tokens, cx: &App) -> AnyElement {
+/// `DiffFilePathCopyButton` (`icon-micro`, `ghost-muted`): shown on the header's hover or
+/// while focused, it copies the path and shows a check and "Copied" for a moment. Hidden, it
+/// stays a Tab stop, as the web's `opacity: 0` button does.
+fn copy_path_button(
+    path: &SharedString,
+    view: &Entity<Workspace>,
+    tokens: &Tokens,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
     let id: SharedString = format!("diff-copy-path:{path}").into();
+    let focus =
+        window.use_keyed_state(SharedString::from(format!("{id}:focus")), cx, |_, cx| cx.focus_handle().tab_stop(true));
+    let focus = focus.read(cx).clone();
     let copied = view.read(cx).copy_feedback.is(&id);
+    let ring = tokens.ring;
     let (accent, foreground) = (tokens.accent, tokens.foreground);
     let glyph = if copied {
         Icon::new(IconName::Check).text_color(tokens.success_foreground)
@@ -262,9 +280,15 @@ fn copy_path_button(path: &SharedString, view: &Entity<Workspace>, tokens: &Toke
         .justify_center()
         .rounded(px(4.))
         .cursor_pointer()
+        .track_focus(&focus)
+        .border_1()
+        .border_color(gpui_kit::transparent_black())
+        .focus_visible(move |style| style.border_color(ring))
         .text_color(tokens.muted_foreground)
         .hover(move |style| style.bg(accent).text_color(foreground))
-        .when(!copied, |el| el.invisible().group_hover(HEADER_GROUP, gpui_kit::Styled::visible))
+        .when(!copied && !focus.is_focused(window), |el| {
+            el.opacity(0.).group_hover(HEADER_GROUP, |style| style.opacity(1.))
+        })
         .child(glyph.size(px(12.)))
         .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
         .on_click(move |_, _, cx| {

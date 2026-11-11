@@ -172,11 +172,6 @@ pub struct Provider {
     /// Empty means every runtime mode.
     #[serde(default)]
     pub supported_runtime_modes: Vec<String>,
-    /// `false` hides the composer's Plan toggle.
-    #[serde(default)]
-    pub show_interaction_mode_toggle: Option<bool>,
-    #[serde(default)]
-    pub reports_context_window: Option<bool>,
     #[serde(default)]
     pub message: Option<String>,
     #[serde(default)]
@@ -389,6 +384,9 @@ pub struct ServerInfo {
     pub provider_instances: Value,
     /// Model picker favorites as `(instanceId, model)`.
     pub favorites: Vec<(String, String)>,
+    /// `config.environmentThemes`, the palettes it publishes, or null for none. Only the theme
+    /// stream sends them, so a snapshot keeps the last set.
+    pub environment_themes: Value,
 }
 
 impl ServerInfo {
@@ -429,6 +427,11 @@ impl ServerInfo {
                 self.providers_json = event["payload"]["providers"].as_array().cloned().unwrap_or_default();
             }
             "settingsUpdated" => self.apply_settings(&event["payload"]["settings"])?,
+            "environmentThemesUpdated" => {
+                let themes = &event["payload"]["themes"];
+                let published = themes.as_array().is_some_and(|themes| !themes.is_empty());
+                self.environment_themes = if published { themes.clone() } else { Value::Null };
+            }
             "usageLimitSourcesUpdated" => {
                 if let Some(config) = self.config.as_object_mut() {
                     config.insert("usageLimitSources".into(), event["payload"]["sources"].clone());
@@ -573,6 +576,8 @@ pub struct RepositoryLocator {
 pub struct RepositoryOrigin {
     pub canonical_key: String,
     #[serde(default)]
+    pub remote_url: Option<String>,
+    #[serde(default)]
     pub display_name: Option<String>,
 }
 
@@ -612,6 +617,11 @@ pub struct ProjectShell {
 }
 
 impl ProjectShell {
+    /// The project's identity across environments, borrowed.
+    pub fn project_ref(&self) -> ThreadRef<'_> {
+        (&self.environment_id, &self.id)
+    }
+
     pub fn scope_project(&self) -> crate::settings::scope::Project {
         crate::settings::scope::Project {
             id: self.id.clone(),
@@ -851,6 +861,9 @@ pub struct ThreadShell {
     pub link_origin: Option<LinkOrigin>,
     #[serde(default)]
     pub delegated_from: Option<DelegatedFrom>,
+    /// `{type: "run", threadId, runId}` for a fork at a run, which names its parent.
+    #[serde(default)]
+    pub forked_from: Option<Value>,
     #[serde(default, deserialize_with = "lossy")]
     pub tags: Vec<String>,
     #[serde(default)]
@@ -957,10 +970,60 @@ impl ThreadShell {
     pub fn is_listed(&self) -> bool {
         self.lineage.relationship_to_parent.as_deref() != Some("subagent") && self.lineage.side_chat != Some(true)
     }
+
+    /// The thread's identity across environments, borrowed.
+    pub fn thread_ref(&self) -> ThreadRef<'_> {
+        (&self.environment_id, &self.id)
+    }
+
+    /// The thread's project's identity across environments, borrowed.
+    pub fn project_ref(&self) -> ThreadRef<'_> {
+        (&self.environment_id, &self.project_id)
+    }
 }
 
 /// `(environment id, thread id)`, a thread's identity across environments.
 pub type ThreadRef<'a> = (&'a str, &'a str);
+
+/// A thread's or project's id on its environment (`ScopedThreadRef`, `ScopedProjectRef`): ids
+/// repeat across environments, so a bare id can name the wrong record.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ScopedId {
+    pub env: SharedString,
+    pub id: String,
+}
+
+impl ScopedId {
+    pub fn new(env: impl Into<SharedString>, id: impl Into<String>) -> Self {
+        Self { env: env.into(), id: id.into() }
+    }
+
+    pub fn of_thread(thread: &ThreadShell) -> Self {
+        Self::new(thread.environment_id.clone(), thread.id.clone())
+    }
+
+    pub fn of_project(project: &ProjectShell) -> Self {
+        Self::new(project.environment_id.clone(), project.id.clone())
+    }
+
+    /// The thread's project on the thread's environment.
+    pub fn thread_project(thread: &ThreadShell) -> Self {
+        Self::new(thread.environment_id.clone(), thread.project_id.clone())
+    }
+
+    pub fn is_thread(&self, thread: &ThreadShell) -> bool {
+        self.env == thread.environment_id && self.id == thread.id
+    }
+
+    pub fn is_project(&self, project: &ProjectShell) -> bool {
+        self.env == project.environment_id && self.id == project.id
+    }
+
+    /// `(environment, id)`, borrowed.
+    pub fn pair(&self) -> ThreadRef<'_> {
+        (&self.env, &self.id)
+    }
+}
 
 /// `hiddenThreadTagsAtom`: the tags an environment's tag filter hides, `None` while it is off.
 pub fn hidden_thread_tags(settings: &crate::settings::Settings) -> Option<Vec<String>> {
@@ -1036,6 +1099,20 @@ struct ShellSnapshot {
     projects: Vec<ProjectShell>,
     #[serde(default, deserialize_with = "lossy")]
     threads: Vec<ThreadShell>,
+    /// Present when the subscription asked to leave older settled threads out.
+    #[serde(default, deserialize_with = "lenient")]
+    older_settled: Option<crate::older_settled::CutWire>,
+}
+
+/// Thread rows read outside the shell: an older settled page, a search's older matches, or a
+/// thread family (`OrchestrationV2ThreadFamily`).
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadRows {
+    #[serde(default)]
+    pub snapshot_sequence: u64,
+    #[serde(default, deserialize_with = "lossy")]
+    pub threads: Vec<ThreadShell>,
 }
 
 /// Every environment's projects and threads in one list (the web's merged shell selectors),
@@ -1057,6 +1134,14 @@ struct ShellCursor {
     needs_snapshot: bool,
     /// A full snapshot was applied; a fresh environment's is valid at sequence 0.
     has_snapshot: bool,
+    /// Counts full snapshots, so reads made before the latest one can tell they are stale.
+    generation: u64,
+    /// Where the snapshot cut older settled threads, when it left them out.
+    older: Option<crate::older_settled::Cut>,
+    /// The sequence of each thread's latest removal since the snapshot.
+    removed_at: HashMap<String, u64>,
+    /// Threads the subscription removed, so lookups of threads it leaves out ask again.
+    removals: u64,
 }
 
 impl ShellState {
@@ -1070,19 +1155,113 @@ impl ShellState {
         self.cursors.get(environment_id).is_some_and(|cursor| cursor.has_snapshot)
     }
 
+    /// `environmentShell` status `live`: this environment's subscription caught up with its server.
+    pub fn is_live(&self, environment_id: &str) -> bool {
+        self.cursors.get(environment_id).is_some_and(|cursor| cursor.live)
+    }
+
+    /// How many threads `environment_id`'s subscription removed.
+    pub fn removals(&self, environment_id: &str) -> u64 {
+        self.cursors.get(environment_id).map_or(0, |cursor| cursor.removals)
+    }
+
     /// Some environment's subscription caught up with its server.
     pub fn live(&self) -> bool {
         self.cursors.values().any(|cursor| cursor.live)
     }
 
-    /// The environment a thread lives on.
-    pub fn thread_environment(&self, thread_id: &str) -> Option<&SharedString> {
-        self.threads.iter().find(|t| t.id == thread_id).map(|t| &t.environment_id)
+    /// The thread with this id on this environment.
+    pub fn thread(&self, key: &ScopedId) -> Option<&ThreadShell> {
+        self.threads.iter().find(|t| key.is_thread(t))
     }
 
-    /// The environment a project lives on.
-    pub fn project_environment(&self, project_id: &str) -> Option<&SharedString> {
-        self.projects.iter().find(|p| p.id == project_id).map(|p| &p.environment_id)
+    /// The project with this id on this environment.
+    pub fn project(&self, key: &ScopedId) -> Option<&ProjectShell> {
+        self.projects.iter().find(|p| key.is_project(p))
+    }
+
+    /// Counts the environment's full snapshots; a read made under an older one must not merge.
+    pub fn generation(&self, environment_id: &str) -> u64 {
+        self.cursors.get(environment_id).map_or(0, |cursor| cursor.generation)
+    }
+
+    /// The environment's older settled cut, when its shell leaves those threads out.
+    pub fn older_settled(&self, environment_id: &str) -> Option<&crate::older_settled::Cut> {
+        self.cursors.get(environment_id)?.older.as_ref()
+    }
+
+    /// Every environment whose shell leaves older settled threads out, with its cut.
+    pub fn older_settled_cuts(&self) -> impl Iterator<Item = (&SharedString, &crate::older_settled::Cut)> {
+        self.cursors.iter().filter_map(|(id, cursor)| Some((id, cursor.older.as_ref()?)))
+    }
+
+    /// The environment's [`crate::older_settled::count_key`] now, when it has a cut.
+    pub fn older_settled_count_key(&self, environment_id: &str) -> Option<u64> {
+        let cursor = self.cursors.get(environment_id)?;
+        let cut = cursor.older.as_ref()?;
+        let threads = self.threads.iter().filter(|t| t.environment_id == environment_id);
+        Some(crate::older_settled::count_key(threads, cut, &cursor.removed_at))
+    }
+
+    /// Takes a count read (`getOlderSettledThreads`, `limit: 0`) made for `key` under `generation`.
+    pub fn set_older_settled_counts(
+        &mut self,
+        environment_id: &str,
+        generation: u64,
+        key: u64,
+        counts: HashMap<String, usize>,
+    ) {
+        let Some(cursor) = self.cursors.get_mut(environment_id).filter(|c| c.generation == generation) else { return };
+        let Some(cut) = cursor.older.as_mut() else { return };
+        cut.set_counts(counts, key);
+        self.revision += 1;
+    }
+
+    /// `unloadedOlderSettledCount`: older settled threads of these projects (all for `None`) on
+    /// the environment that this client does not hold: the server's count minus the older rows
+    /// it has, in any section.
+    pub fn unloaded_older_settled(&self, environment_id: &str, projects: Option<&[String]>) -> usize {
+        let Some(cut) = self.older_settled(environment_id) else { return 0 };
+        let held = self
+            .threads
+            .iter()
+            .filter(|t| t.environment_id == environment_id)
+            .filter(|t| projects.is_none_or(|ids| ids.contains(&t.project_id)))
+            .filter(|t| crate::older_settled::is_older_settled(t, cut.before_ms))
+            .count();
+        cut.count(projects).saturating_sub(held)
+    }
+
+    /// The project has threads, counting older settled ones the shell left out.
+    pub fn project_has_threads(&self, project: &ProjectShell) -> bool {
+        self.threads.iter().any(|t| t.project_ref() == project.project_ref())
+            || self.unloaded_older_settled(&project.environment_id, Some(std::slice::from_ref(&project.id))) > 0
+    }
+
+    /// `threadFamilyRowsMissingFromShell`: merges rows read outside the shell behind its own,
+    /// which win since deltas carry every change. A row the shell removed after the read is
+    /// stale, and a read made under an earlier snapshot merges nothing. Merged rows then follow
+    /// deltas like any other, until the next snapshot replaces them.
+    pub fn mount_rows(&mut self, environment_id: &SharedString, generation: u64, read: ThreadRows) -> bool {
+        let Some(cursor) = self.cursors.get(environment_id.as_ref()) else { return false };
+        let cut_sequence = cursor.older.as_ref().map_or(0, |cut| cut.as_of_sequence);
+        if cursor.generation != generation || read.snapshot_sequence < cut_sequence {
+            return false;
+        }
+        let mut added = false;
+        for mut thread in read.threads {
+            let removed = cursor.removed_at.get(&thread.id).is_some_and(|&at| at > read.snapshot_sequence);
+            if removed || self.threads.iter().any(|t| t.environment_id == *environment_id && t.id == thread.id) {
+                continue;
+            }
+            thread.environment_id = environment_id.clone();
+            self.threads.push(thread);
+            added = true;
+        }
+        if added {
+            self.revision += 1;
+        }
+        added
     }
 
     /// Drops an environment that was removed or switched off.
@@ -1164,6 +1343,16 @@ impl ShellState {
                         cursor.sequence = snapshot.snapshot_sequence;
                         cursor.needs_snapshot = false;
                         cursor.has_snapshot = true;
+                        cursor.generation += 1;
+                        cursor.removed_at.clear();
+                        cursor.older = snapshot.older_settled.and_then(crate::older_settled::Cut::from_wire);
+                        if let Some(cut) = cursor.older.as_mut()
+                            && snapshot.snapshot_sequence == cut.as_of_sequence
+                        {
+                            // Exact as of this snapshot, until a later change moves the key.
+                            let held = self.threads.iter().filter(|t| ours(&t.environment_id));
+                            cut.counts_key = Some(crate::older_settled::count_key(held, cut, &cursor.removed_at));
+                        }
                     }
                 }
             }
@@ -1199,14 +1388,19 @@ impl ShellState {
                         (None, true) => self.threads.push(thread),
                         (Some(index), false) => {
                             self.threads.remove(index);
+                            cursor.removed_at.insert(thread.id, sequence.unwrap_or(cursor.sequence));
                         }
-                        (None, false) => {}
+                        (None, false) => {
+                            cursor.removed_at.insert(thread.id, sequence.unwrap_or(cursor.sequence));
+                        }
                     }
                 }
             },
             "thread.removed" => {
                 let id = item["threadId"].as_str().unwrap_or_default();
                 self.threads.retain(|t| !(ours(&t.environment_id) && t.id == id));
+                cursor.removed_at.insert(id.to_owned(), sequence.unwrap_or(cursor.sequence));
+                cursor.removals += 1;
             }
             _ => {}
         }
@@ -1268,7 +1462,7 @@ pub struct RollbackFailure {
     pub message: String,
 }
 
-/// The token counts behind the context meter: `ThreadTokenUsageSnapshot` on a
+/// A context window's token counts: `ThreadTokenUsageSnapshot` on a
 /// provider thread, `OrchestrationV2ProviderTurnTokenUsage` on a provider turn.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1280,32 +1474,9 @@ pub struct TokenUsage {
     pub auto_compact_threshold: Option<u64>,
     #[serde(default)]
     pub updated_at: Option<String>,
+    /// How long the provider keeps the prompt cache; a live turn's usage reports it.
     #[serde(default)]
-    pub total_processed_tokens: Option<u64>,
-    #[serde(default)]
-    pub compacts_automatically: Option<bool>,
-    #[serde(default)]
-    pub cost: Option<UsageCost>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct UsageCost {
-    pub amount: f64,
-    pub currency: String,
-}
-
-/// `OrchestrationV2PlanArtifact`; a paged projection moves the markdown to its turn item.
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PlanArtifact {
-    pub id: String,
-    pub kind: String,
-    #[serde(default)]
-    pub run_id: Option<String>,
-    #[serde(default)]
-    pub status: String,
-    #[serde(default)]
-    pub markdown: String,
+    pub prompt_cache_ttl_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1498,6 +1669,9 @@ pub struct RuntimeRequest {
     pub status: String,
     #[serde(default)]
     pub response_capability: Value,
+    /// A resolved question's answers, keyed by question.
+    #[serde(default)]
+    pub answers: Value,
 }
 
 impl RuntimeRequest {
@@ -1589,6 +1763,9 @@ pub struct ThreadProjection {
     pub runtime_requests: Vec<RuntimeRequest>,
     #[serde(default, deserialize_with = "lossy")]
     pub turn_items: Vec<Rc<TurnItem>>,
+    /// The user's `messages`: a queued run's message is only here until the run starts.
+    #[serde(default, deserialize_with = "user_messages")]
+    pub messages: Vec<TurnItem>,
     /// The timeline, in render order.
     #[serde(default, deserialize_with = "lossy")]
     pub visible_turn_items: Vec<VisibleRow>,
@@ -1602,8 +1779,6 @@ pub struct ThreadProjection {
     pub nodes: Vec<ExecutionNode>,
     #[serde(default, deserialize_with = "lossy")]
     pub provider_sessions: Vec<ProviderSession>,
-    #[serde(default, deserialize_with = "lossy")]
-    pub plans: Vec<PlanArtifact>,
     #[serde(default, deserialize_with = "lossy")]
     pub subagents: Vec<Subagent>,
 }
@@ -1628,6 +1803,11 @@ pub struct Subagent {
     pub status: String,
     #[serde(default)]
     pub started_at: Option<String>,
+    #[serde(default)]
+    pub completed_at: Option<String>,
+    /// A provider-native workflow coordinator's plan and agents (`OrchestrationV2SubagentWorkflow`).
+    #[serde(default)]
+    pub workflow: Option<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -1687,8 +1867,7 @@ impl ThreadProjection {
         self.context_window().map(|(usage, _)| usage)
     }
 
-    /// `context_usage` and whether it is a live turn report, which always compacts
-    /// automatically and carries no totals.
+    /// `context_usage` and whether it is a live turn report.
     pub fn context_window(&self) -> Option<(Cow<'_, TokenUsage>, bool)> {
         let mut latest: Option<&TokenUsage> = None;
         for usage in self.provider_turns.iter().filter_map(|turn| turn.token_usage.as_ref()) {
@@ -1729,7 +1908,7 @@ impl ThreadProjection {
         serde_json::from_value(transfer["sourceTokenUsage"].clone()).ok()
     }
 
-    /// The newest compaction's after count, with its before count as the total processed.
+    /// The newest compaction's after count.
     fn compaction_usage(&self) -> Option<TokenUsage> {
         self.visible_turn_items.iter().rev().filter(|row| row.item.item_type == "compaction").find_map(|row| {
             let item = &row.item.raw;
@@ -1738,9 +1917,7 @@ impl ThreadProjection {
                 max_tokens: None,
                 auto_compact_threshold: None,
                 updated_at: item["startedAt"].as_str().or_else(|| item["updatedAt"].as_str()).map(str::to_owned),
-                total_processed_tokens: item["beforeTokenCount"].as_u64(),
-                compacts_automatically: Some(true),
-                cost: None,
+                prompt_cache_ttl_ms: None,
             })
         })
     }
@@ -1761,34 +1938,6 @@ impl ThreadProjection {
             Some(session) if session.status != "stopped" => &session.extension_statuses,
             _ => &[],
         }
-    }
-
-    /// `findLatestProposedPlan` for the latest run, with the markdown a paged
-    /// projection moved to the plan's turn item.
-    pub fn latest_proposed_plan(&self) -> Option<(&PlanArtifact, &str)> {
-        let plan_item = |plan: &PlanArtifact| {
-            self.turn_items.iter().rev().find(|item| {
-                matches!(item.item_type.as_str(), "proposed_plan" | "todo_list") && item.str("planId") == Some(&plan.id)
-            })
-        };
-        let time = |plan: &PlanArtifact| -> String {
-            if let Some(updated) = plan_item(plan).and_then(|item| item.str("updatedAt")) {
-                return updated.to_owned();
-            }
-            let run = self.runs.iter().find(|run| Some(&run.id) == plan.run_id.as_ref());
-            run.and_then(|run| run.completed_at.clone().or_else(|| run.started_at.clone())).unwrap_or_default()
-        };
-        let latest_run = self.runs.iter().max_by_key(|run| run.ordinal).map(|run| &run.id);
-        let proposed = || self.plans.iter().filter(|plan| plan.kind == "proposed_plan");
-        let in_run = proposed().any(|plan| plan.run_id.as_ref() == latest_run && latest_run.is_some());
-        let plan = proposed()
-            .filter(|plan| !in_run || plan.run_id.as_ref() == latest_run)
-            .max_by(|a, b| time(a).cmp(&time(b)).then_with(|| a.id.cmp(&b.id)))?;
-        let markdown = match plan.markdown.as_str() {
-            "" => plan_item(plan).and_then(|item| item.str("markdown")).unwrap_or_default(),
-            markdown => markdown,
-        };
-        Some((plan, markdown))
     }
 
     /// `threadHasStarted`: it ran, holds items, or has a provider session.
@@ -1814,6 +1963,18 @@ impl ThreadProjection {
                 && thread.app_thread_id.as_ref() == Some(&self.thread.id)
                 && thread.provider_instance_id.as_ref() == instance
                 && thread.native_thread_ref.as_ref().is_some_and(|r| !r.is_null())
+        })
+    }
+
+    /// A user message by id: from `messages`, like the web, else from its `user_message` item.
+    pub fn user_message(&self, message_id: &str) -> Option<&TurnItem> {
+        self.messages.iter().rev().find(|message| message.id == message_id).or_else(|| {
+            let item = self
+                .turn_items
+                .iter()
+                .rev()
+                .find(|item| item.item_type == "user_message" && item.str("messageId") == Some(message_id));
+            item.map(Rc::as_ref)
         })
     }
 
@@ -1936,6 +2097,11 @@ impl ThreadProjection {
             "runtime-request.updated" => {
                 upsert(&mut self.runtime_requests, RuntimeRequest::deserialize(payload)?, |r| &r.id);
             }
+            "message.updated" => {
+                if let Some(message) = user_message_record(payload.clone()) {
+                    upsert(&mut self.messages, message, |m| &m.id);
+                }
+            }
             "turn-item.updated" => {
                 let mut item = TurnItem::deserialize(payload)?;
                 item.revision = sequence;
@@ -1954,7 +2120,6 @@ impl ThreadProjection {
             }
             "checkpoint.captured" => upsert(&mut self.checkpoints, Checkpoint::deserialize(payload)?, |c| &c.id),
             "node.updated" => upsert(&mut self.nodes, ExecutionNode::deserialize(payload)?, |n| &n.id),
-            "plan.updated" => upsert(&mut self.plans, PlanArtifact::deserialize(payload)?, |p| &p.id),
             "subagent.updated" => upsert(&mut self.subagents, Subagent::deserialize(payload)?, |a| &a.id),
             "provider-session.attached" | "provider-session.updated" => {
                 upsert(&mut self.provider_sessions, ProviderSession::deserialize(payload)?, |s| &s.id);
@@ -2065,6 +2230,21 @@ impl ThreadProjection {
         };
         rows.insert(insertion, row);
     }
+}
+
+/// A `messages` record the projection keeps: a user's, read like its `user_message` item, so
+/// `messageId` is its `id`. Assistant messages stream, and their turn items already hold them.
+fn user_message_record(mut raw: Value) -> Option<TurnItem> {
+    if raw.get("role").and_then(Value::as_str) != Some("user") {
+        return None;
+    }
+    let id = raw.get("id")?.clone();
+    raw.as_object_mut()?.insert("messageId".to_owned(), id);
+    TurnItem::deserialize(raw).map_err(|error| log::warn!("skipping undecodable message: {error}")).ok()
+}
+
+fn user_messages<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<TurnItem>, D::Error> {
+    Ok(Vec::<Value>::deserialize(deserializer)?.into_iter().filter_map(user_message_record).collect())
 }
 
 fn upsert<T>(items: &mut Vec<T>, item: T, id: impl Fn(&T) -> &String) {
@@ -2262,6 +2442,78 @@ mod tests {
     }
 
     #[test]
+    fn rows_read_outside_the_shell_merge_behind_it_and_count_against_the_cut() {
+        let env: SharedString = ENV.into();
+        let older = |id: &str, project: &str| {
+            let mut row = thread(id, "1");
+            row["projectId"] = json!(project);
+            row["settledOverride"] = json!("settled");
+            row["settledAt"] = json!("2024-01-01T00:00:00.000Z");
+            row
+        };
+        let cut = json!({"before": "2024-02-01T00:00:00.000Z", "asOfSequence": 5, "counts": [{"projectId": "p", "count": 3}, {"projectId": "q", "count": 1}]});
+        let mut shell = ShellState::default();
+        shell_snapshot(&mut shell, &env, json!([older("held", "p")]), Some(cut));
+        let generation = shell.generation(ENV);
+        assert_eq!(shell.older_settled(ENV).map(|cut| cut.count(None)), Some(4));
+        assert_eq!(shell.unloaded_older_settled(ENV, None), 3, "the held older row is loaded");
+        assert_eq!(shell.unloaded_older_settled(ENV, Some(&["q".into()])), 1);
+        let key = shell.older_settled_count_key(ENV);
+        assert_eq!(key, shell.older_settled(ENV).and_then(|cut| cut.counts_key), "exact as of the snapshot");
+
+        shell.apply(&env, &json!({"kind":"thread.removed","sequence":7,"threadId":"gone"})).unwrap();
+        assert_ne!(shell.older_settled_count_key(ENV), key, "a removal asks for fresh counts");
+        let rows = |sequence: u64, ids: &[&str]| ThreadRows {
+            snapshot_sequence: sequence,
+            threads: ids.iter().map(|id| serde_json::from_value(older(id, "p")).unwrap()).collect(),
+        };
+        // Read before the removal: the removed row is stale; the held row stays the shell's.
+        assert!(shell.mount_rows(&env, generation, rows(6, &["gone", "held", "page"])));
+        let ids: Vec<_> = shell.threads.iter().map(|t| (t.environment_id.as_ref(), t.id.as_str())).collect();
+        assert_eq!(ids, [(ENV, "held"), (ENV, "page")]);
+        assert_eq!(shell.unloaded_older_settled(ENV, None), 2);
+        assert!(!shell.mount_rows(&env, generation, rows(8, &["page"])), "already held");
+        assert!(shell.mount_rows(&env, generation, rows(8, &["gone"])), "read after the removal");
+        assert!(!shell.mount_rows(&env, generation, rows(4, &["early"])), "read before the cut's snapshot");
+        assert!(!shell.mount_rows(&env, generation + 1, rows(9, &["later"])), "another snapshot's read");
+
+        shell.set_older_settled_counts(ENV, generation, 1, HashMap::from([("p".to_owned(), 9)]));
+        assert_eq!(shell.unloaded_older_settled(ENV, None), 6);
+        // A fresh snapshot replaces the merged rows and the counts with its own.
+        shell_snapshot(&mut shell, &env, json!([]), None);
+        assert!(shell.older_settled(ENV).is_none() && shell.threads.is_empty());
+        assert_eq!(shell.generation(ENV), generation + 1);
+    }
+
+    fn shell_snapshot(shell: &mut ShellState, env: &SharedString, threads: Value, cut: Option<Value>) {
+        let mut snapshot = json!({"snapshotSequence": 5, "projects": [], "threads": threads});
+        if let Some(cut) = cut {
+            snapshot["olderSettled"] = cut;
+        }
+        shell.apply(env, &json!({"kind": "snapshot", "snapshot": snapshot})).unwrap();
+    }
+
+    #[test]
+    fn a_scoped_lookup_tells_equal_ids_on_two_environments_apart() {
+        let mut shell = ShellState::default();
+        let (a, b): (SharedString, SharedString) = ("env-a".into(), "env-b".into());
+        let snapshot = |title: &str| {
+            let mut thread = thread("t", "1");
+            thread["title"] = json!(title);
+            json!({"kind":"snapshot","snapshot":{"snapshotSequence":1,"projects":[project("/r", None)],"threads":[thread]}})
+        };
+        shell.apply(&a, &snapshot("on a")).unwrap();
+        shell.apply(&b, &snapshot("on b")).unwrap();
+        let title = |env: &SharedString| shell.thread(&ScopedId::new(env.clone(), "t")).map(|t| t.title.as_str());
+        assert_eq!((title(&a), title(&b)), (Some("on a"), Some("on b")));
+        assert!(shell.thread(&ScopedId::new("env-c", "t")).is_none());
+        let on_b = shell.project(&ScopedId::new(b.clone(), "/r")).map(|p| &p.environment_id);
+        assert_eq!(on_b, Some(&b));
+        let key = ScopedId::of_thread(&shell.threads[1]);
+        assert_eq!((key.env.as_ref(), key.is_thread(&shell.threads[0])), ("env-b", false));
+    }
+
+    #[test]
     fn each_environment_keeps_its_own_projects_threads_and_cursor() {
         let mut shell = ShellState::default();
         let (a, b): (SharedString, SharedString) = ("env-a".into(), "env-b".into());
@@ -2269,7 +2521,7 @@ mod tests {
         shell.apply(&a, &snapshot(5, "t1")).unwrap();
         shell.apply(&b, &snapshot(2, "t2")).unwrap();
         assert_eq!((shell.projects.len(), shell.threads.len()), (2, 2));
-        assert_eq!(shell.thread_environment("t2"), Some(&b));
+        assert!(shell.thread(&ScopedId::new(b.clone(), "t2")).is_some());
         // Sequences are per subscription: b's 3 is new even though a is at 5.
         shell
             .apply(&b, &json!({"kind":"thread.updated","sequence":3,"location":"active","thread":thread("t3", "2")}))
@@ -2441,6 +2693,14 @@ mod tests {
         let project: ProjectShell =
             serde_json::from_value(json!({"id": "p", "title": "P", "workspaceRoot": "/p"})).unwrap();
         assert_eq!(info.new_thread_model(Some(&project)).unwrap().model, "haiku", "the project's override wins");
+
+        let themes =
+            json!([{"id": "aurora", "name": "Aurora", "appearance": "dark", "canvas": "#000", "accent": "#f0f"}]);
+        info.apply(&json!({"version": 1, "type": "environmentThemesUpdated", "payload": {"themes": themes}})).unwrap();
+        info.apply(&json!({"version": 1, "type": "snapshot", "config": {"providers": []}})).unwrap();
+        assert_eq!(info.environment_themes, themes, "snapshots never carry themes, so the last set stays");
+        info.apply(&json!({"version": 1, "type": "environmentThemesUpdated", "payload": {"themes": []}})).unwrap();
+        assert_eq!(info.environment_themes, Value::Null);
     }
 
     #[test]
@@ -2484,8 +2744,7 @@ mod tests {
         };
         let compacted = projection(json!({}));
         let (usage, live) = compacted.context_window().unwrap();
-        assert_eq!((usage.used_tokens, usage.total_processed_tokens, live), (1200, Some(9000), false));
-        assert_eq!(usage.compacts_automatically, Some(true), "a compaction without counts is skipped");
+        assert_eq!((usage.used_tokens, live), (1200, false), "a compaction without counts is skipped");
         let transfer = |status: &str, strategy: &str| {
             json!({"contextTransfers": [{"type": "fork", "targetThreadId": "t", "sourceThreadId": "src",
                 "sourcePoint": {"runId": "r1"}, "sourceProviderInstanceId": "codex", "status": status,
@@ -2528,29 +2787,6 @@ mod tests {
             None,
             "a child node's failure"
         );
-    }
-
-    #[test]
-    fn latest_proposed_plan_prefers_the_latest_run_and_reads_paged_markdown() {
-        let mut value = projection(&[]);
-        value["runs"] = json!([{"id": "r1", "status": "completed", "ordinal": 1}, {"id": "r2", "status": "completed", "ordinal": 2}]);
-        value["plans"] = json!([
-            {"id": "a", "kind": "proposed_plan", "runId": "r1", "status": "active", "markdown": "# Old"},
-            {"id": "b", "kind": "proposed_plan", "runId": "r2", "status": "active", "markdown": "", "detailInTurnItem": true},
-            {"id": "c", "kind": "todo_list", "runId": "r2", "status": "active", "steps": []}
-        ]);
-        value["turnItems"] = json!([
-            {"id": "i", "type": "proposed_plan", "threadId": "t", "planId": "b", "markdown": "# New", "updatedAt": "2026-01-01T00:00:00Z"}
-        ]);
-        let projection = ThreadProjection::deserialize(&value).unwrap();
-        let (plan, markdown) = projection.latest_proposed_plan().unwrap();
-        assert_eq!((plan.id.as_str(), markdown), ("b", "# New"));
-
-        // Without a plan in the latest run, any run's plan counts.
-        value["plans"] =
-            json!([{"id": "a", "kind": "proposed_plan", "runId": "r1", "status": "superseded", "markdown": "# A"}]);
-        let projection = ThreadProjection::deserialize(&value).unwrap();
-        assert_eq!(projection.latest_proposed_plan().map(|(p, _)| p.status.as_str()), Some("superseded"));
     }
 
     #[test]

@@ -1846,6 +1846,10 @@ impl PlatformWindow for WaylandWindow {
         self.borrow().client.get_client().borrow().capslock
     }
 
+    fn native_key(&self) -> gpui::NativeKey {
+        self.borrow().client.get_client().borrow().native_key
+    }
+
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler) {
         self.borrow_mut().input_handler = Some(input_handler);
     }

@@ -14,7 +14,8 @@ use crate::rpc::RpcClient;
 /// `VCS_REF_LIST_LIMIT` in `apps/web/src/state/queries.ts`.
 const REF_LIST_LIMIT: u32 = 100;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum EnvMode {
     Local,
     Worktree,
@@ -87,6 +88,16 @@ impl DraftWorkspace {
         self.start_from_origin
     }
 
+    /// The launch's `workspaceStrategy` for `choice`, reading what the draft's controls had not loaded.
+    pub async fn resolve_strategy(&self, client: &RpcClient, choice: &WorkspaceChoice) -> Result<Value, String> {
+        let mode = match choice.mode {
+            Some(mode) => mode,
+            None => self.default_mode(client).await,
+        };
+        let refs = list_refs(client, &self.workspace_root).await?;
+        launch_strategy(mode, choice, &refs, choice.start_from_origin.unwrap_or(self.start_from_origin))
+    }
+
     /// `applyProjectFile` + `resolveNewThreadEnvMode`.
     fn env_mode(&self, project_file: Option<EnvMode>) -> EnvMode {
         // Unset everywhere, t3.json decides, then "local"; either way it is not the environment's choice.
@@ -140,7 +151,8 @@ pub fn sanitize_new_ref_name(raw: &str) -> String {
 }
 
 /// What the draft's workspace controls picked.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct WorkspaceChoice {
     pub mode: Option<EnvMode>,
     /// Worktree mode: the base branch. Local mode: the branch switched to.

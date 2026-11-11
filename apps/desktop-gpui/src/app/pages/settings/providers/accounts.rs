@@ -1,5 +1,5 @@
 //! Provider sign-in on the Providers page: the managed Codex/ChatGPT setup
-//! (`CodexSetupSection.tsx`, settings presentation), every other provider's
+//! (`CodexSetupSection.tsx`, in Settings and on the Welcome page), every other provider's
 //! account row (`ProviderAuthenticationSection.tsx`, which is also Claude's),
 //! the ChatGPT account picker, the add-ChatGPT-account wizard, the "Manage
 //! usage" button and the one-time ChatGPT plan notice (`ChatGptWelcomeCoordinator`).
@@ -22,9 +22,9 @@ use gpui_kit::component::radio::Radio;
 use gpui_kit::component::{Disableable as _, Icon, IconName, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, ClipboardItem, Context, Entity, FocusHandle, FontWeight, Global,
-    InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, Render, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Task, WeakEntity, Window, div, px,
+    AnyElement, App, AppContext as _, ClipboardItem, Context, Entity, FontWeight, Global, InteractiveElement as _,
+    IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription,
+    Task, WeakEntity, Window, div, px,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -32,10 +32,11 @@ use serde_json::{Value, json};
 use super::codex_callback;
 
 mod antigravity;
-use super::super::connections::logic::PROVIDERS_MANAGE;
 use super::super::scoped_client;
 use super::super::widgets::RowFrame;
 use crate::app::Workspace;
+use crate::app::onboarding::{AgentState, agent_name, onboarding_state};
+use crate::app::terminal::{SessionEvent, TerminalSession};
 use crate::model::{Provider, ProviderAuth, ProviderSetup};
 use crate::rpc::{RpcClient, RpcError, StreamEvent};
 use crate::theme::{self, Tokens};
@@ -99,7 +100,11 @@ enum Interaction {
     },
     Terminal {
         id: String,
+        /// The tail of everything the flow printed, at most 16,384 UTF-16 units.
         output: String,
+        /// UTF-16 units printed so far, `output` included; older servers leave it out.
+        #[serde(default)]
+        output_offset: Option<u64>,
     },
     Credentials {
         id: String,
@@ -247,57 +252,60 @@ fn redacted_placeholder(value: &str) -> String {
         .collect()
 }
 
-/// Drops terminal control sequences so the sign-in output reads as text.
-fn strip_ansi(output: &str) -> String {
-    let mut text = String::with_capacity(output.len());
-    let mut chars = output.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\u{1b}' => match chars.next() {
-                Some('[') => while chars.next().is_some_and(|c| !('@'..='~').contains(&c)) {},
-                Some(']') => {
-                    while let Some(c) = chars.next() {
-                        if c == '\u{7}' || (c == '\u{1b}' && chars.next_if_eq(&'\\').is_some()) {
-                            break;
-                        }
-                    }
-                }
-                _ => {}
-            },
-            '\r' if chars.peek() == Some(&'\n') => {}
-            c if c.is_control() && c != '\n' && c != '\t' => {}
-            c => text.push(c),
+/// What new sign-in output does to the terminal (`ProviderAuthTerminal`'s effect).
+#[derive(Debug, PartialEq, Eq)]
+enum OutputStep<'a> {
+    Unchanged,
+    /// The units printed since the last write, all still in `output`.
+    Append(&'a str),
+    /// Output was dropped from the window or the flow started over: redraw from `output`.
+    Reset,
+}
+
+/// The step for `output` once `offset` UTF-16 units were printed, after `written` were shown.
+fn output_step(output: &str, offset: usize, written: usize) -> OutputStep<'_> {
+    let available = output.encode_utf16().count();
+    match offset.checked_sub(written) {
+        Some(0) => OutputStep::Unchanged,
+        Some(delta) if delta <= available => OutputStep::Append(utf16_tail(output, delta)),
+        _ => OutputStep::Reset,
+    }
+}
+
+/// `text.slice(-units)`, widened to keep a surrogate pair whole.
+fn utf16_tail(text: &str, units: usize) -> &str {
+    let mut taken = 0;
+    for (index, c) in text.char_indices().rev() {
+        if taken >= units {
+            return &text[index + c.len_utf8()..];
         }
+        taken += c.len_utf16();
     }
     text
 }
 
-/// What a key press sends to a terminal, as xterm encodes it.
-fn terminal_input(event: &KeyDownEvent) -> Option<String> {
-    let keystroke = &event.keystroke;
-    let modifiers = &keystroke.modifiers;
-    let named = match keystroke.key.as_str() {
-        "enter" => Some("\r"),
-        "backspace" => Some("\x7f"),
-        "tab" => Some("\t"),
-        "escape" => Some("\x1b"),
-        "up" => Some("\x1b[A"),
-        "down" => Some("\x1b[B"),
-        "right" => Some("\x1b[C"),
-        "left" => Some("\x1b[D"),
-        "home" => Some("\x1b[H"),
-        "end" => Some("\x1b[F"),
-        "delete" => Some("\x1b[3~"),
-        _ => None,
-    };
-    if let Some(named) = named {
-        return Some(named.to_owned());
+/// `data.slice(offset, offset + max)` for each chunk, and one empty chunk for empty data (a
+/// resize); a surrogate pair stays whole, so a chunk can be one unit short.
+fn utf16_chunks(data: &str, max: usize) -> Vec<&str> {
+    let mut chunks = Vec::new();
+    let (mut start, mut units) = (0, 0);
+    for (index, c) in data.char_indices() {
+        if units + c.len_utf16() > max {
+            chunks.push(&data[start..index]);
+            (start, units) = (index, 0);
+        }
+        units += c.len_utf16();
     }
-    if modifiers.control && !modifiers.alt {
-        let key = keystroke.key.chars().next().filter(|_| keystroke.key.len() == 1)?.to_ascii_lowercase();
-        return key.is_ascii_lowercase().then(|| ((key as u8 - b'a' + 1) as char).to_string());
+    if start < data.len() || chunks.is_empty() {
+        chunks.push(&data[start..]);
     }
-    keystroke.key_char.clone()
+    chunks
+}
+
+/// `onLinkActivate`: only web links leave the sign-in terminal.
+fn is_web_link(url: &str) -> bool {
+    let scheme = url.get(..8).unwrap_or(url).to_ascii_lowercase();
+    scheme.starts_with("https://") || scheme.starts_with("http://")
 }
 
 // ---------------------------------------------------------------------------
@@ -458,6 +466,27 @@ impl Workspace {
                 })
                 .into_any_element(),
         )
+    }
+
+    /// `OnboardingCodexSetup`: Codex's setup card on the Welcome page for `scope`.
+    pub(in crate::app) fn render_onboarding_codex(
+        &mut self,
+        scope: SharedString,
+        instance_id: &str,
+        on_mode_change: ModeChange,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let workspace = cx.weak_entity();
+        let id = instance_id.to_owned();
+        let key = format!("onboarding-codex-{scope}-{instance_id}");
+        window
+            .use_keyed_state(SharedString::from(key), cx, move |_, _| {
+                let mut section = AccountSection::new(workspace, Some(scope), id, None);
+                section.onboarding = Some(OnboardingSetup { on_mode_change });
+                section
+            })
+            .into_any_element()
     }
 
     /// `CodexManagedRuntimeFields`: the runtime paths of a managed Codex instance.
@@ -675,9 +704,38 @@ enum FollowUp {
     OpenPage { flow_id: String },
 }
 
+/// The sign-in terminal of one flow's terminal interaction (`ProviderAuthTerminal`, keyed
+/// `flowId:interactionId`).
+struct AuthTerminal {
+    key: String,
+    session: Entity<TerminalSession>,
+    /// The output offset already shown.
+    written: usize,
+    _events: Subscription,
+}
+
 /// Options of the managed setup shown inside the add-account wizard.
 struct WizardSetup {
     on_cancelled: Callback,
+}
+
+/// `onModeChange` of the Welcome page's Codex card: `"managed"` or `"existing"`.
+pub(in crate::app) type ModeChange = Rc<dyn Fn(&'static str, &mut Window, &mut App)>;
+
+/// `CodexSetupSection presentation="onboarding"`: one card for the ChatGPT runtime and the CLI.
+struct OnboardingSetup {
+    on_mode_change: ModeChange,
+}
+
+/// `{ ...instance, enabled: true, config: { ...config, enabled: true, setupMode } }`.
+pub(in crate::app) fn with_setup_mode(instance: &Value, driver: &str, mode: &str) -> Value {
+    let mut next = if instance.is_object() { instance.clone() } else { json!({ "driver": driver }) };
+    let mut config = next.get("config").filter(|c| c.is_object()).cloned().unwrap_or_else(|| json!({}));
+    config["enabled"] = true.into();
+    config["setupMode"] = mode.into();
+    next["enabled"] = true.into();
+    next["config"] = config;
+    next
 }
 
 pub(in crate::app) struct AccountSection {
@@ -704,9 +762,13 @@ pub(in crate::app) struct AccountSection {
     picker_selection: Option<String>,
     follow_up: Option<FollowUp>,
     receiving: Option<(String, AbortOnDrop)>,
+    /// Sign in once the setup can (`autoStart`): the wizard always does, the Welcome card after
+    /// "Continue with ChatGPT".
+    auto_start: bool,
     auto_start_handled: bool,
+    onboarding: Option<OnboardingSetup>,
     email_revealed: bool,
-    terminal_focus: Option<FocusHandle>,
+    terminal: Option<AuthTerminal>,
     terminal_queue: VecDeque<Value>,
     terminal_sending: bool,
     // Antigravity setup.
@@ -730,6 +792,7 @@ impl AccountSection {
         instance_id: String,
         wizard: Option<WizardSetup>,
     ) -> Self {
+        let auto_start = wizard.is_some();
         Self {
             workspace,
             scope,
@@ -750,9 +813,11 @@ impl AccountSection {
             picker_selection: None,
             follow_up: None,
             receiving: None,
+            auto_start,
             auto_start_handled: false,
+            onboarding: None,
             email_revealed: false,
-            terminal_focus: None,
+            terminal: None,
             terminal_queue: VecDeque::new(),
             terminal_sending: false,
             antigravity: false,
@@ -776,6 +841,17 @@ impl AccountSection {
 
     fn client(&self, cx: &App) -> Option<RpcClient> {
         self.workspace.upgrade()?.read(cx).env_client(self.scope.as_ref()?)
+    }
+
+    /// `readOnly`: this connection may not manage the section environment's providers.
+    fn providers_read_only(&self, cx: &App) -> bool {
+        self.workspace.upgrade().is_none_or(|w| w.read(cx).providers_read_only_on(self.scope.as_deref()))
+    }
+
+    /// `existingCliDisabled`: the CLI's terminal needs `terminal:operate` there.
+    fn terminals_denied(&self, cx: &App) -> bool {
+        let (Some(workspace), Some(scope)) = (self.workspace.upgrade(), self.scope.as_ref()) else { return true };
+        !workspace.read(cx).env_grants(scope, "terminal:operate")
     }
 
     fn input(&self) -> Value {
@@ -966,12 +1042,7 @@ impl AccountSection {
 
     /// `onModeChange`: upserts the instance enabled, with the new setup mode.
     fn set_setup_mode(&mut self, mode: &str, instance: &Value, driver: &str, cx: &mut Context<Self>) {
-        let mut next = if instance.is_object() { instance.clone() } else { json!({ "driver": driver }) };
-        let mut config = next.get("config").filter(|c| c.is_object()).cloned().unwrap_or_else(|| json!({}));
-        config["enabled"] = true.into();
-        config["setupMode"] = mode.into();
-        next["enabled"] = true.into();
-        next["config"] = config;
+        let next = with_setup_mode(instance, driver, mode);
         let payload = json!({
             "patch": {},
             "providerInstanceMutation": { "operation": "upsert", "instanceId": self.instance_id, "instance": next },
@@ -1076,7 +1147,7 @@ impl AccountSection {
     /// `removeProviderAuthMethod.permissionAtom`: removal needs `providers:manage` on this environment.
     fn can_remove_auth_method(&self, cx: &App) -> bool {
         let (Some(workspace), Some(scope)) = (self.workspace.upgrade(), self.scope.as_ref()) else { return false };
-        workspace.read(cx).environment_grants(scope, PROVIDERS_MANAGE)
+        workspace.read(cx).env_permits(scope, "provider.auth.removeMethod", &self.input())
     }
 
     /// Forgets an incomplete ChatGPT connection; the picker stays open on the updated list.
@@ -1243,22 +1314,64 @@ impl AccountSection {
         input
     }
 
-    fn send_terminal(&mut self, data: String, cx: &mut Context<Self>) {
-        let Some(auth) = &self.auth.data else { return };
+    /// The flow's terminal, made when its interaction first shows and fed what was printed since.
+    fn sync_terminal(
+        &mut self,
+        key: String,
+        output: &str,
+        offset: Option<u64>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<TerminalSession> {
+        let terminal = match self.terminal.take().filter(|terminal| terminal.key == key) {
+            Some(terminal) => terminal,
+            None => {
+                let id = format!("provider-auth-{}", self.instance_id);
+                let session = cx.new(|cx| TerminalSession::sink(id, window, cx));
+                let _events = cx.subscribe(&session, |this, _, event: &SessionEvent, cx| match event {
+                    SessionEvent::Input(data) => this.send_terminal(data, None, cx),
+                    SessionEvent::Resize { columns, rows } => {
+                        this.send_terminal("", Some(((*columns).clamp(1, 500), (*rows).clamp(1, 200))), cx);
+                    }
+                    SessionEvent::OpenUrl { url, .. } if is_web_link(url) => cx.open_url(url),
+                    _ => {}
+                });
+                AuthTerminal { key, session, written: 0, _events }
+            }
+        };
+        let offset = offset.map_or_else(|| output.encode_utf16().count(), |o| usize::try_from(o).unwrap_or(usize::MAX));
+        match output_step(output, offset, terminal.written) {
+            OutputStep::Unchanged => {}
+            OutputStep::Append(data) => terminal.session.update(cx, |session, cx| session.write(data, cx)),
+            OutputStep::Reset => terminal.session.update(cx, |session, cx| session.reset_and_write(output, cx)),
+        }
+        let session = terminal.session.clone();
+        self.terminal = Some(AuthTerminal { written: offset, ..terminal });
+        session
+    }
+
+    /// `onResponse`: typed input and the grid's size, in order and in pieces the server takes.
+    fn send_terminal(&mut self, data: &str, size: Option<(usize, usize)>, cx: &mut Context<Self>) {
+        let read_only =
+            self.workspace.upgrade().is_none_or(|w| w.read(cx).providers_read_only_on(self.scope.as_deref()));
+        let Some(auth) = self.auth.data.as_ref().filter(|_| !read_only) else { return };
         let (Some(flow_id), Some(interaction)) = (&auth.flow_id, &auth.interaction) else { return };
-        let chars: Vec<char> = data.chars().collect();
-        for chunk in chars.chunks(TERMINAL_CHUNK) {
+        let Some(client) = self.client(cx) else { return };
+        for chunk in utf16_chunks(data, TERMINAL_CHUNK) {
+            let mut response = json!({ "type": "terminal", "data": chunk });
+            if let Some((cols, rows)) = size {
+                response["size"] = json!({ "cols": cols, "rows": rows });
+            }
             self.terminal_queue.push_back(json!({
                 "instanceId": self.instance_id,
                 "flowId": flow_id,
                 "interactionId": interaction.id(),
-                "response": { "type": "terminal", "data": chunk.iter().collect::<String>() },
+                "response": response,
             }));
         }
         if std::mem::replace(&mut self.terminal_sending, true) {
             return;
         }
-        let Some(client) = self.client(cx) else { return };
         cx.spawn(async move |this, cx| {
             loop {
                 let Ok(Some(input)) = this.update(cx, |this, _| this.terminal_queue.pop_front()) else { break };
@@ -1285,6 +1398,8 @@ struct CodexView {
     authenticated: bool,
     update_available: bool,
     finishing_sign_in: bool,
+    waiting_for_auth_state: bool,
+    starting_automatically: bool,
     install_active: bool,
     auth_active: bool,
     unavailable: bool,
@@ -1306,7 +1421,7 @@ impl CodexView {
         let waiting_for_auth_state = awaiting && !authenticated && (auth.is_none() || phase == "idle");
         let auth_in_progress = finishing_sign_in || waiting_for_auth_state || auth_running(phase);
         let install_active = installation.is_some_and(|i| install_running(&i.phase));
-        let starting_automatically = section.wizard.is_some() && !section.auto_start_handled;
+        let starting_automatically = section.auto_start && !section.auto_start_handled;
         let auth_active = starting_automatically || auth_in_progress || (section.pending && !install_active);
         let unavailable = !instance_enabled(&snapshot.instance)
             || section.pending
@@ -1318,12 +1433,99 @@ impl CodexView {
             authenticated,
             update_available,
             finishing_sign_in,
+            waiting_for_auth_state,
+            starting_automatically,
             install_active,
             auth_active,
             unavailable,
             busy,
         }
     }
+}
+
+/// What the Welcome page's ChatGPT card shows, as [`AccountSection::render_codex`] derives it.
+struct CodexCard {
+    title: String,
+    view: CodexView,
+    phase: String,
+    flow_id: Option<String>,
+    url: Option<String>,
+    requested_email: Option<String>,
+    has_saved_account: bool,
+    runtime_description: String,
+    email: Option<String>,
+    read_only: bool,
+    can_start: bool,
+    install_failure: Option<String>,
+}
+
+const SIGN_IN_IN_BROWSER: &str = "Complete sign-in in your browser.";
+
+/// `CodexWelcomeCard`: the `OpenAI` mark, a title and description, its buttons, and a footer.
+fn welcome_card(
+    t: &Tokens,
+    title: String,
+    description: AnyElement,
+    secondary: Option<AnyElement>,
+    control: Option<AnyElement>,
+    footer: Vec<AnyElement>,
+) -> AnyElement {
+    let controls = secondary.is_some() || control.is_some();
+    v_flex()
+        .rounded_lg()
+        .border_1()
+        .border_color(t.border)
+        .bg(t.background)
+        .p_4()
+        .child(
+            h_flex()
+                .flex_wrap()
+                .items_center()
+                .gap_3()
+                .child(Icon::empty().path("icons/app/openai.svg").size(px(20.)).flex_none().text_color(t.foreground))
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .child(div().text_sm().font_weight(FontWeight::MEDIUM).text_color(t.foreground).child(title))
+                        .child(
+                            div()
+                                .mt_0p5()
+                                .text_xs()
+                                .line_height(px(19.5))
+                                .text_color(t.muted_foreground)
+                                .child(description),
+                        ),
+                )
+                .when(controls, |el| {
+                    el.child(
+                        h_flex()
+                            .flex_none()
+                            .flex_wrap()
+                            .items_center()
+                            .justify_end()
+                            .gap_2()
+                            .children(secondary)
+                            .children(control),
+                    )
+                }),
+        )
+        .when(!footer.is_empty(), |el| {
+            el.child(h_flex().ml_8().mt_2().flex_wrap().items_center().gap_2().children(footer))
+        })
+        .into_any_element()
+}
+
+/// The check and "Ready" of a set-up agent.
+fn ready_badge(t: &Tokens) -> AnyElement {
+    h_flex()
+        .gap_1p5()
+        .text_xs()
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(t.success_foreground)
+        .child(Icon::new(IconName::Check).size(px(14.)))
+        .child("Ready")
+        .into_any_element()
 }
 
 /// `resolveProviderInstanceEnabled` for a Codex instance, enabled by default.
@@ -1339,9 +1541,12 @@ impl Render for AccountSection {
             return self.render_antigravity(window, cx);
         }
         let Some(snapshot) = self.snapshot(cx) else { return div().into_any_element() };
+        let managed = codex_setup_managed(&snapshot.instance["config"]);
+        if self.onboarding.is_some() && !managed {
+            return self.render_codex_choice(&snapshot, cx);
+        }
         let codex = self.wizard.is_some()
-            || (snapshot.instance["driver"].as_str().unwrap_or(&snapshot.provider.driver) == "codex"
-                && codex_setup_managed(&snapshot.instance["config"]));
+            || (snapshot.instance["driver"].as_str().unwrap_or(&snapshot.provider.driver) == "codex" && managed);
         let instance_id = self.instance_id.clone();
         subscribe(
             self,
@@ -1390,7 +1595,7 @@ impl AccountSection {
                 cx.background_spawn(async move { client.request("server.refreshProviders", payload).await }).detach();
             }
         }
-        if self.wizard.is_some()
+        if self.auto_start
             && !self.auto_start_handled
             && !view.unavailable
             && !view.busy
@@ -1401,6 +1606,13 @@ impl AccountSection {
             cx.defer_in(window, |this, _, cx| this.setup("chatgpt", cx));
         }
         if !setup.as_ref().is_some_and(|s| s.can_authenticate) {
+            if self.onboarding.is_some() {
+                let open = button("codex-open-page", "Open sign-in page").outline().min_w(px(176.)).disabled(true);
+                let cancel = button("codex-cancel-sign-in", "Cancel").ghost().disabled(true);
+                let (title, description) = (agent_name(provider), text(SIGN_IN_IN_BROWSER));
+                let (cancel, open) = (Some(cancel.into_any_element()), Some(open.into_any_element()));
+                return welcome_card(&t, title, description, cancel, open, Vec::new());
+            }
             return settings_row(&t, "ChatGPT account", Some(text("Preparing sign-in.")), None).into_any_element();
         }
         let auth = self.auth.data.clone();
@@ -1433,6 +1645,29 @@ impl AccountSection {
                 .unwrap_or_else(|| "T3 Code downloads and manages Codex for you.".into()),
         };
         let email = provider.auth.email.as_deref().map(str::trim).filter(|e| !e.is_empty()).map(str::to_owned);
+        let read_only = self.providers_read_only(cx);
+        let can_start = if view.installed {
+            setup.as_ref().is_some_and(|s| s.can_authenticate)
+        } else {
+            setup.as_ref().is_some_and(|s| s.can_install)
+        };
+        if self.onboarding.is_some() {
+            let card = CodexCard {
+                title: agent_name(provider),
+                view,
+                phase,
+                flow_id,
+                url,
+                requested_email,
+                has_saved_account,
+                runtime_description,
+                email,
+                read_only,
+                can_start,
+                install_failure: installation.filter(|i| i.phase == "failed").map(|i| i.message.unwrap_or_default()),
+            };
+            return self.render_codex_card(card, window, cx);
+        }
         let description: AnyElement = if view.finishing_sign_in {
             text("Finishing sign-in...")
         } else if view.install_active {
@@ -1464,13 +1699,7 @@ impl AccountSection {
             text(reconnect_email.unwrap_or_else(|| "Use your ChatGPT subscription.".into()))
         };
 
-        let read_only = self.workspace.upgrade().is_none_or(|w| w.read(cx).providers_read_only());
         let pending = self.pending;
-        let can_start = if view.installed {
-            setup.as_ref().is_some_and(|s| s.can_authenticate)
-        } else {
-            setup.as_ref().is_some_and(|s| s.can_install)
-        };
         let control = if view.auth_active {
             let waiting = phase == "waiting";
             let open_url = url.clone();
@@ -1595,42 +1824,12 @@ impl AccountSection {
             .filter(|a| a.phase == "idle")
             .and_then(|a| a.message.clone())
             .filter(|message| message.starts_with("Signed out locally."));
-        let callback_completion = (phase == "waiting" && url.is_some()).then(|| {
-            let draft_id = format!("{}:callback", flow_id.clone().unwrap_or_default());
-            let input = self.field(&draft_id, "callback", true, "Paste the URL from the sign-in tab", window, cx);
-            let typed = !input.read(cx).value().trim().is_empty();
-            let browser_url = url.clone().unwrap_or_default();
-            v_flex()
-                .w_full()
-                .gap_3()
-                .text_xs()
-                .text_color(t.muted_foreground)
-                .child("If sign-in doesn't return to T3 Code, paste the URL from the final localhost page.")
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .child(
-                            div().flex_1().min_w_0().child(Input::new(&input).small().disabled(pending || read_only)),
-                        )
-                        .child(
-                            button("codex-callback-connect", "Connect")
-                                .outline()
-                                .disabled(pending || read_only || !typed)
-                                .on_click(cx.listener(|this, _, _, cx| this.submit_callback(cx))),
-                        ),
-                )
-                .child(
-                    div().child(
-                        Button::new("codex-try-browser")
-                            .ghost()
-                            .xsmall()
-                            .text_color(t.muted_foreground)
-                            .child("Try sign-in in your browser")
-                            .child(Icon::new(IconName::ExternalLink).size(px(14.)))
-                            .on_click(move |_, _, cx| cx.open_url(&browser_url)),
-                    ),
-                )
-        });
+        let callback_completion = match &url {
+            Some(url) if phase == "waiting" => {
+                Some(self.callback_completion(flow_id.as_deref(), url.clone(), read_only, &t, window, cx))
+            }
+            _ => None,
+        };
         let help_open = self.callback_help_open;
         let callback_fallback = callback_completion.map(|completion| {
             v_flex()
@@ -1697,6 +1896,296 @@ impl AccountSection {
             .when_some(error, |el, error| {
                 el.child(error_line(&t, error).border_t_1().border_color(t.border.opacity(0.5)))
             })
+            .into_any_element()
+    }
+
+    /// `callbackCompletion`: paste the final localhost URL when the redirect does not come back.
+    fn callback_completion(
+        &mut self,
+        flow_id: Option<&str>,
+        browser_url: String,
+        read_only: bool,
+        t: &Tokens,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::Div {
+        let pending = self.pending;
+        let draft_id = format!("{}:callback", flow_id.unwrap_or_default());
+        let input = self.field(&draft_id, "callback", true, "Paste the URL from the sign-in tab", window, cx);
+        let typed = !input.read(cx).value().trim().is_empty();
+        v_flex()
+            .w_full()
+            .gap_3()
+            .text_xs()
+            .text_color(t.muted_foreground)
+            .child("If sign-in doesn't return to T3 Code, paste the URL from the final localhost page.")
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(div().flex_1().min_w_0().child(Input::new(&input).small().disabled(pending || read_only)))
+                    .child(
+                        button("codex-callback-connect", "Connect")
+                            .outline()
+                            .disabled(pending || read_only || !typed)
+                            .on_click(cx.listener(|this, _, _, cx| this.submit_callback(cx))),
+                    ),
+            )
+            .child(
+                div().child(
+                    Button::new("codex-try-browser")
+                        .ghost()
+                        .xsmall()
+                        .text_color(t.muted_foreground)
+                        .child("Try sign-in in your browser")
+                        .child(Icon::new(IconName::ExternalLink).size(px(14.)))
+                        .on_click(move |_, _, cx| cx.open_url(&browser_url)),
+                ),
+            )
+    }
+
+    /// `ManagedCodexSetup presentation="onboarding"`: the Welcome page's ChatGPT card.
+    fn render_codex_card(&mut self, card: CodexCard, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let t = *theme::tokens(cx);
+        let CodexCard { view, phase, flow_id, url, read_only, .. } = &card;
+        let read_only = *read_only;
+        let pending = self.pending;
+        let callback = match url {
+            Some(url) if phase == "waiting" => {
+                Some(self.callback_completion(flow_id.as_deref(), url.clone(), read_only, &t, window, cx))
+            }
+            _ => None,
+        };
+        let help_open = self.callback_help_open;
+        let description: AnyElement = if view.install_active {
+            text(card.runtime_description.clone())
+        } else if view.authenticated {
+            match &card.email {
+                Some(email) => self.signed_in_as(email, &t, cx),
+                None => text("Connected to ChatGPT."),
+            }
+        } else if callback.is_some() {
+            // `CodexSignInDescription` with its toggle: the paste-the-URL help opens below.
+            h_flex()
+                .id("codex-sign-in-help")
+                .gap_1p5()
+                .cursor_pointer()
+                .tab_index(0)
+                .rounded_sm()
+                .focus_visible(|style| style.border_1().border_color(t.ring))
+                .child(SIGN_IN_IN_BROWSER)
+                .child(Icon::new(if help_open { IconName::ChevronDown } else { IconName::ChevronRight }).size(px(12.)))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.callback_help_open = !this.callback_help_open;
+                    cx.notify();
+                }))
+                .into_any_element()
+        } else if view.starting_automatically
+            || view.waiting_for_auth_state
+            || matches!(phase.as_str(), "starting" | "waiting")
+            || (pending && !view.install_active)
+        {
+            text(SIGN_IN_IN_BROWSER)
+        } else if view.auth_active || phase == "failed" || phase == "cancelled" {
+            text(match (phase.as_str(), &card.requested_email) {
+                ("waiting", Some(email)) => format!("Continue as {email} on OpenAI."),
+                _ => self
+                    .auth
+                    .data
+                    .as_ref()
+                    .and_then(|a| a.message.clone())
+                    .unwrap_or_else(|| "Finish signing in in your browser.".into()),
+            })
+        } else {
+            text("Code with your ChatGPT subscription.")
+        };
+
+        let control = if view.authenticated && !view.busy {
+            ready_badge(&t)
+        } else if view.auth_active {
+            let waiting = phase == "waiting";
+            let (open_url, flow) = (url.clone(), flow_id.clone());
+            button("codex-open-page", if view.finishing_sign_in { "Finishing sign-in..." } else { "Open sign-in page" })
+                .outline()
+                .min_w(px(176.))
+                .disabled(url.is_none() || !waiting)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(url) = open_url.clone() {
+                        this.open_page(url, flow.clone(), cx);
+                    }
+                }))
+                .into_any_element()
+        } else {
+            let has_saved_account = card.has_saved_account;
+            let label = if view.install_active || pending {
+                "Setting up..."
+            } else if has_saved_account {
+                "Reconnect account"
+            } else {
+                "Continue with ChatGPT"
+            };
+            chatgpt_connection_button("codex-connect", label)
+                .disabled(view.unavailable || view.busy || !card.can_start)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if has_saved_account {
+                        this.open_account_picker(window, cx);
+                    } else {
+                        this.setup("chatgpt", cx);
+                    }
+                }))
+                .into_any_element()
+        };
+        let muted = |id: &'static str, label: &'static str| button(id, label).ghost().text_color(t.muted_foreground);
+        let secondary = if (view.auth_active && !view.finishing_sign_in) || view.install_active {
+            let sign_in = view.auth_active && flow_id.is_some();
+            Some(muted("codex-cancel", "Cancel").disabled(pending || read_only).on_click(cx.listener(
+                move |this, _, _, cx| {
+                    if sign_in {
+                        this.cancel_sign_in(cx);
+                    } else {
+                        this.cancel_install(cx);
+                    }
+                },
+            )))
+        } else if !view.auth_active && !view.authenticated && card.has_saved_account {
+            Some(
+                muted("codex-different-account", "Use a different account")
+                    .disabled(view.unavailable || view.busy)
+                    .on_click(cx.listener(|this, _, _, cx| this.setup(CHANGE_ACCOUNT, cx))),
+            )
+        } else if !view.auth_active && !view.authenticated && self.wizard.is_none() {
+            let change = self.onboarding.as_ref().map(|o| o.on_mode_change.clone());
+            Some(
+                muted("codex-existing-cli", "Use existing CLI")
+                    .disabled(read_only || view.busy || self.terminals_denied(cx))
+                    .on_click(move |_, window, cx| {
+                        if let Some(change) = &change {
+                            change("existing", window, cx);
+                        }
+                    }),
+            )
+        } else {
+            None
+        };
+
+        let logout_warning = self
+            .auth
+            .data
+            .as_ref()
+            .filter(|a| a.phase == "idle")
+            .and_then(|a| a.message.clone())
+            .filter(|message| message.starts_with("Signed out locally."));
+        let setup_error = logout_warning.or_else(|| self.error.as_ref().map(ToString::to_string)).or_else(|| {
+            if self.auth.error.is_some() || self.install.error.is_some() {
+                Some("Could not read setup status. Reconnect and try again.".into())
+            } else {
+                card.install_failure.clone()
+            }
+        });
+        let mut footer = Vec::new();
+        if let Some(callback) = callback.filter(|_| help_open) {
+            footer.push(
+                div()
+                    .w_full()
+                    .border_t_1()
+                    .border_color(t.border.opacity(0.5))
+                    .pt_3()
+                    .child(callback)
+                    .into_any_element(),
+            );
+        }
+        if let Some(error) = setup_error {
+            footer.push(div().text_xs().text_color(t.error_foreground).child(error).into_any_element());
+        }
+        welcome_card(&t, card.title, description, secondary.map(IntoElement::into_any_element), Some(control), footer)
+    }
+
+    /// `CodexSetupSection` in "existing" mode on the Welcome page: the ChatGPT runtime or the CLI.
+    fn render_codex_choice(&mut self, snapshot: &Snapshot, cx: &mut Context<Self>) -> AnyElement {
+        let t = *theme::tokens(cx);
+        let provider = &snapshot.provider;
+        let state = onboarding_state(provider);
+        let ready = provider.enabled && state == AgentState::Ready;
+        let checking = state == AgentState::Checking;
+        let authenticated = provider.auth.status == "authenticated";
+        let (headline, denial) = {
+            let workspace = self.workspace.upgrade();
+            let info = workspace.as_ref().and_then(|w| w.read(cx).env_info(self.scope.as_ref()?));
+            let json =
+                info.and_then(|i| i.providers_json.iter().find(|p| p["instanceId"] == self.instance_id.as_str()));
+            // A policy that owns Codex's launch settings also rules out ChatGPT's own runtime.
+            let denial = info
+                .and_then(|i| super::add::config_locks(&i.managed_policy, "codex"))
+                .filter(|(keys, _)| keys.contains("setupMode"))
+                .map(|(_, reason)| reason);
+            (super::instances::summary(json).0, denial)
+        };
+        let email = provider.auth.email.as_deref().map(str::trim).filter(|e| !e.is_empty()).map(str::to_owned);
+        let description = if ready {
+            match &email {
+                Some(email) => self.signed_in_as(email, &t, cx),
+                None => text("Connected with your Codex CLI."),
+            }
+        } else if checking {
+            text("Checking your Codex CLI...")
+        } else if provider.installed {
+            text(headline.clone())
+        } else {
+            text("Code with your ChatGPT subscription.")
+        };
+        let change = self.onboarding.as_ref().map(|o| o.on_mode_change.clone());
+        let control = if ready {
+            ready_badge(&t)
+        } else if checking {
+            div().text_xs().text_color(t.muted_foreground).child("Checking...").into_any_element()
+        } else if authenticated {
+            div().text_xs().text_color(t.muted_foreground).child(headline).into_any_element()
+        } else {
+            let change = change.clone();
+            let connect = chatgpt_connection_button("codex-connect", "Continue with ChatGPT");
+            match denial {
+                // `ManagedControl`: inert, with the policy's reason.
+                Some(reason) => connect.disabled(true).tooltip(reason).into_any_element(),
+                None => connect
+                    .disabled(self.providers_read_only(cx))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        // Sign in as soon as the ChatGPT runtime is set up (`requested`).
+                        this.auto_start = true;
+                        this.auto_start_handled = false;
+                        if let Some(change) = &change {
+                            change("managed", window, cx);
+                        }
+                    }))
+                    .into_any_element(),
+            }
+        };
+        let secondary = (!authenticated && !ready && !checking).then(|| {
+            button("codex-existing-cli", "Use existing CLI")
+                .ghost()
+                .text_color(t.muted_foreground)
+                .disabled(self.terminals_denied(cx))
+                .on_click(move |_, window, cx| {
+                    if let Some(change) = &change {
+                        change("existing", window, cx);
+                    }
+                })
+                .into_any_element()
+        });
+        welcome_card(&t, agent_name(provider), description, secondary, Some(control), Vec::new())
+    }
+
+    /// "Signed in as {email}." with the address hidden until clicked.
+    fn signed_in_as(&self, email: &str, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+        h_flex()
+            .flex_wrap()
+            .gap_1()
+            .child("Signed in as")
+            .child(redacted_email(&self.instance_id, email, self.email_revealed, t).on_click(cx.listener(
+                |this, _, _, cx| {
+                    this.email_revealed = !this.email_revealed;
+                    cx.notify();
+                },
+            )))
+            .child(".")
             .into_any_element()
     }
 
@@ -1886,37 +2375,24 @@ impl AccountSection {
                     .child("in your browser."),
             );
         }
-        if let Some(Interaction::Terminal { output, .. }) = &interaction {
-            let focus = self.terminal_focus.get_or_insert_with(|| cx.focus_handle()).clone();
+        if let Some(Interaction::Terminal { id, output, output_offset }) = &interaction {
+            let key = format!("{}:{id}", auth.as_ref().and_then(|a| a.flow_id.as_deref()).unwrap_or_default());
+            let session = self.sync_terminal(key, output, *output_offset, window, cx);
             details = details.child(
                 div().py_2().child(
                     div()
                         .id("auth-terminal")
-                        .track_focus(&focus)
+                        .relative()
                         .h(px(256.))
-                        .overflow_y_scroll()
+                        .overflow_hidden()
                         .rounded_md()
                         .border_1()
-                        .border_color(if focus.is_focused(window) { t.ring } else { t.border })
-                        .bg(t.background)
-                        .p_2()
-                        .font_family(t.fonts.mono)
-                        .text_size(px(13.))
-                        .text_color(t.foreground)
-                        .child(strip_ansi(output))
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            if let Some(focus) = &this.terminal_focus {
-                                window.focus(focus, cx);
-                            }
-                        }))
-                        .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                            if let Some(data) = terminal_input(event) {
-                                cx.stop_propagation();
-                                this.send_terminal(data, cx);
-                            }
-                        })),
+                        .border_color(t.border)
+                        .child(session),
                 ),
             );
+        } else {
+            self.terminal = None;
         }
         if let Some(Interaction::Credentials { fields, .. }) = &interaction {
             let mut form = v_flex().gap_2().py_2().text_sm();
@@ -2379,10 +2855,29 @@ mod tests {
     }
 
     #[test]
-    fn terminal_output_drops_control_sequences() {
-        assert_eq!(
-            strip_ansi("\x1b[1;32mSign in\x1b[0m\r\nCode: \x1b]8;;https://x\x07link\x1b]8;;\x07"),
-            "Sign in\nCode: link"
-        );
+    fn sign_in_output_appends_what_is_new_and_redraws_after_a_gap() {
+        assert_eq!(output_step("", 0, 0), OutputStep::Unchanged);
+        assert_eq!(output_step("Sign in", 7, 0), OutputStep::Append("Sign in"));
+        assert_eq!(output_step("Sign in: ok", 11, 7), OutputStep::Append(": ok"));
+        assert_eq!(output_step("Sign in: ok", 11, 11), OutputStep::Unchanged);
+        // The window kept only the tail: what was missed is no longer there.
+        assert_eq!(output_step("tail", 40, 10), OutputStep::Reset);
+        // A new flow's output restarts from zero.
+        assert_eq!(output_step("again", 5, 11), OutputStep::Reset);
+        // Offsets count UTF-16 units, and a surrogate pair is never split.
+        assert_eq!(output_step("a😀b", 4, 1), OutputStep::Append("😀b"));
+        assert_eq!(utf16_tail("a😀", 1), "😀");
+        assert_eq!(utf16_tail("abc", 0), "");
+    }
+
+    #[test]
+    fn terminal_responses_split_below_the_limit_and_a_resize_sends_one() {
+        assert_eq!(utf16_chunks("", 4), vec![""]);
+        assert_eq!(utf16_chunks("abcdefghij", 4), vec!["abcd", "efgh", "ij"]);
+        assert_eq!(utf16_chunks("abc😀", 4), vec!["abc", "😀"]);
+        assert_eq!(utf16_chunks("ab😀", 4), vec!["ab😀"]);
+        assert!(is_web_link("HTTPS://auth.example/device"));
+        assert!(is_web_link("http://localhost:1455"));
+        assert!(!is_web_link("file:///etc/passwd"));
     }
 }

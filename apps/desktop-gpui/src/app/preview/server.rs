@@ -5,20 +5,24 @@
 
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::ops::Range;
+use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use futures::{SinkExt as _, StreamExt as _};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{Disableable as _, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Bounds, ClickEvent, Context, Entity, FocusHandle, InteractiveElement as _,
-    IntoElement, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ObjectFit, ParentElement as _, Pixels, Point, RenderImage, ScrollDelta, ScrollEvent, SharedString,
-    Styled as _, StyledImage as _, Task, Window, canvas, div, img, px,
+    AnyElement, App, AppContext as _, Bounds, ClickEvent, Context, DispatchPhase, ElementInputHandler, Entity,
+    EntityInputHandler, FocusHandle, InteractiveElement as _, IntoElement, KeyDownEvent, KeyUpEvent, Keystroke,
+    Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement as _,
+    PathPromptOptions, Pixels, Point, RenderImage, ScrollDelta, ScrollEvent, SharedString, Styled as _,
+    StyledImage as _, Task, UTF16Selection, Window, canvas, div, img, px, size,
 };
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -29,7 +33,7 @@ use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
 use super::super::Workspace;
 use super::super::right_panel::Surface;
-use crate::preview::{self, NavStatus, Session, Viewport};
+use crate::preview::{self, NavStatus, Session, TabRef, ThreadRef, Viewport};
 use crate::theme::Tokens;
 
 const TAB_GONE: u16 = 4404;
@@ -95,6 +99,284 @@ fn control_label(control: Option<&Control>) -> &'static str {
     }
 }
 
+/// The page's open file picker, offered to this viewer (`PreviewStreamFileChooser`).
+#[derive(Clone, Debug, PartialEq)]
+struct FileChooser {
+    id: String,
+    multiple: bool,
+}
+
+#[derive(Debug, PartialEq)]
+enum ChooserMessage {
+    Offered(FileChooser),
+    Closed(String),
+}
+
+impl ChooserMessage {
+    /// `fileChooser` and `fileChooserClosed`; anything else, or a malformed one, is `None`.
+    fn parse(value: &Value) -> Option<Self> {
+        let id = value["id"].as_str()?.to_owned();
+        match value["type"].as_str()? {
+            // GPUI's system picker has no type filter for the input's `accept`; the page checks
+            // the files it gets, as it would a drop.
+            "fileChooser" if value["accept"].is_string() => {
+                Some(Self::Offered(FileChooser { id, multiple: value["multiple"].as_bool()? }))
+            }
+            "fileChooserClosed" => Some(Self::Closed(id)),
+            _ => None,
+        }
+    }
+
+    /// A closed picker withdraws only the offer it names; a newer one stays.
+    fn apply(self, chooser: &mut Option<FileChooser>) {
+        match self {
+            Self::Offered(offer) => *chooser = Some(offer),
+            Self::Closed(id) => {
+                if chooser.as_ref().is_some_and(|open| open.id == id) {
+                    *chooser = None;
+                }
+            }
+        }
+    }
+}
+
+/// The page's text-input bridge (the web's hidden textarea): an IME composition stays here
+/// until it commits, then reaches the page as one `text` input.
+#[derive(Debug, Default)]
+struct Composition {
+    marked: String,
+    /// A Windows dead key went to the platform, which composes it with the next key that types.
+    dead_key: bool,
+}
+
+impl Composition {
+    fn mark(&mut self, text: &str) {
+        text.clone_into(&mut self.marked);
+    }
+
+    /// Committed text replaces the composition; the page types it unless it is empty. Typed
+    /// text means no dead key waits: Windows sends a dead key no character.
+    fn commit(&mut self, text: &str) -> Option<String> {
+        self.marked.clear();
+        self.dead_key = false;
+        (!text.is_empty()).then(|| text.to_owned())
+    }
+
+    /// The platform ended the composition without a commit (a click, focus moving): what it
+    /// showed is kept, as a browser's `compositionend` keeps it.
+    fn unmark(&mut self) -> Option<String> {
+        let text = std::mem::take(&mut self.marked);
+        (!text.is_empty()).then_some(text)
+    }
+
+    fn marked_range(&self) -> Option<Range<usize>> {
+        (!self.marked.is_empty()).then(|| 0..self.marked.encode_utf16().count())
+    }
+
+    /// Whether a key down belongs to the platform's composition, so it types through the input
+    /// handler instead of reaching the page as a key (the terminal's `composing`). A Windows dead
+    /// key, the key that completes it, and text a modifier types (`AltGr`) need the
+    /// `TranslateMessage` a handled key skips. Until that text commits, the key may be a dead key.
+    fn composing(&mut self, keystroke: &Keystroke, prefer_character_input: bool) -> bool {
+        let m = &keystroke.modifiers;
+        let plain = !(m.control || m.alt || m.platform || m.function);
+        let completes_dead_key = keystroke.key_char.is_some() && std::mem::take(&mut self.dead_key);
+        if prefer_character_input {
+            self.dead_key = !completes_dead_key;
+            return true;
+        }
+        !self.marked.is_empty() || (plain && completes_dead_key)
+    }
+}
+
+/// Typed and composed text for the page, while this viewer drives it. Keys the key listener
+/// forwards never reach it: a handled key down sends no text on any platform.
+pub(super) struct PageInput {
+    outgoing: mpsc::UnboundedSender<String>,
+    /// Connected, operable and controlled by this viewer, as `ServerStream::send` requires.
+    live: bool,
+    composition: Composition,
+}
+
+impl PageInput {
+    fn set_live(&mut self, live: bool) {
+        self.live = live;
+        if !live {
+            self.composition = Composition::default();
+        }
+    }
+
+    fn type_text(&self, text: Option<String>) {
+        if let Some(text) = text.filter(|_| self.live) {
+            let _ = self.outgoing.send(json!({"type": "text", "text": text}).to_string());
+        }
+    }
+}
+
+impl EntityInputHandler for PageInput {
+    fn text_for_range(
+        &mut self,
+        _: Range<usize>,
+        _: &mut Option<Range<usize>>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<String> {
+        None
+    }
+
+    fn selected_text_range(&mut self, _: bool, _: &mut Window, _: &mut Context<Self>) -> Option<UTF16Selection> {
+        let end = self.composition.marked_range().map_or(0, |range| range.end);
+        Some(UTF16Selection { range: end..end, reversed: false })
+    }
+
+    fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
+        self.composition.marked_range()
+    }
+
+    fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
+        let text = self.composition.unmark();
+        self.type_text(text);
+    }
+
+    fn replace_text_in_range(&mut self, _: Option<Range<usize>>, text: &str, _: &mut Window, _: &mut Context<Self>) {
+        let text = self.composition.commit(text);
+        self.type_text(text);
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _: Option<Range<usize>>,
+        text: &str,
+        _: Option<Range<usize>>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) {
+        if self.live {
+            self.composition.mark(text);
+        }
+    }
+
+    /// The frame's top-left corner, where the web pins its textarea, so the IME window opens there.
+    fn bounds_for_range(
+        &mut self,
+        _: Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        Some(Bounds::new(element_bounds.origin, size(px(1.), px(16.))))
+    }
+
+    fn character_index_for_point(&mut self, _: Point<Pixels>, _: &mut Window, _: &mut Context<Self>) -> Option<usize> {
+        None
+    }
+
+    fn accepts_text_input(&self, _: &mut Window, _: &mut Context<Self>) -> bool {
+        self.live
+    }
+}
+
+/// A key event for the page: a release, or a press that may ask for character input
+/// (`KeyDownEvent::prefer_character_input`, a Windows dead key).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyAction {
+    Down,
+    DownComposing,
+    Up,
+}
+
+/// Shift+Escape takes the keyboard back from the page (`aria-description` on the web's textarea).
+fn leaves_page(keystroke: &Keystroke) -> bool {
+    let m = &keystroke.modifiers;
+    keystroke.key == "escape" && m.shift && !(m.control || m.alt || m.platform || m.function)
+}
+
+/// The server's `UPLOAD_MAX_FILE_BYTES` and `UPLOAD_MAX_FILES`: a larger answer is refused
+/// there anyway, so it is never read into memory here.
+const UPLOAD_MAX_BYTES: u64 = 100 * 1024 * 1024;
+const UPLOAD_MAX_FILES: usize = 20;
+const UPLOAD_REFUSED: &str = "The upload was refused.";
+
+/// `previewStreamUploadUrl`.
+fn upload_url(http_base: &str, tab: &TabRef, chooser: &str) -> String {
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("threadId", &tab.thread.thread_id)
+        .append_pair("tabId", &tab.tab_id)
+        .append_pair("chooser", chooser)
+        .finish();
+    format!("{http_base}/api/preview-stream/upload?{query}")
+}
+
+struct UploadFile {
+    name: String,
+    mime: String,
+    bytes: Vec<u8>,
+}
+
+/// A `multipart/form-data` body of `file` parts, as the web's `FormData`; no parts cancels the
+/// page's picker. Quotes and line breaks in names are percent-encoded, as browsers do.
+fn multipart_body(boundary: &str, files: &[UploadFile]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for file in files {
+        let name = file.name.replace('"', "%22").replace('\r', "%0D").replace('\n', "%0A");
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\nContent-Type: {}\r\n\r\n",
+                file.mime
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(&file.bytes);
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    body
+}
+
+fn read_upload_files(paths: Vec<PathBuf>) -> Result<Vec<UploadFile>, String> {
+    if paths.len() > UPLOAD_MAX_FILES {
+        return Err(UPLOAD_REFUSED.to_owned());
+    }
+    let mut total = 0;
+    for path in &paths {
+        total += std::fs::metadata(path).map_err(|error| format!("{}: {error}", path.display()))?.len();
+    }
+    if total > UPLOAD_MAX_BYTES {
+        return Err(UPLOAD_REFUSED.to_owned());
+    }
+    paths
+        .into_iter()
+        .map(|path| {
+            let bytes = std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+            let name = path.file_name().map_or_else(|| "file".into(), |name| name.to_string_lossy().into_owned());
+            let mime = mime_guess::from_path(&path).first_or_octet_stream().to_string();
+            Ok(UploadFile { name, mime, bytes })
+        })
+        .collect()
+}
+
+/// `uploadPreviewStreamFiles`: answers the page's picker with `paths`, authenticated as the
+/// stream is, on the environment that owns the tab.
+async fn upload_files(url: String, token: String, paths: Vec<PathBuf>) -> Result<(), String> {
+    static UPLOADS: LazyLock<reqwest::Client> = LazyLock::new(reqwest::Client::new);
+    let files =
+        tokio::task::spawn_blocking(move || read_upload_files(paths)).await.map_err(|error| error.to_string())??;
+    let boundary = format!("t3-{}", uuid::Uuid::new_v4().simple());
+    let response = UPLOADS
+        .post(url)
+        .bearer_auth(token)
+        .header(reqwest::header::CONTENT_TYPE, format!("multipart/form-data; boundary={boundary}"))
+        .body(multipart_body(&boundary, &files))
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if response.status().is_success() {
+        return Ok(());
+    }
+    let text = response.text().await.unwrap_or_default();
+    Err(if text.is_empty() { UPLOAD_REFUSED.to_owned() } else { text })
+}
+
 /// What the stream's socket last told the view.
 enum Incoming {
     Connected(bool),
@@ -146,12 +428,23 @@ pub(super) struct ServerStream {
     sent_size: Option<(u32, u32)>,
     buttons: u8,
     focus: FocusHandle,
+    input: Entity<PageInput>,
+    file_chooser: Option<FileChooser>,
     /// A `prompt` dialog's response.
     prompt: Entity<InputState>,
     _task: Task<()>,
 }
 
 impl ServerStream {
+    fn mine(&self) -> bool {
+        self.control.as_ref().is_some_and(Control::mine)
+    }
+
+    /// Whether `send` would carry this viewer's input.
+    fn live(&self) -> bool {
+        self.connected && self.control.as_ref().is_some_and(|control| control.can_operate && control.mine())
+    }
+
     /// `PreviewStreamClient.send`: only the controller sends, except the claim itself.
     fn send(&self, input: Value) -> bool {
         let Some(control) = self.control.as_ref().filter(|c| self.connected && c.can_operate) else { return false };
@@ -171,11 +464,11 @@ struct PdfView {
 
 #[derive(Default)]
 pub(super) struct ServerStreams {
-    streams: HashMap<String, ServerStream>,
-    pdfs: HashMap<String, PdfView>,
+    streams: HashMap<TabRef, ServerStream>,
+    pdfs: HashMap<TabRef, PdfView>,
     /// The agent tabs the panel and the mini player drew this frame, and those drawn as PDFs.
-    pub(super) drawn: Vec<String>,
-    pdf_drawn: Vec<String>,
+    pub(super) drawn: Vec<TabRef>,
+    pdf_drawn: Vec<TabRef>,
 }
 
 impl Workspace {
@@ -204,28 +497,25 @@ impl Workspace {
         });
     }
 
-    /// Connects `tab_id`'s stream, or keeps it connected through this frame.
-    pub(super) fn keep_server_stream(
-        &mut self,
-        thread_id: &str,
-        tab_id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.ensure_server_stream(thread_id, tab_id, window, cx);
-        if !self.preview.server.drawn.iter().any(|drawn| drawn == tab_id) {
-            self.preview.server.drawn.push(tab_id.to_owned());
+    /// The CSS viewport `tab`'s stream last reported (`onViewport`).
+    pub(super) fn stream_viewport(&self, tab: &TabRef) -> Option<(f32, f32)> {
+        self.preview.server.streams.get(tab)?.viewport
+    }
+
+    /// Connects `tab`'s stream, or keeps it connected through this frame.
+    pub(super) fn keep_server_stream(&mut self, tab: &TabRef, window: &mut Window, cx: &mut Context<Self>) {
+        self.ensure_server_stream(tab, window, cx);
+        if !self.preview.server.drawn.contains(tab) {
+            self.preview.server.drawn.push(tab.clone());
         }
     }
 
-    fn ensure_server_stream(&mut self, thread_id: &str, tab_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if self.preview.server.streams.contains_key(tab_id) {
+    fn ensure_server_stream(&mut self, key: &TabRef, window: &mut Window, cx: &mut Context<Self>) {
+        if self.preview.server.streams.contains_key(key) {
             return;
         }
         // The tab streams from its thread's environment.
-        let Some(endpoint) = self.thread_environment(thread_id).and_then(|env| self.env_endpoint(&env).cloned()) else {
-            return;
-        };
+        let Some(endpoint) = self.env_endpoint(&key.thread.environment).cloned() else { return };
         let scale = window.scale_factor();
         let size = window.viewport_size();
         #[expect(
@@ -235,8 +525,8 @@ impl Workspace {
         )]
         let max = |px: Pixels| ((f32::from(px) * scale).round() as u32).max(1).to_string();
         let query = url::form_urlencoded::Serializer::new(String::new())
-            .append_pair("threadId", thread_id)
-            .append_pair("tabId", tab_id)
+            .append_pair("threadId", &key.thread.thread_id)
+            .append_pair("tabId", &key.tab_id)
             .append_pair("maxWidth", &max(size.width))
             .append_pair("maxHeight", &max(size.height))
             .finish();
@@ -246,7 +536,7 @@ impl Workspace {
         let (outgoing, outgoing_rx) = mpsc::unbounded_channel();
         let (events_tx, events) = async_channel::unbounded();
         crate::runtime().spawn(run_stream(url, token, events_tx, outgoing_rx));
-        let tab = tab_id.to_owned();
+        let tab = key.clone();
         let task = cx.spawn_in(window, async move |this, cx| {
             while let Ok(first) = events.recv().await {
                 // The latest frame wins; older ones in the batch are never painted.
@@ -256,6 +546,7 @@ impl Workspace {
                     for event in batch {
                         this.on_server_stream(&tab, event, window, cx);
                     }
+                    this.sync_page_input(&tab, window, cx);
                     cx.notify();
                 });
                 if alive.is_err() {
@@ -263,6 +554,8 @@ impl Workspace {
                 }
             }
         });
+        let input =
+            cx.new(|_| PageInput { outgoing: outgoing.clone(), live: false, composition: Composition::default() });
         let stream = ServerStream {
             frame: None,
             frame_size: (0, 0),
@@ -277,20 +570,24 @@ impl Workspace {
             sent_size: None,
             buttons: 0,
             focus: cx.focus_handle(),
+            input,
+            file_chooser: None,
             prompt: cx.new(|cx| InputState::new(window, cx)),
             _task: task,
         };
-        self.preview.server.streams.insert(tab_id.to_owned(), stream);
+        self.preview.server.streams.insert(key.clone(), stream);
     }
 
-    fn on_server_stream(&mut self, tab_id: &str, event: Incoming, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(stream) = self.preview.server.streams.get_mut(tab_id) else { return };
+    fn on_server_stream(&mut self, key: &TabRef, event: Incoming, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(stream) = self.preview.server.streams.get_mut(key) else { return };
         match event {
             Incoming::Connected(connected) => {
                 stream.connected = connected;
                 if !connected {
                     stream.control = None;
                     stream.buttons = 0;
+                    // The server offers a picker still open again, under a new id, on reconnect.
+                    stream.file_chooser = None;
                 }
             }
             Incoming::Frame(image, size) => {
@@ -302,8 +599,14 @@ impl Workspace {
                 stream.stopped = Some(stop);
                 stream.connected = false;
                 stream.control = None;
+                stream.file_chooser = None;
             }
             Incoming::Message(message) => match message["type"].as_str() {
+                Some("fileChooser" | "fileChooserClosed") => {
+                    if let Some(chooser) = ChooserMessage::parse(&message) {
+                        chooser.apply(&mut stream.file_chooser);
+                    }
+                }
                 Some("control") => {
                     let Some(control) = Control::parse(&message) else { return };
                     let previous = stream.control.as_ref().and_then(|c| c.dialog.as_ref());
@@ -341,10 +644,11 @@ impl Workspace {
                         cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(text.to_owned()));
                     }
                 }
-                // `showPreviewPopup`: a page's new window opens as its own tab.
+                // `showPreviewPopup`: a page's new window opens as its own tab, on its thread's panel.
                 Some("popup") => {
                     if let Some(popup) = message["tabId"].as_str() {
-                        self.open_surface(Surface::Browser(popup.to_owned()), window, cx);
+                        let target = super::panel_target(&key.thread);
+                        self.open_surface_on(&target, Surface::Browser(popup.to_owned()), window, cx);
                     }
                 }
                 _ => {}
@@ -356,17 +660,16 @@ impl Workspace {
     /// its view starts.
     fn server_pdf_view(
         &mut self,
-        thread_id: &str,
-        tab_id: &str,
+        key: &TabRef,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Option<Entity<gpui_webview::WebView>>> {
-        let session = self.preview.threads.get(thread_id)?.get(tab_id)?;
+        let session = self.preview.threads.session(key)?;
         let NavStatus::Success { url, .. } = &session.nav_status else { return None };
-        let endpoint = self.thread_environment(thread_id).and_then(|env| self.env_endpoint(&env).cloned())?;
+        let endpoint = self.env_endpoint(&key.thread.environment)?;
         let url = preview::pdf_asset_url(url, &endpoint.http_base)?;
-        self.preview.server.pdf_drawn.push(tab_id.to_owned());
-        if let Some(pdf) = self.preview.server.pdfs.get_mut(tab_id) {
+        self.preview.server.pdf_drawn.push(key.clone());
+        if let Some(pdf) = self.preview.server.pdfs.get_mut(key) {
             if pdf.url != url {
                 if let Some(view) = &pdf.view {
                     view.update(cx, |view, _| view.load_url(&url));
@@ -375,8 +678,8 @@ impl Workspace {
             }
             return Some(pdf.view.clone());
         }
-        self.preview.server.pdfs.insert(tab_id.to_owned(), PdfView { url, view: None, shown: false });
-        let tab = tab_id.to_owned();
+        self.preview.server.pdfs.insert(key.clone(), PdfView { url, view: None, shown: false });
+        let tab = key.clone();
         // `build_view` runs only from a task.
         cx.spawn_in(window, async move |this, cx| {
             let _ = this.update_in(cx, |this, window, cx| {
@@ -397,26 +700,107 @@ impl Workspace {
         Some(None)
     }
 
+    /// `serverInputDisabled`: an agent tab takes this viewer's navigation only while it has control.
+    pub(super) fn server_input_disabled(&self, tab: &TabRef) -> bool {
+        self.preview.threads.session(tab).is_some_and(crate::preview::Session::server_hosted)
+            && !self.preview.server.streams.get(tab).is_some_and(ServerStream::mine)
+    }
+
     /// Sends `input` to the agent tab on screen, if this viewer may.
-    pub(super) fn send_server_input(&self, tab_id: &str, input: Value) -> bool {
-        self.preview.server.streams.get(tab_id).is_some_and(|stream| stream.send(input))
+    pub(super) fn send_server_input(&self, tab: &TabRef, input: Value) -> bool {
+        self.preview.server.streams.get(tab).is_some_and(|stream| stream.send(input))
+    }
+
+    /// Keeps the text bridge in step with control; a viewer that loses control loses the
+    /// page's keyboard too, as the web blurs its textarea (`clearInput`).
+    fn sync_page_input(&mut self, tab: &TabRef, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(stream) = self.preview.server.streams.get(tab) else { return };
+        let live = stream.live();
+        stream.input.update(cx, |input, _| input.set_live(live));
+        if !live && stream.focus.is_focused(window) {
+            self.leave_server_page(tab, window, cx);
+        }
+    }
+
+    /// Moves focus off the page to the area that shows it: the panel, or the chat under the
+    /// mini player.
+    fn leave_server_page(&self, tab: &TabRef, window: &mut Window, cx: &mut App) {
+        let in_panel = self.preview_thread().as_ref() == Some(&tab.thread)
+            && self.active_surface() == Some(&Surface::Browser(tab.tab_id.clone()));
+        let area = if in_panel { &self.areas.panel } else { &self.focus };
+        area.focus(window, cx);
+    }
+
+    /// "Choose files": the system picker, then the upload, if the page still asks by then.
+    fn choose_server_files(&mut self, tab: &TabRef, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(stream) = self.preview.server.streams.get(tab) else { return };
+        let Some(chooser) = stream.file_chooser.clone().filter(|_| stream.live()) else { return };
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: chooser.multiple,
+            prompt: None,
+        });
+        let tab = tab.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            // A cancelled system picker leaves the page's picker waiting, as the web's does.
+            let Ok(Ok(Some(paths))) = paths.await else { return };
+            if paths.is_empty() {
+                return;
+            }
+            let _ =
+                this.update_in(cx, |this, window, cx| this.answer_file_chooser(&tab, &chooser.id, paths, window, cx));
+        })
+        .detach();
+    }
+
+    /// `answerFileChooser`: sends `paths` (none cancels) to the picker `id`, unless it closed or
+    /// control moved since it was offered.
+    fn answer_file_chooser(
+        &mut self,
+        tab: &TabRef,
+        id: &str,
+        paths: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(stream) = self.preview.server.streams.get_mut(tab) else { return };
+        if !stream.live() || stream.file_chooser.as_ref().is_none_or(|chooser| chooser.id != id) {
+            return;
+        }
+        stream.file_chooser = None;
+        cx.notify();
+        // The tab's own environment holds the picker.
+        let Some(endpoint) = self.env_endpoint(&tab.thread.environment) else { return };
+        let url = upload_url(&endpoint.http_base, tab, id);
+        let upload = crate::runtime().spawn(upload_files(url, endpoint.bearer_token.clone(), paths));
+        cx.spawn_in(window, async move |this, cx| {
+            let error = match upload.await {
+                Ok(Ok(())) => return,
+                Ok(Err(error)) => error,
+                Err(error) => error.to_string(),
+            };
+            log::warn!("server browser upload failed: {error}");
+            let _ = this.update_in(cx, |_, window, cx| {
+                window.push_notification(Notification::error(error).title("Could not send the files to the page"), cx);
+            });
+        })
+        .detach();
     }
 
     /// The agent tab's page: its latest frame with the control bar above it, or below it
     /// (`controlPosition="bottom"`) in the mini player.
-    #[expect(clippy::too_many_arguments, reason = "a render helper's layout options")]
     pub(super) fn render_server_page(
         &mut self,
-        thread_id: &str,
-        tab_id: &str,
+        key: &TabRef,
         follow_size: bool,
         bar_below: bool,
         tokens: &Tokens,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        self.keep_server_stream(thread_id, tab_id, window, cx);
-        let Some(stream) = self.preview.server.streams.get_mut(tab_id) else {
+        self.keep_server_stream(key, window, cx);
+        let Some(stream) = self.preview.server.streams.get_mut(key) else {
             return div().flex_1().into_any_element();
         };
         for image in stream.stale.drain(..) {
@@ -438,7 +822,11 @@ impl Workspace {
             stream.sent_size = Some(size);
             stream.send(json!({"type": "resize", "width": size.0, "height": size.1}));
         }
-        let stream = &self.preview.server.streams[tab_id];
+        // A press the window stopped seeing ends like the web's `pointercancel`.
+        if stream.buttons != 0 && !window.is_window_active() {
+            self.cancel_server_buttons(key, window.mouse_position());
+        }
+        let stream = &self.preview.server.streams[key];
         let control = stream.control.clone();
         let mine = control.as_ref().is_some_and(Control::mine);
         let bar = h_flex()
@@ -452,7 +840,7 @@ impl Workspace {
             .bg(tokens.background)
             .child(div().text_xs().text_color(tokens.muted_foreground).child(control_label(control.as_ref())))
             .children(control.as_ref().filter(|c| c.can_operate).map(|control| {
-                let tab = tab_id.to_owned();
+                let tab = key.clone();
                 let claim = if mine { "releaseControl" } else { "takeControl" };
                 Button::new("server-browser-control")
                     .outline()
@@ -464,9 +852,9 @@ impl Workspace {
                     }))
             }));
         // The native view would cover GPUI's dialog and stop overlays.
-        let overlay = self.render_server_overlay(tab_id, tokens, cx);
-        let pdf = if overlay.is_none() { self.server_pdf_view(thread_id, tab_id, window, cx) } else { None };
-        let stream = &self.preview.server.streams[tab_id];
+        let overlay = self.render_server_overlay(key, tokens, cx);
+        let pdf = if overlay.is_empty() { self.server_pdf_view(key, window, cx) } else { None };
+        let stream = &self.preview.server.streams[key];
         let fit = page_fit(stream.bounds.get(), stream.frame_size, stream.viewport);
         let cursor = stream
             .agent_pointer
@@ -486,9 +874,12 @@ impl Workspace {
             });
         let frame = stream.frame.clone().map(|frame| img(frame).size_full().object_fit(ObjectFit::Contain));
         let bounds_cell = stream.bounds.clone();
-        let tab = tab_id.to_owned();
-        let (down_tab, up_tab, move_tab, wheel_tab, key_tab, key_up_tab) =
-            (tab.clone(), tab.clone(), tab.clone(), tab.clone(), tab.clone(), tab.clone());
+        // The web disables its textarea over a PDF.
+        let text_input = pdf.is_none().then(|| (stream.focus.clone(), stream.input.clone()));
+        let tab = key.clone();
+        let (down_tab, move_tab, wheel_tab, key_tab, key_up_tab) =
+            (tab.clone(), tab.clone(), tab.clone(), tab.clone(), tab.clone());
+        let (drag_view, drag_tab) = (cx.weak_entity(), tab.clone());
         let body = div()
             .id("server-browser-page")
             .relative()
@@ -496,7 +887,30 @@ impl Workspace {
             .min_h_0()
             .overflow_hidden()
             .track_focus(&stream.focus)
-            .child(canvas(move |bounds, _, _| bounds_cell.set(bounds), |_, (), _, _| {}).absolute().size_full())
+            .child(
+                canvas(
+                    move |bounds, _, _| bounds_cell.set(bounds),
+                    move |bounds, (), window, cx| {
+                        if let Some((focus, input)) = text_input {
+                            window.handle_input(&focus, ElementInputHandler::new(bounds, input), cx);
+                        }
+                        // A press on the page follows the pointer and its release anywhere in the window.
+                        let (up_view, up_tab) = (drag_view.clone(), drag_tab.clone());
+                        window.on_mouse_event(move |e: &MouseMoveEvent, phase, _, cx| {
+                            if phase == DispatchPhase::Capture {
+                                let _ = drag_view.update(cx, |this, _| this.server_mouse_move(&drag_tab, e, true));
+                            }
+                        });
+                        window.on_mouse_event(move |e: &MouseUpEvent, phase, _, cx| {
+                            if phase == DispatchPhase::Capture {
+                                let _ = up_view.update(cx, |this, cx| this.server_mouse_up(&up_tab, e, cx));
+                            }
+                        });
+                    },
+                )
+                .absolute()
+                .size_full(),
+            )
             .children(frame)
             .children(pdf.flatten().map(|view| div().absolute().inset_0().child(view)))
             .children(cursor)
@@ -508,35 +922,26 @@ impl Workspace {
                 let tab = tab.clone();
                 cx.listener(move |this, e: &MouseDownEvent, w, cx| this.server_mouse_down(&tab, e, w, cx))
             })
-            .on_mouse_down(MouseButton::Middle, {
-                let tab = tab.clone();
-                cx.listener(move |this, e: &MouseDownEvent, w, cx| this.server_mouse_down(&tab, e, w, cx))
-            })
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(move |this, e: &MouseUpEvent, _, cx| this.server_mouse_up(&up_tab, e, cx)),
-            )
-            .on_mouse_up(MouseButton::Right, {
-                let tab = tab.clone();
-                cx.listener(move |this, e: &MouseUpEvent, _, cx| this.server_mouse_up(&tab, e, cx))
-            })
-            .on_mouse_up(
+            .on_mouse_down(
                 MouseButton::Middle,
-                cx.listener(move |this, e: &MouseUpEvent, _, cx| this.server_mouse_up(&tab, e, cx)),
+                cx.listener(move |this, e: &MouseDownEvent, w, cx| this.server_mouse_down(&tab, e, w, cx)),
             )
-            .on_mouse_move(cx.listener(move |this, e: &MouseMoveEvent, _, _| this.server_mouse_move(&move_tab, e)))
+            .on_mouse_move(
+                cx.listener(move |this, e: &MouseMoveEvent, _, _| this.server_mouse_move(&move_tab, e, false)),
+            )
             .on_scroll(cx.listener(move |this, e: &ScrollEvent, _, cx| {
                 if this.server_wheel(&wheel_tab, e) {
                     cx.stop_propagation();
                 }
             }))
             .on_key_down(cx.listener(move |this, e: &KeyDownEvent, window, cx| {
-                if this.server_key(&key_tab, "down", &e.keystroke, window, cx) {
+                let action = if e.prefer_character_input { KeyAction::DownComposing } else { KeyAction::Down };
+                if this.server_key(&key_tab, action, &e.keystroke, window, cx) {
                     cx.stop_propagation();
                 }
             }))
             .on_key_up(cx.listener(move |this, e: &KeyUpEvent, window, cx| {
-                if this.server_key(&key_up_tab, "up", &e.keystroke, window, cx) {
+                if this.server_key(&key_up_tab, KeyAction::Up, &e.keystroke, window, cx) {
                     cx.stop_propagation();
                 }
             }));
@@ -545,9 +950,9 @@ impl Workspace {
         if bar_below { page.child(body).child(bar) } else { page.child(bar).child(body) }.into_any_element()
     }
 
-    /// The page's dialog, or the stop that ended the stream.
-    fn render_server_overlay(&self, tab_id: &str, tokens: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let stream = self.preview.server.streams.get(tab_id)?;
+    /// The page's file picker and dialog (the dialog on top), or the stop that ended the stream.
+    fn render_server_overlay(&self, key: &TabRef, tokens: &Tokens, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let Some(stream) = self.preview.server.streams.get(key) else { return Vec::new() };
         let card = || {
             v_flex()
                 .absolute()
@@ -575,10 +980,10 @@ impl Workspace {
                 .bg(tokens.background)
                 .text_center()
         };
-        let tab = tab_id.to_owned();
+        let tab = key.clone();
         match &stream.stopped {
             Some(Stop::HostSetup { message, command }) => {
-                return Some(
+                return vec![
                     cover()
                         .child(div().max_w(px(384.)).text_sm().text_color(tokens.muted_foreground).child(*message))
                         .child(
@@ -601,10 +1006,10 @@ impl Workspace {
                                 .on_click(cx.listener(move |this, _, _, cx| this.restart_server_stream(&tab, cx))),
                         )
                         .into_any_element(),
-                );
+                ];
             }
             Some(Stop::Refused) => {
-                return Some(
+                return vec![
                     cover()
                         .gap_2()
                         .child(
@@ -621,12 +1026,41 @@ impl Workspace {
                                 .on_click(cx.listener(move |this, _, _, cx| this.restart_server_stream(&tab, cx))),
                         )
                         .into_any_element(),
-                );
+                ];
             }
             Some(Stop::Gone) | None => {}
         }
-        let control = stream.control.as_ref()?;
-        let dialog = control.dialog.as_ref()?;
+        let mut overlays = Vec::new();
+        if let Some(chooser) = stream.file_chooser.as_ref().filter(|_| stream.mine()) {
+            let id = chooser.id.clone();
+            let (cancel_tab, choose_tab) = (tab.clone(), tab.clone());
+            let what = if chooser.multiple { "files" } else { "a file" };
+            overlays.push(
+                card()
+                    .child(div().text_sm().child(format!("The page asks for {what}.")))
+                    .child(
+                        h_flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(Button::new("server-chooser-cancel").outline().small().label("Cancel").on_click(
+                                cx.listener(move |this, _, window, cx| {
+                                    this.answer_file_chooser(&cancel_tab, &id, Vec::new(), window, cx);
+                                }),
+                            ))
+                            .child(
+                                Button::new("server-chooser-choose")
+                                    .primary()
+                                    .small()
+                                    .label(if chooser.multiple { "Choose files" } else { "Choose file" })
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.choose_server_files(&choose_tab, window, cx);
+                                    })),
+                            ),
+                    )
+                    .into_any_element(),
+            );
+        }
+        let Some(dialog) = stream.control.as_ref().and_then(|control| control.dialog.as_ref()) else { return overlays };
         let is_prompt = dialog.kind == "prompt";
         let respond = |id: &'static str, label: &'static str, accept: bool, cx: &mut Context<Self>| {
             let (tab, prompt) = (tab.clone(), stream.prompt.clone());
@@ -640,11 +1074,11 @@ impl Workspace {
                 this.send_server_input(&tab, input);
             }))
         };
-        Some(
+        overlays.push(
             card()
                 .child(div().text_sm().child(SharedString::from(dialog.message.clone())))
                 .map(|el| {
-                    if control.mine() {
+                    if stream.mine() {
                         el.when(is_prompt, |el| el.child(Input::new(&stream.prompt))).child(
                             h_flex()
                                 .justify_end()
@@ -657,11 +1091,12 @@ impl Workspace {
                     }
                 })
                 .into_any_element(),
-        )
+        );
+        overlays
     }
 
-    fn restart_server_stream(&mut self, tab_id: &str, cx: &mut Context<Self>) {
-        if let Some(stream) = self.preview.server.streams.remove(tab_id) {
+    fn restart_server_stream(&mut self, tab: &TabRef, cx: &mut Context<Self>) {
+        if let Some(stream) = self.preview.server.streams.remove(tab) {
             for image in stream.stale.into_iter().chain(stream.frame) {
                 cx.drop_image(image, None);
             }
@@ -669,20 +1104,20 @@ impl Workspace {
         cx.notify();
     }
 
-    fn server_point(&self, tab_id: &str, position: Point<Pixels>, captured: bool) -> Option<(f32, f32)> {
-        let stream = self.preview.server.streams.get(tab_id)?;
+    fn server_point(&self, tab: &TabRef, position: Point<Pixels>, captured: bool) -> Option<(f32, f32)> {
+        let stream = self.preview.server.streams.get(tab)?;
         page_fit(stream.bounds.get(), stream.frame_size, stream.viewport)?.to_page(position, captured)
     }
 
-    fn server_mouse_down(&mut self, tab_id: &str, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(stream) = self.preview.server.streams.get(tab_id) else { return };
+    fn server_mouse_down(&mut self, tab: &TabRef, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(stream) = self.preview.server.streams.get(tab) else { return };
         if !stream.control.as_ref().is_some_and(Control::mine) {
             return;
         }
         window.focus(&stream.focus.clone(), cx);
         let Some((button, bit)) = mouse_button(event.button) else { return };
-        let Some((x, y)) = self.server_point(tab_id, event.position, false) else { return };
-        let Some(stream) = self.preview.server.streams.get_mut(tab_id) else { return };
+        let Some((x, y)) = self.server_point(tab, event.position, false) else { return };
+        let Some(stream) = self.preview.server.streams.get_mut(tab) else { return };
         stream.buttons |= bit;
         stream.send(json!({
             "type": "mouse", "action": "down", "x": x, "y": y, "button": button, "buttons": stream.buttons,
@@ -691,13 +1126,13 @@ impl Workspace {
         cx.stop_propagation();
     }
 
-    fn server_mouse_up(&mut self, tab_id: &str, event: &MouseUpEvent, cx: &mut Context<Self>) {
+    fn server_mouse_up(&mut self, tab: &TabRef, event: &MouseUpEvent, cx: &mut Context<Self>) {
         let Some((button, bit)) = mouse_button(event.button) else { return };
-        if self.preview.server.streams.get(tab_id).is_none_or(|s| s.buttons & bit == 0) {
+        if self.preview.server.streams.get(tab).is_none_or(|s| s.buttons & bit == 0) {
             return;
         }
-        let Some((x, y)) = self.server_point(tab_id, event.position, true) else { return };
-        let Some(stream) = self.preview.server.streams.get_mut(tab_id) else { return };
+        let Some((x, y)) = self.server_point(tab, event.position, true) else { return };
+        let Some(stream) = self.preview.server.streams.get_mut(tab) else { return };
         stream.buttons &= !bit;
         stream.send(json!({
             "type": "mouse", "action": "up", "x": x, "y": y, "button": button, "buttons": stream.buttons,
@@ -706,13 +1141,19 @@ impl Workspace {
         cx.stop_propagation();
     }
 
-    fn server_mouse_move(&mut self, tab_id: &str, event: &MouseMoveEvent) {
-        let Some(stream) = self.preview.server.streams.get(tab_id) else { return };
-        if !stream.control.as_ref().is_some_and(Control::mine) {
+    /// A hover over the page, or (`dragging`) a held press moving anywhere in the window.
+    fn server_mouse_move(&mut self, tab: &TabRef, event: &MouseMoveEvent, dragging: bool) {
+        let Some(stream) = self.preview.server.streams.get(tab) else { return };
+        // A release this window didn't see: the page gets its `up` before any more moves.
+        if dragging && stream.buttons != 0 && event.pressed_button.is_none() {
+            self.cancel_server_buttons(tab, event.position);
+            return;
+        }
+        if !stream.control.as_ref().is_some_and(Control::mine) || (stream.buttons != 0) != dragging {
             return;
         }
         let held = stream.buttons;
-        let Some((x, y)) = self.server_point(tab_id, event.position, held != 0) else { return };
+        let Some((x, y)) = self.server_point(tab, event.position, held != 0) else { return };
         let button = match held {
             0 => "none",
             b if b & 1 != 0 => "left",
@@ -725,31 +1166,62 @@ impl Workspace {
         }));
     }
 
-    fn server_wheel(&self, tab_id: &str, event: &ScrollEvent) -> bool {
-        let Some((x, y)) = self.server_point(tab_id, event.position, false) else { return false };
+    /// Releases every held button at `position`, clamped to the page.
+    fn cancel_server_buttons(&mut self, tab: &TabRef, position: Point<Pixels>) {
+        let point = self.server_point(tab, position, true);
+        let Some(stream) = self.preview.server.streams.get_mut(tab) else { return };
+        if let Some((x, y)) = point {
+            for (button, buttons) in released_buttons(stream.buttons) {
+                stream.send(json!({
+                    "type": "mouse", "action": "up", "x": x, "y": y, "button": button, "buttons": buttons,
+                    "clickCount": 0, "modifiers": 0,
+                }));
+            }
+        }
+        stream.buttons = 0;
+    }
+
+    fn server_wheel(&self, tab: &TabRef, event: &ScrollEvent) -> bool {
+        let Some((x, y)) = self.server_point(tab, event.position, false) else { return false };
         let (dx, dy) = match event.delta {
             ScrollDelta::Pixels(delta) => (f32::from(delta.x), f32::from(delta.y)),
             ScrollDelta::Lines(delta) => (delta.x * WHEEL_LINE_PX, delta.y * WHEEL_LINE_PX),
         };
         // GPUI's deltas point where the content moves; the DOM's where the page scrolls.
         self.send_server_input(
-            tab_id,
+            tab,
             json!({"type": "wheel", "x": x, "y": y, "deltaX": -dx, "deltaY": -dy, "modifiers": modifier_bits(event.modifiers)}),
         )
     }
 
     fn server_key(
         &mut self,
-        tab_id: &str,
-        action: &str,
+        tab: &TabRef,
+        key_action: KeyAction,
         keystroke: &Keystroke,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(stream) = self.preview.server.streams.get(tab_id) else { return false };
+        let action = if key_action == KeyAction::Up { "up" } else { "down" };
+        let Some(stream) = self.preview.server.streams.get(tab) else { return false };
         // Keys typed into the page's own overlays, such as a prompt's response, stay there.
-        if !stream.control.as_ref().is_some_and(Control::mine) || !stream.focus.is_focused(window) {
+        if !stream.focus.is_focused(window) {
             return false;
+        }
+        if leaves_page(keystroke) {
+            if action == "down" {
+                self.leave_server_page(tab, window, cx);
+            }
+            return true;
+        }
+        if !stream.mine() {
+            return false;
+        }
+        if key_action != KeyAction::Up {
+            let prefer_character_input = key_action == KeyAction::DownComposing;
+            if stream.input.update(cx, |input, _| input.composition.composing(keystroke, prefer_character_input)) {
+                return false;
+            }
         }
         let m = &keystroke.modifiers;
         // Paste types the clipboard's text, as the page's own paste would.
@@ -776,10 +1248,10 @@ impl Workspace {
 impl Workspace {
     /// `alternatePreviewRuntime`'s label: a remote environment's tab can move between this
     /// computer and the environment's own browser. `None` for this app's own server.
-    pub(super) fn move_tab_label(&self, session: &Session) -> Option<SharedString> {
-        let environment = self.thread_environment(&session.thread_id)?;
-        let remote = self.environment_remote || self.primary_environment() != Some(&environment);
-        let info = &self.session(&environment)?.server_info;
+    pub(super) fn move_tab_label(&self, thread: &ThreadRef, session: &Session) -> Option<SharedString> {
+        let environment = &thread.environment;
+        let remote = self.environment_remote || self.primary_environment() != Some(environment);
+        let info = &self.session(environment)?.server_info;
         if !remote || !info.capability("serverBrowser") {
             return None;
         }
@@ -792,14 +1264,19 @@ impl Workspace {
     }
 
     /// `handleMoveTab`: opens the page in the other runtime, then closes this tab.
-    pub(super) fn move_preview_tab(&mut self, session: Session, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(client) = self.thread_client(&session.thread_id) else { return };
-        let mut input = json!({"threadId": session.thread_id, "viewport": viewport_json(&session.viewport)});
+    pub(super) fn move_preview_tab(
+        &mut self,
+        thread: ThreadRef,
+        session: Session,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.env_client(&thread.environment) else { return };
+        let mut input = json!({"threadId": thread.thread_id, "viewport": viewport_json(&session.viewport)});
         if let Some(url) = session.nav_status.url() {
             // A page moving to this computer reaches the environment's loopback servers on its host.
             input["url"] =
-                if session.server_hosted() { self.discovered_url(&session.thread_id, url) } else { url.to_owned() }
-                    .into();
+                if session.server_hosted() { self.discovered_url(&thread, url) } else { url.to_owned() }.into();
         }
         if !session.server_hosted() {
             input["runtime"] = "server".into();
@@ -807,8 +1284,8 @@ impl Workspace {
         if let Some(profile) = &session.profile_id {
             input["profileId"] = profile.clone().into();
         }
-        // The moved tab opens where the move started, even if another thread shows by then.
-        let origin = self.target.clone();
+        // The moved tab opens on its thread's panel, even if another thread shows by then.
+        let origin = super::panel_target(&thread);
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("preview.open", input).await;
             let _ = this.update_in(cx, |this, window, cx| {
@@ -817,11 +1294,9 @@ impl Workspace {
                 }) {
                     Ok(moved) => {
                         let tab = moved.tab_id.clone();
-                        this.preview.threads.entry(session.thread_id.clone()).or_default().apply_snapshot(moved, true);
-                        if let Some(origin) = &origin {
-                            this.open_surface_on(origin, Surface::Browser(tab), window, cx);
-                        }
-                        this.close_preview_tab(session.thread_id.clone(), session.tab_id.clone(), window, cx);
+                        this.preview.threads.entry(&thread).apply_snapshot(moved, true);
+                        this.open_surface_on(&origin, Surface::Browser(tab), window, cx);
+                        this.close_preview_tab(thread.tab(&session.tab_id), window, cx);
                     }
                     Err(error) => window.push_notification(
                         gpui_kit::component::notification::Notification::error(error)
@@ -857,6 +1332,19 @@ fn mouse_button(button: MouseButton) -> Option<(&'static str, u8)> {
         MouseButton::Middle => Some(("middle", 4)),
         MouseButton::Navigate(_) => None,
     }
+}
+
+/// Cancellation releases every held button, one `up` each, with the buttons still held after it.
+fn released_buttons(held: u8) -> Vec<(&'static str, u8)> {
+    let mut buttons = held;
+    [("left", 1), ("right", 2), ("middle", 4)]
+        .into_iter()
+        .filter(|(_, bit)| held & bit != 0)
+        .map(|(button, bit)| {
+            buttons &= !bit;
+            (button, buttons)
+        })
+        .collect()
 }
 
 /// How the frame sits in its area: `object-fit: contain`, mapped to page CSS px.
@@ -1081,7 +1569,7 @@ fn decode_jpeg(bytes: &[u8]) -> Option<(Arc<RenderImage>, (u32, u32))> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui_kit::{point, size};
+    use gpui_kit::point;
 
     #[test]
     fn control_labels_follow_the_controller() {
@@ -1106,6 +1594,13 @@ mod tests {
         let next = Dialog { message: "Age?".into(), ..prompt.clone() };
         assert_eq!(prompt_reset(Some(&prompt), Some(&next)).as_deref(), Some("x"), "another prompt resets");
         assert_eq!(prompt_reset(Some(&prompt), None).as_deref(), Some(""), "a closed dialog clears it");
+    }
+
+    #[test]
+    fn a_cancelled_press_releases_each_held_button() {
+        assert_eq!(released_buttons(0b101), vec![("left", 0b100), ("middle", 0)]);
+        assert_eq!(released_buttons(0b010), vec![("right", 0)]);
+        assert!(released_buttons(0).is_empty());
     }
 
     #[test]
@@ -1136,6 +1631,92 @@ mod tests {
         assert_eq!(key("space").text.as_deref(), Some(" "));
         assert!(dom_key(&Keystroke::parse("f13").ok().unwrap()).is_none());
         assert_eq!(modifier_bits(Modifiers { shift: true, control: true, ..Default::default() }), 10);
+    }
+
+    #[test]
+    fn file_chooser_messages_offer_and_withdraw_the_named_picker() {
+        let offer = |id: &str| json!({"type": "fileChooser", "id": id, "multiple": true, "accept": "image/*"});
+        let mut chooser = None;
+        ChooserMessage::parse(&offer("a")).unwrap().apply(&mut chooser);
+        assert_eq!(chooser, Some(FileChooser { id: "a".into(), multiple: true }));
+        ChooserMessage::parse(&offer("b")).unwrap().apply(&mut chooser);
+        ChooserMessage::parse(&json!({"type": "fileChooserClosed", "id": "a"})).unwrap().apply(&mut chooser);
+        assert_eq!(chooser.as_ref().map(|c| c.id.as_str()), Some("b"), "an older picker's close keeps the new one");
+        ChooserMessage::parse(&json!({"type": "fileChooserClosed", "id": "b"})).unwrap().apply(&mut chooser);
+        assert_eq!(chooser, None);
+        assert_eq!(ChooserMessage::parse(&json!({"type": "fileChooser", "id": "c", "multiple": false})), None);
+        assert_eq!(ChooserMessage::parse(&json!({"type": "fileChooserClosed"})), None);
+        assert_eq!(ChooserMessage::parse(&json!({"type": "popup", "id": "d"})), None);
+    }
+
+    #[test]
+    fn uploads_post_named_file_parts_to_the_tabs_picker() {
+        let tab = ThreadRef::new("env", "thread 1").tab("tab&1");
+        assert_eq!(
+            upload_url("http://host:3773", &tab, "c1"),
+            "http://host:3773/api/preview-stream/upload?threadId=thread+1&tabId=tab%261&chooser=c1"
+        );
+        let file = UploadFile { name: "a\"b\r\n.png".into(), mime: "image/png".into(), bytes: b"PNG".to_vec() };
+        assert_eq!(
+            String::from_utf8(multipart_body("X", &[file])).unwrap(),
+            "--X\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a%22b%0D%0A.png\"\r\n\
+             Content-Type: image/png\r\n\r\nPNG\r\n--X--\r\n"
+        );
+        assert_eq!(multipart_body("X", &[]), b"--X--\r\n", "no files cancels the picker");
+    }
+
+    #[test]
+    fn compositions_reach_the_page_only_when_they_commit() {
+        let mut composition = Composition::default();
+        composition.mark("に");
+        assert_eq!(composition.marked_range(), Some(0..1));
+        composition.mark("日本");
+        assert_eq!(composition.commit("日本"), Some("日本".into()));
+        assert_eq!(composition.marked_range(), None);
+        composition.mark("ka");
+        assert_eq!(composition.commit(""), None, "a cancelled composition types nothing");
+        composition.mark("😀");
+        assert_eq!(composition.marked_range(), Some(0..2), "ranges count UTF-16 units");
+        assert_eq!(composition.unmark(), Some("😀".into()), "an ended composition keeps its text");
+        assert_eq!(composition.unmark(), None);
+    }
+
+    #[test]
+    fn dead_keys_and_compositions_type_through_the_input_handler() {
+        let key = |text: &'static str, key_char: Option<&str>| Keystroke {
+            key_char: key_char.map(str::to_owned),
+            ..Keystroke::parse(text).ok().unwrap()
+        };
+        let mut composition = Composition::default();
+        // Windows: the dead key asks for character input; the key that completes it does not.
+        assert!(composition.composing(&key("´", Some("´")), true), "the dead key");
+        assert!(composition.composing(&key("e", Some("é")), false), "the key it composes with");
+        assert!(!composition.composing(&key("e", Some("e")), false), "the dead key is spent");
+        // A dead key pressed twice types it, and a shortcut never composes.
+        assert!(composition.composing(&key("´", Some("´")), true));
+        assert!(composition.composing(&key("´", Some("´")), true));
+        assert!(!composition.composing(&key("e", Some("e")), false));
+        assert!(!composition.composing(&key("ctrl-c", Some("c")), false));
+        // AltGr is Ctrl+Alt on Windows: the text it types asks for character input too.
+        assert!(composition.composing(&key("ctrl-alt-q", Some("@")), true), "German AltGr+Q types @");
+        composition.commit("@");
+        assert!(!composition.composing(&key("e", Some("e")), false), "typed text leaves no dead key");
+        // An AltGr dead key composes with the next key that types.
+        assert!(composition.composing(&key("ctrl-alt-]", Some("~")), true));
+        assert!(composition.composing(&key("a", Some("ã")), false));
+        // Keys while an IME shows marked text belong to it.
+        composition.mark("に");
+        assert!(composition.composing(&key("enter", None), false));
+        composition.commit("に");
+        assert!(!composition.composing(&key("enter", None), false));
+    }
+
+    #[test]
+    fn shift_escape_alone_leaves_the_page() {
+        let leaves = |text: &'static str| leaves_page(&Keystroke::parse(text).ok().unwrap());
+        assert!(leaves("shift-escape"));
+        assert!(!leaves("escape"), "Escape reaches the page");
+        assert!(!leaves("ctrl-shift-escape"));
     }
 
     #[test]

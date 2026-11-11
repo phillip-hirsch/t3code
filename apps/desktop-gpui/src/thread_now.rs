@@ -6,7 +6,7 @@
 use gpui_kit::SharedString;
 use serde_json::Value;
 
-use crate::model::{PendingBackgroundTask, Run, ThreadGoal, ThreadShell, TurnItem};
+use crate::model::{PendingBackgroundTask, Run, ScopedId, ThreadGoal, ThreadShell, TurnItem};
 use crate::work_log;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -15,7 +15,8 @@ pub enum NowLine {
     ChildInput {
         title: SharedString,
         approvals: bool,
-        children: Vec<(SharedString, SharedString)>,
+        /// Each child on its own environment: a delegated task runs on a linked one.
+        children: Vec<(ScopedId, SharedString)>,
     },
     RunStop(RunStop),
     Background(BackgroundWork),

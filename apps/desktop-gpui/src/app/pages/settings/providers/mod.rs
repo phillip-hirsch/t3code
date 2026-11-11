@@ -1,5 +1,6 @@
 //! Settings › Providers (`apps/web/src/components/settings/ProviderSettingsPanel.tsx`): the
-//! provider instances listed beside the selected one's editor, then Advanced.
+//! provider instances listed beside the selected one's editor, usage hubs, text generators, then
+//! Advanced.
 //!
 //! The native client talks to one environment, which is the web's single-primary-device case, so
 //! there are no device tabs. Advanced uses the shared settings rows; everything else here is
@@ -7,13 +8,18 @@
 
 mod accent;
 mod accounts;
-pub(in crate::app) use accounts::{chatgpt_usage_button, redacted_email, uses_chatgpt_sharing};
+pub(in crate::app) use accounts::{
+    ModeChange, chatgpt_usage_button, codex_setup_managed, redacted_email, uses_chatgpt_sharing, with_setup_mode,
+};
+pub(in crate::app) use instances::summary as provider_summary;
 mod acp;
 mod add;
 mod codex_callback;
 mod drivers;
 mod instances;
 mod models;
+mod text_generators;
+pub(super) use text_generators::{TextGeneratorCatalog, text_generators_allowed, writing_providers};
 mod usage_sources;
 
 use std::collections::{HashMap, HashSet};
@@ -101,12 +107,13 @@ const IDLE_COMPACTION_MODES: &[(&str, &str)] =
 
 /// `PROVIDER_HEALTH_INTERVAL_STEP_SECONDS`.
 const HEALTH_STEP_SECONDS: i64 = 30;
+const REFRESH_PROVIDERS: &str = "server.refreshProviders";
 const HEALTH_KEY: &str = "providerHealthRefreshInterval";
 /// Its index in [`background::DURATION_KEYS`].
 const HEALTH: usize = 1;
 
 /// `globalIdleCompaction`: the mode, or the legacy switch from before modes.
-fn idle_compaction<'a>(mode: &'a Value, legacy: &'a Value) -> &'a str {
+pub(in crate::app) fn idle_compaction<'a>(mode: &'a Value, legacy: &'a Value) -> &'a str {
     mode.as_str().unwrap_or(match legacy {
         Value::String(mode) => mode,
         Value::Bool(true) => "beforeCacheExpires",
@@ -383,10 +390,13 @@ impl Workspace {
             })
             .child(card);
         let content = [
-            providers.into_any_element(),
-            self.render_usage_limit_sources(cx),
-            self.render_providers_advanced(window, cx).into_any_element(),
-        ];
+            Some(providers.into_any_element()),
+            Some(self.render_usage_limit_sources(cx)),
+            self.render_text_generators(cx),
+            Some(self.render_providers_advanced(window, cx).into_any_element()),
+        ]
+        .into_iter()
+        .flatten();
         self.settings_page("providers", &view, content, cx)
     }
 
@@ -419,6 +429,7 @@ impl Workspace {
         };
         let refresh_page = page.clone();
         let update_page = page.clone();
+        let can_refresh = self.can_refresh_providers();
         h_flex()
             .gap_2()
             .mr(px(-8.))
@@ -436,7 +447,7 @@ impl Workspace {
                 ghost_text_button("providers-refresh", "", t)
                     .icon(Icon::new(gpui_kit::assets::IconName::RefreshCw).size(px(14.)))
                     .when_some(label, gpui_kit::component::button::Button::label)
-                    .disabled(refreshing)
+                    .disabled(refreshing || !can_refresh)
                     .tooltip("Refresh provider status")
                     .on_click(
                         cx.listener(move |this, _, window, cx| this.refresh_providers(&refresh_page, window, cx)),
@@ -582,9 +593,15 @@ impl Workspace {
         self.save_settings(payload, "Could not update provider instance", window, cx);
     }
 
+    /// `refreshProviders.permissionAtom` on the Settings environment, for what the button sends.
+    fn can_refresh_providers(&self) -> bool {
+        let payload = json!({"refreshModels": true, "reloadSecrets": true});
+        self.settings_environment().is_some_and(|env| self.env_permits(&env, REFRESH_PROVIDERS, &payload))
+    }
+
     /// `server.refreshProviders` with models and secrets reloaded, as the refresh button does.
     fn refresh_providers(&mut self, page: &Entity<ProvidersPage>, window: &mut Window, cx: &mut Context<Self>) {
-        if page.read(cx).refreshing {
+        if page.read(cx).refreshing || !self.can_refresh_providers() {
             return;
         }
         page.update(cx, |page, cx| {
@@ -594,7 +611,7 @@ impl Workspace {
         let page = page.clone();
         let payload = json!({"refreshModels": true, "reloadSecrets": true});
         self.providers_request_then(
-            "server.refreshProviders",
+            REFRESH_PROVIDERS,
             payload,
             None,
             window,

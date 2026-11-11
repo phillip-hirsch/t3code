@@ -73,8 +73,16 @@ fn sample_unused(sample: &mut Option<Sample>, origin: &Target, still_open: bool)
     }
 }
 
+/// `onEnvironmentChange`'s guard: a scratch project that lands moves the draft only for the newest
+/// machine switch, while the draft is still open where that switch started.
+fn change_lands(request: u64, latest: u64, origin: Option<&Target>, now: Option<&Target>) -> bool {
+    request == latest && origin == now
+}
+
 pub(super) struct HostUi {
     open: bool,
+    /// The newest machine switch (`environmentChangeRef`); an older one settling late is dropped.
+    environment_change: u64,
     /// By draft, as the web keeps them on each draft session: they follow it from machine to
     /// machine, and a new draft starts without them.
     selections: HashMap<Target, Selection>,
@@ -90,6 +98,7 @@ impl HostUi {
     pub(super) fn new(cx: &mut App) -> Self {
         Self {
             open: false,
+            environment_change: 0,
             selections: HashMap::new(),
             sample: None,
             _sample: None,
@@ -112,6 +121,8 @@ fn carry(selections: &mut HashMap<Target, Selection>, from: &Target, to: &Target
 enum HostItem {
     Auto(SharedString),
     Environment(EnvironmentOption),
+    /// "Add to another machine", for the draft's project.
+    AddToMachine(crate::model::ScopedId),
 }
 
 impl HostItem {
@@ -119,6 +130,7 @@ impl HostItem {
         match self {
             Self::Auto(label) => label,
             Self::Environment(option) => &option.label,
+            Self::AddToMachine(_) => "Add to another machine",
         }
     }
 }
@@ -155,7 +167,7 @@ impl Typeahead {
 }
 
 impl Workspace {
-    fn option_for(&self, environment_id: &SharedString, project_id: Option<String>) -> EnvironmentOption {
+    pub(super) fn option_for(&self, environment_id: &SharedString, project_id: Option<String>) -> EnvironmentOption {
         let info = self.session(environment_id).map(|s| &s.server_info);
         EnvironmentOption {
             environment_id: environment_id.clone(),
@@ -173,7 +185,7 @@ impl Workspace {
     pub(super) fn logical_project_environments(&self) -> Vec<EnvironmentOption> {
         let Some(project) = self.target_project() else { return Vec::new() };
         let groups = self.project_groups();
-        let Some(group) = groups.iter().find(|g| g.contains(&project.id)) else { return Vec::new() };
+        let Some(group) = groups.iter().find(|g| g.contains_project(project)) else { return Vec::new() };
         let scratch_draft = group.members[0].is_scratch && matches!(self.target, Some(Target::Draft { .. }));
         let mut options: Vec<EnvironmentOption> = Vec::new();
         if scratch_draft {
@@ -215,10 +227,31 @@ impl Workspace {
         matches!(self.target, Some(Target::Draft { .. })) && options.len() > 1
     }
 
+    /// The draft's project, when it can be added to another machine (`addTargets`).
+    fn add_to_machine_project(&self, options: &[EnvironmentOption]) -> Option<crate::model::ScopedId> {
+        if !matches!(self.target, Some(Target::Draft { .. })) {
+            return None;
+        }
+        let project = self.target_project()?;
+        let existing: Vec<SharedString> = options.iter().map(|option| option.environment_id.clone()).collect();
+        (!self.add_project_targets(project, &existing).is_empty()).then(|| crate::model::ScopedId::of_project(project))
+    }
+
+    /// The picker opens for a draft with a machine to move to, or a machine to add its project to
+    /// (`showEnvironmentPicker`).
+    fn can_pick_host(&self, options: &[EnvironmentOption]) -> bool {
+        !self.target_sending() && self.has_host_choice(options)
+    }
+
+    /// The draft has somewhere to go, whether or not a send holds it in place for now.
+    fn has_host_choice(&self, options: &[EnvironmentOption]) -> bool {
+        self.can_change_environment(options) || self.add_to_machine_project(options).is_some()
+    }
+
     /// The draft is a "No project" draft (`activeProjectIsScratch`), which never auto-balances.
     pub(super) fn draft_is_scratch(&self) -> bool {
         let Some(project) = self.target_project() else { return false };
-        self.project_groups().iter().any(|g| g.contains(&project.id) && g.members[0].is_scratch)
+        self.project_groups().iter().any(|g| g.contains_project(project) && g.members[0].is_scratch)
     }
 
     fn selection(&self) -> Option<&Selection> {
@@ -275,7 +308,11 @@ impl Workspace {
     /// (`onEnvironmentChange`). A pick by hand turns load balancing off for this draft.
     fn change_environment(&mut self, option: EnvironmentOption, window: &mut Window, cx: &mut Context<Self>) {
         let Some(target @ Target::Draft { .. }) = self.target.clone() else { return };
+        if self.target_sending() {
+            return;
+        }
         self.host.open = false;
+        self.host.environment_change += 1;
         self.host.selections.insert(target, Selection::Manual);
         self.host._sample = None;
         self.host.sample = None;
@@ -286,33 +323,50 @@ impl Workspace {
         self.retarget_draft(option.environment_id, project_id, cx);
     }
 
-    /// The draft keeps its text and moves to another checkout of its project.
+    /// The draft moves to `project_id` on `env` as if picked there by hand, so load balancing
+    /// leaves it (`environmentSelection: "manual"`).
+    pub(super) fn move_draft_by_hand(&mut self, env: SharedString, project_id: String, cx: &mut Context<Self>) {
+        let Some(target @ Target::Draft { .. }) = self.target.clone() else { return };
+        if self.target_sending() {
+            return;
+        }
+        self.host.open = false;
+        self.host.selections.insert(target, Selection::Manual);
+        self.host._sample = None;
+        self.host.sample = None;
+        self.retarget_draft(env, project_id, cx);
+    }
+
+    /// The draft keeps its identity and text and moves to another checkout, becoming that
+    /// project's draft (`setLogicalProjectDraftThreadId`). A draft being sent stays put: the
+    /// launch promotes it where it started.
     pub(super) fn retarget_draft(&mut self, env: SharedString, project_id: String, cx: &mut Context<Self>) {
         let Some(from @ Target::Draft { .. }) = self.target.clone() else { return };
-        let to = Target::Draft { env, project_id };
+        if self.target_sending() {
+            return;
+        }
+        let Some(draft) = from.draft_id().cloned() else { return };
+        self.drafts.assign(crate::model::ScopedId::new(env.clone(), project_id.as_str()), &draft);
+        let to = Target::draft(env, project_id, draft);
         carry(&mut self.host.selections, &from, &to);
+        self.carry_draft_panel(&from, &to);
+        self.retarget_closed_views(&from, &to);
         self.target = Some(to);
         self.sync_draft_workspace(cx);
         self.sync_attachment_uploads(cx);
         self.model_override = None;
         self.model_explicit = false;
+        self.drafts_changed(cx);
         self.notify_sidebar(cx);
         cx.notify();
     }
 
     /// `selectProject` for a draft with content: it moves to the project and keeps an explicit model;
-    /// an inherited one resolves again for the destination.
-    /// A project that already holds an unsent draft keeps it, and that draft opens instead.
-    pub(super) fn move_draft_to_project(
-        &mut self,
-        env: SharedString,
-        project_id: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let destination = Target::Draft { env: env.clone(), project_id: project_id.clone() };
-        if self.composer_drafts.contains_key(&destination) || self.target.as_ref() == Some(&destination) {
-            self.start_draft_in(env, project_id, window, cx);
+    /// an inherited one resolves again for the destination. The draft keeps its identity; a draft
+    /// the project already holds stays as its own sidebar row.
+    pub(super) fn move_draft_to_project(&mut self, env: SharedString, project_id: String, cx: &mut Context<Self>) {
+        let Some(Target::Draft { env: from_env, project_id: from, .. }) = &self.target else { return };
+        if (from_env, from) == (&env, &project_id) || self.target_sending() {
             return;
         }
         let (model, explicit) = (self.model_override.take(), self.model_explicit);
@@ -329,12 +383,14 @@ impl Workspace {
 
     fn open_scratch_then_retarget(&mut self, env: SharedString, window: &mut Window, cx: &mut Context<Self>) {
         let Some(client) = self.env_client(&env) else { return };
-        let origin = self.target.clone();
+        let (origin, request) = (self.target.clone(), self.host.environment_change);
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("projects.ensureScratch", json!({})).await;
             let _ = this.update_in(cx, |this, window, cx| match result {
-                // A draft that moved on meanwhile keeps its machine.
-                Ok(value) if this.target == origin => {
+                // A draft that moved on, or a newer switch, keeps the machine it has.
+                Ok(value)
+                    if change_lands(request, this.host.environment_change, origin.as_ref(), this.target.as_ref()) =>
+                {
                     if let Some(project_id) = value["projectId"].as_str() {
                         this.retarget_draft(env, project_id.to_owned(), cx);
                     }
@@ -350,7 +406,7 @@ impl Workspace {
     /// `onAutoEnvironment`: back to load balancing, which samples the machines again.
     fn choose_auto_environment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.host.open = false;
-        if !matches!(self.target, Some(Target::Draft { .. })) {
+        if !matches!(self.target, Some(Target::Draft { .. })) || self.target_sending() {
             return;
         }
         if !self.attachments.is_empty() {
@@ -453,7 +509,7 @@ impl Workspace {
 
     /// `composer.host`: opens the picker while there is a choice to make.
     pub(super) fn open_host_picker(&mut self, cx: &mut Context<Self>) -> bool {
-        if !self.can_change_environment(&self.logical_project_environments()) {
+        if !self.can_pick_host(&self.logical_project_environments()) {
             return false;
         }
         self.set_host_open(true, cx);
@@ -468,25 +524,31 @@ impl Workspace {
         cx.notify();
     }
 
-    /// The menu's rows and which one is checked: Auto balance where it can be chosen, then the
-    /// machines.
+    /// The menu's rows and which one is checked: Auto balance where it can be chosen, the
+    /// machines, then Add to another machine where the project can go to one.
     fn host_items(&self) -> Vec<(HostItem, bool)> {
         let options = self.logical_project_environments();
         let auto = self.auto_environment_label(&options);
         let active = self.active_environment();
         let balancing = self.client_settings.values.bool("loadBalancingEnabled") && !self.draft_is_scratch();
         let auto_row = balancing.then(|| (HostItem::Auto(auto.unwrap_or("Auto balance").into()), auto.is_some()));
+        let add = self.add_to_machine_project(&options).map(|project| (HostItem::AddToMachine(project), false));
         let machines = options.into_iter().map(|option| {
             let checked = auto.is_none() && Some(&option.environment_id) == active;
             (HostItem::Environment(option), checked)
         });
-        auto_row.into_iter().chain(machines).collect()
+        auto_row.into_iter().chain(machines).chain(add).collect()
     }
 
     fn pick_host_item(&mut self, item: HostItem, window: &mut Window, cx: &mut Context<Self>) {
         match item {
             HostItem::Auto(_) => self.choose_auto_environment(window, cx),
             HostItem::Environment(option) => self.change_environment(option, window, cx),
+            HostItem::AddToMachine(project) => {
+                self.host.open = false;
+                cx.notify();
+                self.open_add_to_machine(project, None, window, cx);
+            }
         }
     }
 
@@ -529,7 +591,7 @@ impl Workspace {
     /// `composer.cycleHost`: the draft moves to the project's next machine.
     pub(super) fn cycle_host(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let options = self.logical_project_environments();
-        if !self.can_change_environment(&options) {
+        if !self.can_change_environment(&options) || self.target_sending() {
             return false;
         }
         let current = self.active_environment().cloned();
@@ -545,8 +607,8 @@ impl Workspace {
         let options = self.logical_project_environments();
         let active = self.active_environment();
         let current = options.iter().find(|o| Some(&o.environment_id) == active);
-        let can_pick = self.can_change_environment(&options);
-        let shown = can_pick || current.is_some_and(|o| !o.is_primary) || self.environment_remote;
+        let can_pick = self.can_pick_host(&options);
+        let shown = self.has_host_choice(&options) || current.is_some_and(|o| !o.is_primary) || self.environment_remote;
         if !shown {
             return None;
         }
@@ -617,8 +679,11 @@ impl Workspace {
                 HostItem::Environment(option) => {
                     (ElementId::Name(format!("host-{}", option.environment_id).into()), machine_icon(&option.machine))
                 }
+                HostItem::AddToMachine(_) => ("host-add-machine".into(), Lucide::Plus),
             };
             let label = SharedString::from(item.label().to_owned());
+            // `ADD_TO_MACHINE_LABEL_CLASS`: faded until highlighted.
+            let faded = matches!(item, HostItem::AddToMachine(_)) && self.host.highlight != Some(index);
             // The pointer highlights the row it moves over, so one row paints at a time.
             menu = menu.child(
                 h_flex()
@@ -636,8 +701,8 @@ impl Workspace {
                             cx.notify();
                         }
                     }))
-                    .child(Icon::new(icon).with_size(px(12.)))
-                    .child(div().flex_1().truncate().child(label))
+                    .child(div().flex().when(faded, |el| el.opacity(0.55)).child(Icon::new(icon).with_size(px(12.))))
+                    .child(div().flex_1().truncate().when(faded, |el| el.opacity(0.55)).child(label))
                     .when(checked, |el| el.child(Icon::new(Lucide::Check).with_size(px(12.))))
                     .on_click(cx.listener(move |this, _, window, cx| this.pick_host_item(item.clone(), window, cx))),
             );
@@ -682,7 +747,15 @@ mod tests {
     use super::*;
 
     fn draft(env: &str, project: &str) -> Target {
-        Target::Draft { env: env.to_owned().into(), project_id: project.to_owned() }
+        Target::draft(env.to_owned().into(), project.to_owned(), crate::app::draft_sessions::DraftId::for_test(project))
+    }
+
+    #[test]
+    fn a_scratch_switch_lands_only_while_it_is_the_newest_for_its_draft() {
+        let (a, b) = (draft("local", "web"), draft("remote", "web"));
+        assert!(change_lands(2, 2, Some(&a), Some(&a)));
+        assert!(!change_lands(1, 2, Some(&a), Some(&a)), "a newer switch superseded it");
+        assert!(!change_lands(2, 2, Some(&a), Some(&b)), "the draft moved meanwhile");
     }
 
     #[test]

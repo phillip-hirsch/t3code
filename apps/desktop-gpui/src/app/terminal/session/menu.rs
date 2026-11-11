@@ -24,7 +24,7 @@ impl TerminalSession {
     /// Add to chat: the selection goes to the composer, then clears.
     pub fn add_selection_to_chat(&mut self, cx: &mut Context<Self>) {
         if let Some(selected) = self.selected() {
-            self.term.selection = None;
+            self.core.clear_selection();
             cx.emit(SessionEvent::AddToChat(selected));
             cx.notify();
         }
@@ -37,17 +37,24 @@ impl TerminalSession {
     ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
         let session = cx.entity();
         move |menu, window, cx| {
-            let has_selection = session.read(cx).selected().is_some();
+            let (has_selection, chat) = {
+                let session = session.read(cx);
+                (session.selected().is_some(), session.chat)
+            };
             let on = |f: fn(&mut TerminalSession, &mut Window, &mut Context<TerminalSession>)| {
                 window.listener_for(&session, move |this, _, window, cx| f(this, window, cx))
             };
-            menu.min_w(px(160.))
-                .item(
+            let menu = menu.min_w(px(160.));
+            let menu = if chat {
+                menu.item(
                     PopupMenuItem::new("Add to chat")
                         .disabled(!has_selection)
                         .on_click(on(|this, _, cx| this.add_selection_to_chat(cx))),
                 )
-                .item(PopupMenuItem::new("Copy").disabled(!has_selection).on_click(on(|this, _, cx| this.copy(cx))))
+            } else {
+                menu
+            };
+            menu.item(PopupMenuItem::new("Copy").disabled(!has_selection).on_click(on(|this, _, cx| this.copy(cx))))
                 .item(PopupMenuItem::new("Paste").on_click(on(|this, _, cx| this.paste(cx))))
                 .item(PopupMenuItem::new("Select all").on_click(on(|this, _, cx| this.select_all(cx))))
                 .item(PopupMenuItem::new("Jump to latest").on_click(on(|this, _, cx| this.scroll_to_bottom(cx))))
@@ -74,7 +81,8 @@ impl TerminalSession {
 
     fn open_selection_menu(&mut self, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
         self.pointer.menu_timer = None;
-        if self.selected().is_none() {
+        // Outside a thread the selection has nowhere to go but the clipboard (right-click Copy).
+        if !self.chat || self.selected().is_none() {
             return;
         }
         let session = cx.entity();

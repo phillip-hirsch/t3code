@@ -893,6 +893,54 @@ impl PlatformInput {
             _ => None,
         }
     }
+
+    /// t3code: the platform's event in a window whose interface scale is `ui_scale`
+    /// ([`Window::set_ui_scale`]): its positions and pixel scroll deltas divided by it.
+    pub(crate) fn scaled_down(mut self, ui_scale: f32) -> Self {
+        if ui_scale == 1.0 {
+            return self;
+        }
+        let at = |p: &mut Point<Pixels>| *p = p.map(|v| v.scale_down(ui_scale));
+        match &mut self {
+            PlatformInput::KeyDown(_)
+            | PlatformInput::KeyUp(_)
+            | PlatformInput::ModifiersChanged(_) => {}
+            PlatformInput::MouseDown(event) => at(&mut event.position),
+            PlatformInput::MouseUp(event) => at(&mut event.position),
+            PlatformInput::MouseMove(event) => at(&mut event.position),
+            PlatformInput::MousePressure(event) => at(&mut event.position),
+            PlatformInput::MouseExited(event) => at(&mut event.position),
+            PlatformInput::Scroll(event) => {
+                at(&mut event.position);
+                if let ScrollDelta::Pixels(delta) = &mut event.delta {
+                    at(delta);
+                }
+            }
+            PlatformInput::Pinch(event) => at(&mut event.position),
+            PlatformInput::LongPress(event) => {
+                at(&mut event.start_position);
+                at(&mut event.position);
+            }
+            PlatformInput::TouchDrag(event) => {
+                at(&mut event.start_position);
+                at(&mut event.position);
+            }
+            PlatformInput::BackGesture(event) => at(&mut event.start_position),
+            PlatformInput::FileDrop(
+                FileDropEvent::Entered { position, .. }
+                | FileDropEvent::Pending { position }
+                | FileDropEvent::Submit { position },
+            ) => at(position),
+            PlatformInput::FileDrop(FileDropEvent::Exited | FileDropEvent::Ended) => {}
+            PlatformInput::Touch(event) => {
+                at(&mut event.position);
+                if let Some(predicted) = &mut event.predicted_position {
+                    at(predicted);
+                }
+            }
+        }
+        self
+    }
 }
 
 #[cfg(test)]

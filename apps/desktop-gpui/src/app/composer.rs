@@ -2,35 +2,37 @@
 //! approval rows above it (`TimelinePendingApprovalRow.tsx`) and the question
 //! banner attached to it (`ComposerPendingUserInputPanel.tsx`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Duration;
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{InlineToken, InlineTokenContext, InputContent, TextDecoration, Textarea};
+use gpui_kit::component::input::{InlineToken, InlineTokenContext, InputContent, Textarea};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::text::TextView;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Disableable as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, BoxShadow, ClickEvent, Context, ElementId, Focusable as _, FontStyle, FontWeight, HighlightStyle, Hsla,
-    InteractiveElement as _, IntoElement, Keystroke, ModifiersChangedEvent, ParentElement as _, SharedString,
-    StatefulInteractiveElement as _, StrikethroughStyle, Styled as _, Window, div, prelude::FluentBuilder as _, px,
-    rgb, svg,
+    AnyElement, BoxShadow, ClickEvent, Context, ElementId, Focusable as _, FontWeight, Hsla, InteractiveElement as _,
+    IntoElement, Keystroke, ModifiersChangedEvent, ParentElement as _, SharedString, StatefulInteractiveElement as _,
+    Styled as _, Window, div, prelude::FluentBuilder as _, px, rgb, svg,
 };
 use serde_json::{Value, json};
 
-use super::attachments::Attachment;
+use super::attachments::{Attachment, QuestionDraft};
 use super::composer_fit::{ControlsWidths, ModeFit, resolve_mode_fit};
 use super::context_strip::PermissionsForm;
+use super::queue::QueueEdit;
 use super::send::Intent;
+use super::side_chat::ChatPane;
 use super::{Target, Workspace, new_id};
+use crate::composer_context::ContextRecords;
 use crate::composer_text::{self, Chip};
 use crate::model::{ModelSelection, RuntimeRequest, TurnItem};
 use crate::new_thread::UsageFallback;
-use crate::requests::{self, Question, QuestionDraft};
+use crate::requests::{self, Attached, Question};
 use crate::theme::{Tokens, tokens};
 
 /// `max-h-52` (208px) over the 22.75px line.
@@ -70,7 +72,6 @@ pub(super) fn editor_scrollbar() -> gpui_kit::base::input::EditorScrollbarRender
 pub(super) struct FooterText {
     picker: super::model_picker::TriggerText,
     chip: Option<&'static str>,
-    toggle: Option<&'static str>,
     font: gpui_kit::Font,
     size: gpui_kit::Pixels,
     scale: f32,
@@ -89,29 +90,101 @@ impl FooterText {
             };
             f32::from(window.text_system().shape_line(text.to_owned().into(), self.size, &[run], None).width)
         };
-        // The layouts below: `ps-1.5`/8px sides, 1px borders, 16-17px icons, 6px gaps, 4px apart.
-        let chip_widths = self.chip.map(|label| (32. + 6. + measure(label), 32.));
-        let toggle_widths = self.toggle.map(|label| (35. + 6. + measure(label), 35.));
-        let both = if chip_widths.is_some() && toggle_widths.is_some() { 4. } else { 0. };
-        let (block, block_icon_only) = [chip_widths, toggle_widths]
-            .into_iter()
-            .flatten()
-            .fold((both, both), |(natural, icon), (n, i)| (natural + n, icon + i));
+        // The chip: `ps-1.5`/8px sides, 1px borders, a 16px icon and a 6px gap.
+        let (block, block_icon_only) = self.chip.map_or((0., 0.), |label| (32. + 6. + measure(label), 32.));
         ControlsWidths { picker: self.picker.natural_width(measure), block, block_icon_only, overflow: 34., gap: 2. }
     }
 }
 
+/// Which composer chips a catch-up may change; a later kind covers every earlier one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum ChipSync {
+    /// After an undo or redo: only the chips it brought back for a skill or model that is gone.
+    Restored,
+    /// The skills or models chips resolve against changed (`skillChipReplacements`).
+    Lists,
+    /// Rich text turned on or off: every chip is rebuilt from the text, as the web's remount does.
+    Remount,
+}
+
+/// The catch-up to run now: `sync`, or the wider one still waiting in `pending`.
+fn take_chip_sync(pending: &mut Option<ChipSync>, sync: ChipSync) -> ChipSync {
+    pending.take().map_or(sync, |waiting| waiting.max(sync))
+}
+
+/// Whether the editor took a catch-up. One it refused during an IME composition waits in
+/// `pending` for the change that ends the composition.
+fn settle_chip_sync(
+    pending: &mut Option<ChipSync>,
+    sync: ChipSync,
+    result: Result<(), gpui_kit::base::input::InlineTokenError>,
+) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(gpui_kit::base::input::InlineTokenError::CompositionActive) => {
+            *pending = Some(sync);
+            false
+        }
+        Err(error) => {
+            log::warn!("composer chips not reconciled: {error:?}");
+            false
+        }
+    }
+}
+
+/// Records `now` as the provider chips resolve against; whether it differs from the one before.
+fn note_provider(seen: &mut Option<String>, now: Option<&str>) -> bool {
+    if seen.as_deref() == now {
+        return false;
+    }
+    *seen = now.map(str::to_owned);
+    true
+}
+
+/// Whether `now` holds a chip `before` did not, counting each occurrence of an id.
+fn adds_chip(before: &[String], now: &[String]) -> bool {
+    let count = |ids: &[String], id: &String| ids.iter().filter(|other| *other == id).count();
+    now.iter().any(|id| count(now, id) > count(before, id))
+}
+
 /// A failed message first, then whatever was typed after it.
-fn merge_prompt(failed: String, newer: &str) -> String {
+pub(super) fn merge_prompt(failed: String, newer: &str) -> String {
     if newer.trim().is_empty() { failed } else { format!("{failed}\n\n{newer}") }
 }
 
 /// What a target keeps of the composer while another one is on screen, like
-/// the web's `composerDraftStore` (in memory only).
+/// the web's `composerDraftStore`; [`super::draft_store`] keeps it across restarts.
 pub(super) enum ComposerDraft {
-    Prompt(String, Vec<Attachment>),
+    /// The prompt, its attachments and the context records its chips name.
+    Prompt(String, Vec<Attachment>, ContextRecords),
     /// An open question card; its prompt is the one it set aside.
     Question(QuestionDraft),
+    /// A queued message's edit left open: the composer as it was, while the target's own prompt
+    /// waits in the edit.
+    QueueEdit(Box<QueueEdit>, Box<ComposerDraft>),
+}
+
+impl ComposerDraft {
+    pub(super) fn empty() -> Self {
+        ComposerDraft::Prompt(String::new(), Vec::new(), ContextRecords::default())
+    }
+
+    /// A prompt with nothing in it, which needs no keeping.
+    pub(super) fn is_empty(&self) -> bool {
+        matches!(self, Self::Prompt(prompt, attachments, _) if prompt.is_empty() && attachments.is_empty())
+    }
+
+    /// Its own prompt and attachment count.
+    pub(super) fn content(&self) -> (&str, usize) {
+        let (prompt, attachments, _) = self.own_prompt();
+        (prompt, attachments.len())
+    }
+
+    /// `composerDraftHasUserContent`.
+    pub(super) fn has_content(&self) -> bool {
+        let (prompt, attachments) = self.content();
+        !prompt.trim().is_empty() || attachments > 0
+    }
 }
 
 /// A target's model and permissions picks while another one is on screen.
@@ -135,45 +208,29 @@ impl Workspace {
                 cx.notify();
             }
         }
-        self.save_custom_answer(cx);
+        self.save_custom_answer(ChatPane::Main, cx);
         self.sync_composer_empty(cx);
+        self.drop_orphan_citation_comment(cx);
         self.reveal_branch_banner();
         let state = self.composer.read(cx);
         if self.prompt_history.as_ref().is_some_and(|h| *h.recalled != *state.value()) {
             self.prompt_history = None;
         }
         let chips: Vec<String> = state.tokens().iter().map(|s| s.token().id().to_string()).collect();
-        let previous = std::mem::replace(&mut self.chip_ids, chips);
+        // A chip an undo or redo brings back may name a skill or model that has gone since.
+        let restored = adds_chip(&self.chip_ids, &chips);
+        self.chip_ids = chips;
+        let references = composer_text::context_reference_ids(&state.value());
+        let previous = std::mem::replace(&mut self.context_refs, references);
         self.sync_attachment_chips(&previous, cx);
+        self.sync_context_chips(cx);
+        // A catch-up refused while an IME composition was active runs once a change ends it.
+        if restored || self.chip_sync_pending.is_some() {
+            self.reconcile_composer_chips(ChipSync::Restored, cx);
+        }
         self.sync_trigger(cx);
         self.sync_composer_marks(cx);
-    }
-
-    /// Repaints the composer's Markdown (`composerRichTextEnabled`); off, the text is plain.
-    /// Runs per text or theme change, never per frame; the editor slides ranges in between.
-    pub(super) fn sync_composer_marks(&mut self, cx: &mut Context<Self>) {
-        let enabled = self.client_settings.values.bool("composerRichTextEnabled");
-        if !enabled && self.composer_marks.is_none() {
-            return;
-        }
-        let decorations = if enabled {
-            let t = tokens(cx);
-            let state = self.composer.read(cx);
-            let chips: Vec<_> = state.tokens().iter().map(gpui_kit::base::input::InlineTokenSpan::range).collect();
-            crate::composer_markdown::spans(&state.value(), &chips)
-                .into_iter()
-                .map(|span| TextDecoration::new(span.range, mark_style(span.style, t)))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        match &self.composer_marks {
-            Some(marks) => marks.set(decorations, cx),
-            None => {
-                let marks = self.composer.update(cx, |state, cx| state.create_decorations_collection(decorations, cx));
-                self.composer_marks = Some(marks);
-            }
-        }
+        self.drafts_changed(cx);
     }
 
     pub(super) fn sync_composer_empty(&mut self, cx: &mut Context<Self>) {
@@ -198,7 +255,7 @@ impl Workspace {
     }
 
     /// `set_value` emits no `Change`, so this keeps `composer_empty` in step.
-    /// File links, known skills and context links in `text` come back as chips.
+    /// File links, known skills and models, and context links in `text` come back as chips.
     pub(super) fn set_composer_text(
         &mut self,
         text: impl Into<SharedString>,
@@ -208,7 +265,13 @@ impl Workspace {
         let text: SharedString = text.into();
         let skills = self.skill_names();
         let mut content = InputContent::new(text.clone());
-        for (range, chip) in composer_text::chips(&text, |name| skills.iter().any(|s| s == name)) {
+        let chips = composer_text::chips_with_models(
+            &text,
+            self.client_settings.values.bool("composerRichTextEnabled"),
+            |name| skills.iter().any(|s| s == name),
+            |instance_id, model| self.model_mention(instance_id, model).map(|m| m.label),
+        );
+        for (range, chip) in chips {
             let token = InlineToken::new(chip.id(), &text[range.clone()]).with_label(chip.label().to_owned());
             content = match content.clone().with_token(range, token) {
                 Ok(next) => next,
@@ -216,15 +279,94 @@ impl Workspace {
             };
         }
         self.chip_ids = content.tokens().iter().map(|s| s.token().id().to_string()).collect();
+        self.context_refs = composer_text::context_reference_ids(&text);
+        self.chip_sync_pending = None;
         // `set_value` clears the undo history that could bring a deleted chip back.
         self.release_retained_attachments(cx);
+        self.reset_context_chips(&text);
         self.composer.update(cx, |composer, cx| composer.set_value(content, window, cx));
         self.sync_composer_empty(cx);
+        self.drop_orphan_citation_comment(cx);
         self.sync_trigger(cx);
         self.sync_composer_marks(cx);
+        self.drafts_changed(cx);
     }
 
-    /// Pasted file links, known skills and context links arrive as chips (`handlePaste`);
+    /// The skills or models chips resolve against may have changed: the composer's chips and
+    /// the messages that name one catch up.
+    pub(super) fn chip_lists_changed(&mut self, cx: &mut Context<Self>) {
+        let provider = self.composer_provider().map(|p| p.instance_id.clone());
+        note_provider(&mut self.chip_provider, provider.as_deref());
+        self.reconcile_composer_chips(ChipSync::Lists, cx);
+        self.markdown.chips_changed();
+        cx.notify();
+    }
+
+    /// The composer's provider, whose skills chips name, changed from outside a pick (another
+    /// client's model change on the open thread): chips catch up. A model change within the
+    /// provider leaves them, since a model chip names any provider's model.
+    pub(super) fn sync_chip_provider(&mut self, cx: &mut Context<Self>) {
+        let provider = self.composer_provider().map(|p| p.instance_id.clone());
+        if note_provider(&mut self.chip_provider, provider.as_deref()) {
+            self.refresh_menu_items(cx);
+            self.chip_lists_changed(cx);
+        }
+    }
+
+    /// Brings the composer's chips in line with the text and the lists it knows, outside the undo
+    /// history and keeping the selection; `sync` says which chips may change. Attachments keep
+    /// their records: like the web's, a send reads their references from the text.
+    pub(super) fn reconcile_composer_chips(&mut self, sync: ChipSync, cx: &mut Context<Self>) {
+        let sync = take_chip_sync(&mut self.chip_sync_pending, sync);
+        let state = self.composer.read(cx);
+        let (text, spans) = (state.value(), state.tokens().to_vec());
+        if sync != ChipSync::Remount
+            && spans.is_empty()
+            && !text.contains(composer_text::is_currency)
+            && !text.contains("model:")
+        {
+            return;
+        }
+        let skills = self.skill_names();
+        let tokens: Vec<_> =
+            spans.iter().map(|s| (s.range(), s.token().id().as_ref(), s.token().label().as_ref())).collect();
+        let rich = self.client_settings.values.bool("composerRichTextEnabled");
+        let is_skill = |name: &str| skills.iter().any(|s| s == name);
+        let model_label = |instance_id: &str, model: &str| self.model_mention(instance_id, model).map(|m| m.label);
+        let (stale, fresh) = match sync {
+            ChipSync::Restored => composer_text::reconcile_restored_chips(&text, rich, &tokens, is_skill, model_label),
+            ChipSync::Lists => composer_text::reconcile_chips(&text, rich, &tokens, is_skill, model_label),
+            ChipSync::Remount => composer_text::remount_chips(&text, rich, &tokens, is_skill, model_label),
+        };
+        if stale.is_empty() && fresh.is_empty() {
+            return;
+        }
+        let mut next: Vec<_> = spans
+            .iter()
+            .filter(|span| !stale.contains(&span.range()))
+            .map(|span| (span.range(), span.token().clone()))
+            .chain(fresh.into_iter().map(|(range, chip)| {
+                let token = InlineToken::new(chip.id(), &text[range.clone()]).with_label(chip.label().to_owned());
+                (range, token)
+            }))
+            .collect();
+        next.sort_by_key(|(range, _)| range.start);
+        let mut content = InputContent::new(text);
+        for (range, token) in next {
+            content = match content.clone().with_token(range, token) {
+                Ok(next) => next,
+                Err(_) => content,
+            };
+        }
+        let result = self.composer.update(cx, |composer, cx| composer.retokenize(content, cx));
+        if settle_chip_sync(&mut self.chip_sync_pending, sync, result) {
+            let state = self.composer.read(cx);
+            self.chip_ids = state.tokens().iter().map(|s| s.token().id().to_string()).collect();
+            self.sync_composer_marks(cx);
+        }
+    }
+
+    /// Pasted file links, known skills and models, and context links arrive as chips (`handlePaste`);
     /// `false` leaves a paste without any, or one into code, to the editor.
     pub(super) fn paste_chips(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let state = self.composer.read(cx);
@@ -235,9 +377,13 @@ impl Workspace {
         }
         let after_space = value[..selection.start].chars().next_back().is_none_or(char::is_whitespace);
         let skills = self.skill_names();
-        let Some((text, found)) =
-            composer_text::pasted_chips(text, after_space, |name| skills.iter().any(|s| s == name))
-        else {
+        let Some((text, found)) = composer_text::pasted_chips(
+            text,
+            after_space,
+            rich,
+            |name| skills.iter().any(|s| s == name),
+            |instance_id, model| self.model_mention(instance_id, model).map(|m| m.label),
+        ) else {
             return false;
         };
         let at = selection.start;
@@ -252,6 +398,19 @@ impl Workspace {
             state.set_selected_range(end..end, cx);
         });
         true
+    }
+
+    /// The model a `model:` reference names, as its chip shows it (`modelMentionPresentationAtom`):
+    /// any provider of this environment that offers it, ready or not.
+    pub(super) fn model_mention(&self, instance_id: &str, model: &str) -> Option<ModelMention> {
+        let provider = self.server_info().provider(instance_id)?;
+        let option = provider.models.iter().find(|m| m.slug == model)?;
+        Some(ModelMention {
+            label: crate::model_label::display_model_name(option),
+            provider_label: (option.sub_provider.clone())
+                .unwrap_or_else(|| crate::model_label::provider_name(provider).to_owned()),
+            driver: provider.driver.clone(),
+        })
     }
 
     /// The user-invocable skills of the composer's provider, by name.
@@ -278,17 +437,30 @@ impl Workspace {
             self.composer_selections.remove(&target);
         }
         let attachments = std::mem::take(&mut self.attachments);
-        let draft = match (self.question.take(), self.take_queue_edit_draft()) {
-            (Some(question), _) => ComposerDraft::Question(question),
-            // A queued message's edit ends here; the thread keeps its own draft.
-            (None, Some((prompt, attachments))) => ComposerDraft::Prompt(prompt, attachments),
-            (None, None) => ComposerDraft::Prompt(self.composer.read(cx).value().to_string(), attachments),
+        let records = self.take_context_records();
+        let commented = self.stash_citation_comment(cx);
+        let draft = match self.question.take() {
+            Some(mut question) => {
+                question.park(attachments);
+                ComposerDraft::Question(question)
+            }
+            None => ComposerDraft::Prompt(
+                commented.unwrap_or_else(|| self.composer.read(cx).value().to_string()),
+                attachments,
+                records,
+            ),
+        };
+        // A queued message's edit stays open with the composer it holds, the thread's own draft in it.
+        let draft = match self.queue.park_edit() {
+            Some(edit) => ComposerDraft::QueueEdit(Box::new(edit), Box::new(draft)),
+            None => draft,
         };
         self.prompt_history = None;
         self.menu = Default::default();
+        self.composer_ui.rich.picker = None;
         self.prompt_stash.open = false;
         self.picker.dismiss();
-        if matches!(&draft, ComposerDraft::Prompt(prompt, attachments) if prompt.is_empty() && attachments.is_empty()) {
+        if draft.is_empty() {
             self.composer_drafts.remove(&target);
         } else {
             self.composer_drafts.insert(target, draft);
@@ -304,46 +476,79 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.target.as_ref() == Some(origin) {
-            match &mut self.question {
-                Some(question) => question.prompt = merge_prompt(text, &question.prompt),
-                None => {
-                    let merged = merge_prompt(text, &self.composer.read(cx).value());
-                    self.set_composer_text(merged, window, cx);
-                }
-            }
+        self.drafts_changed(cx);
+        if self.composer_holds_prompt(origin) {
+            let merged = merge_prompt(text, &self.composer.read(cx).value());
+            self.set_composer_text(merged, window, cx);
             return;
         }
-        let slot = match self.composer_drafts.get_mut(origin) {
-            Some(ComposerDraft::Prompt(prompt, _)) => prompt,
-            Some(ComposerDraft::Question(question)) => &mut question.prompt,
-            None => {
-                self.composer_drafts.insert(origin.clone(), ComposerDraft::Prompt(text, Vec::new()));
-                return;
+        if self.target.as_ref() != Some(origin) {
+            self.composer_drafts.entry(origin.clone()).or_insert_with(ComposerDraft::empty);
+        }
+        if let Some((prompt, ..)) = self.set_aside_prompt(origin) {
+            *prompt = merge_prompt(text, prompt);
+        }
+    }
+
+    /// A failed send's attachments, back with `origin`'s prompt wherever it waits: the composer,
+    /// or set aside under an open question or in a draft not on screen.
+    pub(super) fn give_back_attachments(
+        &mut self,
+        origin: &Target,
+        attachments: Vec<Attachment>,
+        cx: &mut Context<Self>,
+    ) {
+        if attachments.is_empty() {
+            return;
+        }
+        if self.composer_holds_prompt(origin) {
+            self.attachments.extend(attachments);
+        } else {
+            if self.target.as_ref() != Some(origin) {
+                self.composer_drafts.entry(origin.clone()).or_insert_with(ComposerDraft::empty);
             }
-        };
-        *slot = merge_prompt(text, slot);
+            if let Some((_, kept, _)) = self.set_aside_prompt(origin) {
+                kept.extend(attachments);
+            }
+        }
+        self.drafts_changed(cx);
     }
 
     /// Brings back the new target's composer; call after the target changes.
     /// `sync_question` drops a restored question once the thread shows it resolved.
     pub(super) fn restore_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_draft_workspace(cx);
+        // The question coming back is not the one a pick on another target was advancing.
+        self.composer_ui.question_advance = None;
         self.typing_guard.reset();
         self._typing_idle = None;
         self.sync_typing_guard(window, cx);
-        match self.target.as_ref().and_then(|target| self.composer_drafts.remove(target)) {
-            Some(ComposerDraft::Question(question)) => {
-                self.question = Some(question);
-                self.load_custom_answer(window, cx);
+        let draft = self.target.as_ref().and_then(|target| self.composer_drafts.remove(target));
+        self.restore_editor(draft, window, cx);
+    }
+
+    /// Puts a draft that was set aside back in the editor.
+    fn restore_editor(&mut self, draft: Option<ComposerDraft>, window: &mut Window, cx: &mut Context<Self>) {
+        match draft {
+            Some(ComposerDraft::QueueEdit(edit, editor)) => {
+                self.queue.resume_edit(*edit);
+                self.restore_editor(Some(*editor), window, cx);
             }
-            Some(ComposerDraft::Prompt(prompt, attachments)) => {
+            Some(ComposerDraft::Question(mut question)) => {
+                self.attachments = question.unpark();
+                self.question = Some(question);
+                self.load_custom_answer(ChatPane::Main, window, cx);
+            }
+            Some(ComposerDraft::Prompt(prompt, attachments, records)) => {
                 self.question = None;
                 self.attachments = attachments;
+                self.context.records = records;
                 self.set_composer_text(prompt, window, cx);
+                self.start_restored_uploads(cx);
             }
             None => {
                 self.question = None;
+                self.context.records = ContextRecords::default();
                 self.set_composer_text("", window, cx);
             }
         }
@@ -358,7 +563,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> bool {
         // The permissions popover nests in the model picker's footer, so it takes the keys first.
-        if self.permissions_key(keystroke, window, cx) || self.context_meter_key(keystroke, cx) {
+        if self.permissions_key(keystroke, window, cx) {
             return true;
         }
         if self.model_picker_open() {
@@ -367,10 +572,27 @@ impl Workspace {
         self.stash_menu_key(keystroke, window, cx)
             || self.draft_workspace_key(keystroke, window, cx)
             || (self.composer.focus_handle(cx).is_focused(window)
-                && (self.code_key(keystroke, window, cx)
+                && (self.model_chip_key(keystroke, window, cx)
+                    || self.code_key(keystroke, window, cx)
+                    || self.block_backspace_key(keystroke, window, cx)
                     || self.list_outdent_key(keystroke, window, cx)
-                    || self.plan_toggle_key(keystroke, window, cx)
-                    || self.menu_key(keystroke, window, cx)))
+                    || self.menu_key(keystroke, window, cx)
+                    || self.prompt_suggestion_key(keystroke, window, cx)))
+    }
+
+    /// Enter on a selected model chip opens its details, as the web chip's button does.
+    fn model_chip_key(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if keystroke.key != "enter" || keystroke.modifiers.modified() {
+            return false;
+        }
+        let state = self.composer.read(cx);
+        let selection = state.selected_range();
+        let Some(Chip::Model { instance_id, model, .. }) = selected_chip(state.tokens(), &selection) else {
+            return false;
+        };
+        let Some(bounds) = state.range_to_bounds(&selection) else { return false };
+        self.open_model_menu(&instance_id, &model, None, model_chip_menu_at(bounds), window, cx);
+        true
     }
 
     /// Keys left after the keymap: 1-9 on a question card, prompt history, then a plain send.
@@ -455,7 +677,7 @@ impl Workspace {
         edit.is_some_and(|edit| self.apply_composer_edit(edit, window, cx))
     }
 
-    fn apply_composer_edit(
+    pub(super) fn apply_composer_edit(
         &mut self,
         edit: crate::composer_edit::Edit,
         window: &mut Window,
@@ -474,53 +696,41 @@ impl Workspace {
     /// `shouldTypeToFocusComposer` and `usePasteToFocusComposer`: with nothing focused (a
     /// click on the timeline blurs the editor), typing and pasting land at the composer's end.
     fn redirect_to_composer(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if !self.focus.is_focused(window)
-            || self.target.is_none()
-            || self.palette.is_some()
-            || self.page.is_some()
-            || self.settings.is_some()
-        {
-            return false;
-        }
-        let m = keystroke.modifiers;
-        let paste = keystroke.key == "v" && (m.control || m.platform) && !m.alt;
-        let text = if paste {
-            let item = cx.read_from_clipboard();
-            let only_text = item
-                .as_ref()
-                .is_some_and(|item| item.entries().iter().all(|e| matches!(e, gpui_kit::ClipboardEntry::String(_))));
-            match item.and_then(|item| item.text()).filter(|text| only_text && !text.is_empty()) {
-                Some(text) => text,
-                None => return false,
+        let gate = RedirectGate {
+            resting: self.focus.is_focused(window),
+            open: self.target.is_some()
+                && self.palette.is_none()
+                && self.page.is_none()
+                && self.settings.is_none()
+                && !window.has_active_dialog(cx),
+            inert: self.saving_queue_edit(),
+            answer_locked: !self.question_takes_text(ChatPane::Main),
+        };
+        let Some(redirect) = focus_redirect(keystroke, gate) else { return false };
+        let (text, fold, item) = match redirect {
+            FocusRedirect::Type(text) => (text, false, None),
+            FocusRedirect::Paste { as_text } => {
+                let Some(item) = cx.read_from_clipboard() else { return false };
+                let only_text = item.entries().iter().all(|e| matches!(e, gpui_kit::ClipboardEntry::String(_)));
+                match item.text().filter(|text| only_text && !text.is_empty()) {
+                    Some(text) => (text, !as_text, Some(item)),
+                    None => return false,
+                }
             }
-        } else if !m.control && !m.alt && !m.platform && !m.function {
-            match keystroke.key_char.as_ref().filter(|c| c.chars().count() == 1 && !c.chars().any(char::is_control)) {
-                Some(c) => c.clone(),
-                None => return false,
-            }
-        } else {
-            return false;
         };
         self.composer.update(cx, |state, cx| {
             let end = state.value().len();
             state.set_selected_range(end..end, cx);
         });
         self.composer.read(cx).focus_handle(cx).focus(window, cx);
-        // Ctrl+Shift+V pastes as text even when it is long (`isPasteAsTextShortcut`).
-        if paste && !m.shift && self.fold_pasted_text(&text, window, cx) {
+        // Copied context brings its records and attachments, as a paste into the editor does.
+        if item.is_some_and(|item| self.paste_context(&item, window, cx)) {
+            return true;
+        }
+        if fold && self.fold_pasted_text(&text, window, cx) {
             return true;
         }
         self.composer.update(cx, |state, cx| state.insert(text, window, cx));
-        true
-    }
-
-    /// Shift+Tab switches between Build and Plan (`composerCommandKey.ts`).
-    fn plan_toggle_key(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let m = keystroke.modifiers;
-        if keystroke.key != "tab" || !m.shift || m.control || m.alt || m.platform || !self.interaction_mode().0 {
-            return false;
-        }
-        self.toggle_interaction_mode(window, cx);
         true
     }
 
@@ -584,26 +794,23 @@ impl Workspace {
 
     /// 1-9 pick an option on an open question card while no text field, terminal or preview has focus.
     fn question_option_key(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let m = keystroke.modifiers;
-        if m.control || m.platform || m.alt || self.page.is_some() || self.settings.is_some() {
+        if self.page.is_some() || self.settings.is_some() {
             return false;
         }
-        let Some(digit) = keystroke.key.parse::<usize>().ok().filter(|d| (1..=9).contains(d)) else { return false };
+        let Some(digit) = option_digit(keystroke) else { return false };
         // The web skips keys aimed at any text field; here that is any focus but the workspace's own
         // (composer, find bar, side chat, terminal, preview), and an open palette or dialog.
-        let resting = self.focus.is_focused(window) || window.focused(cx).is_none();
+        // A disabled composer is no text field, though it keeps the focus it had.
+        let disabled =
+            !self.question_takes_text(ChatPane::Main) && self.composer.read(cx).focus_handle(cx).is_focused(window);
+        let resting = self.focus.is_focused(window) || window.focused(cx).is_none() || disabled;
         if !resting || self.palette.is_some() || window.has_active_dialog(cx) {
             return false;
         }
-        let Some(draft) = &self.question else { return false };
-        if draft.collapsed
-            || self.pending_question_request().is_none_or(|(r, _)| r.capability() == Some("not_resumable"))
-        {
-            return false;
-        }
-        let Some(option) = draft.questions[draft.index].options.get(digit - 1) else { return false };
+        let Some((pane, draft)) = self.shortcut_question() else { return false };
+        let Some(option) = draft.active().options.get(digit - 1) else { return false };
         let value = option.value().to_owned();
-        self.pick_option(value, window, cx);
+        self.pick_option(pane, value, window, cx);
         true
     }
 
@@ -639,7 +846,7 @@ impl Workspace {
     pub(super) fn release_typing_hold(&mut self, blur: bool, window: &mut Window, cx: &mut Context<Self>) {
         self._typing_idle = None;
         if self.typing_guard.release(blur) {
-            self.sync_question(window, cx);
+            self.sync_question(ChatPane::Main, window, cx);
             cx.notify();
         }
     }
@@ -652,41 +859,119 @@ impl Workspace {
         approvals
     }
 
-    /// Opens a fresh draft when the first pending question changes. The editor
+    pub(super) fn question(&self, pane: ChatPane) -> Option<&QuestionDraft> {
+        match pane {
+            ChatPane::Main => self.question.as_ref(),
+            ChatPane::Side => self.side_chat_question(),
+        }
+    }
+
+    fn question_slot(&mut self, pane: ChatPane) -> Option<&mut Option<QuestionDraft>> {
+        match pane {
+            ChatPane::Main => Some(&mut self.question),
+            ChatPane::Side => self.side_chat_question_slot(),
+        }
+    }
+
+    pub(super) fn question_mut(&mut self, pane: ChatPane) -> Option<&mut QuestionDraft> {
+        self.question_slot(pane)?.as_mut()
+    }
+
+    /// Replaces the pane's pending auto-advance; `None` cancels it, like the web clearing its
+    /// timer when the active question changes or the card unmounts.
+    fn set_question_advance(&mut self, pane: ChatPane, task: Option<gpui_kit::Task<()>>) {
+        let slot = match pane {
+            ChatPane::Main => Some(&mut self.composer_ui.question_advance),
+            ChatPane::Side => self.side_chat_advance_slot(),
+        };
+        if let Some(slot) = slot {
+            *slot = task;
+        }
+    }
+
+    pub(super) fn cancel_question_advances(&mut self) {
+        self.set_question_advance(ChatPane::Main, None);
+        self.set_question_advance(ChatPane::Side, None);
+    }
+
+    /// Opens a fresh draft when the pane's first pending question changes. The editor
     /// then holds the question's answer, and the prompt waits in the draft
     /// until the last question closes.
-    pub(super) fn sync_question(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(projection) = self.thread.as_ref().and_then(|t| t.state.projection.as_ref()) else { return };
+    pub(super) fn sync_question(&mut self, pane: ChatPane, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(projection) = self.pane_projection(pane) else { return };
         let first = projection.pending_user_inputs().into_iter().next();
         // A question that arrived mid-typing waits; the composer keeps the prompt meanwhile.
-        let first = first.filter(|(request, _)| !self.typing_guard.is_held(&request.id));
-        if first.map(|(request, _)| &request.id) == self.question.as_ref().map(|q| &q.request_id) {
+        let first = first.filter(|(request, _)| pane == ChatPane::Side || !self.typing_guard.is_held(&request.id));
+        if first.map(|(request, _)| &request.id) == self.question(pane).map(|q| &q.request_id) {
             return;
         }
         let next = first.and_then(|(request, item)| QuestionDraft::new(request.id.clone(), requests::questions(item)));
-        match (self.question.take(), next) {
+        self.set_question_advance(pane, None);
+        let Some(previous) = self.question_slot(pane).map(Option::take) else { return };
+        // The open thread's composer lists the question on screen's attachments; side chats take none.
+        let main = pane == ChatPane::Main;
+        match (previous, next) {
             (None, None) => {}
-            (Some(previous), None) => self.set_composer_text(previous.prompt, window, cx),
+            (Some(previous), None) => {
+                if main {
+                    self.close_question_attachments(previous.attachments, previous.prompt_attachments, cx);
+                    // Ahead of the prompt's text, so its chips find them.
+                    self.context.records = previous.prompt_records;
+                }
+                self.set_pane_text(pane, previous.prompt, window, cx);
+            }
             (previous, Some(draft)) => {
-                let prompt = match previous {
-                    Some(previous) => previous.prompt,
-                    None => self.composer.read(cx).value().to_string(),
+                let (prompt, prompt_attachments, prompt_records) = match previous {
+                    Some(previous) if main => {
+                        self.close_question_attachments(previous.attachments, Vec::new(), cx);
+                        (previous.prompt, previous.prompt_attachments, previous.prompt_records)
+                    }
+                    Some(previous) => (previous.prompt, previous.prompt_attachments, previous.prompt_records),
+                    // Out of reach of the answer's text, which would prune them.
+                    None if main => {
+                        (self.pane_text(pane, cx), std::mem::take(&mut self.attachments), self.take_context_records())
+                    }
+                    None => (self.pane_text(pane, cx), Vec::new(), ContextRecords::default()),
                 };
-                self.question = Some(QuestionDraft { prompt, ..draft });
-                self.load_custom_answer(window, cx);
+                if let Some(slot) = self.question_slot(pane) {
+                    *slot = Some(QuestionDraft { prompt, prompt_attachments, prompt_records, ..draft });
+                }
+                self.load_custom_answer(pane, window, cx);
             }
         }
     }
 
-    fn pending_question_request(&self) -> Option<(&RuntimeRequest, &TurnItem)> {
-        let id = &self.question.as_ref()?.request_id;
-        let projection = self.thread.as_ref()?.state.projection.as_ref()?;
-        projection.pending_user_inputs().into_iter().find(|(request, _)| &request.id == id)
+    /// Shows question `index` of the pane's card, with its attachments in the composer.
+    fn show_question(&mut self, pane: ChatPane, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_question_advance(pane, None);
+        match pane {
+            ChatPane::Main => {
+                let Some(question) = self.question.as_mut() else { return };
+                question.park(std::mem::take(&mut self.attachments));
+                question.index = index;
+                self.attachments = question.unpark();
+            }
+            ChatPane::Side => {
+                let Some(draft) = self.question_mut(pane) else { return };
+                draft.index = index;
+            }
+        }
+        self.load_custom_answer(pane, window, cx);
+        cx.notify();
     }
 
-    fn save_custom_answer(&mut self, cx: &mut Context<Self>) {
-        let text = self.composer.read(cx).value().to_string();
-        let Some(draft) = &mut self.question else { return };
+    pub(super) fn pending_question_request(&self, pane: ChatPane) -> Option<(&RuntimeRequest, &TurnItem)> {
+        let id = &self.question(pane)?.request_id;
+        self.pane_projection(pane)?.pending_user_inputs().into_iter().find(|(request, _)| &request.id == id)
+    }
+
+    /// A user edit in the pane's composer, while a question holds it, is the custom answer.
+    pub(super) fn save_custom_answer(&mut self, pane: ChatPane, cx: &mut Context<Self>) {
+        if self.question(pane).is_none() {
+            return;
+        }
+        let text = self.pane_text(pane, cx);
+        let Some(draft) = self.question_mut(pane) else { return };
         let question = &draft.questions[draft.index];
         if text.is_empty() && !draft.drafts.contains_key(&question.id) {
             return;
@@ -695,87 +980,137 @@ impl Workspace {
         draft.drafts.insert(question.id.clone(), next);
     }
 
-    fn load_custom_answer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(draft) = &self.question else { return };
+    fn load_custom_answer(&mut self, pane: ChatPane, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(draft) = self.question(pane) else { return };
         let question = &draft.questions[draft.index];
         let text = draft.drafts.get(&question.id).and_then(|d| d.custom.clone()).unwrap_or_default();
-        self.set_composer_text(text, window, cx);
+        self.set_pane_text(pane, text, window, cx);
+    }
+
+    /// The pane's question takes answers now: its request still waits and can resume, no answer
+    /// is on its way, and the connection may operate the thread (`responseDisabled`).
+    pub(super) fn question_answerable(&self, pane: ChatPane) -> bool {
+        !self.question_responding(pane)
+            && self.pane_can_operate(pane)
+            && self.pending_question_request(pane).is_some_and(|(r, _)| r.capability() != Some("not_resumable"))
+    }
+
+    /// The pane's composer takes text: no open question there is choice-only or has its answer on
+    /// the way (`insertComposerText`, the editor's `disabled`).
+    pub(super) fn question_takes_text(&self, pane: ChatPane) -> bool {
+        !self.question_responding(pane) && self.question(pane).is_none_or(|q| q.active().allows_custom())
+    }
+
+    /// The question whose options 1-9 pick: the open thread's card first, else the side chat's,
+    /// while it is expanded and takes answers.
+    fn shortcut_question(&self) -> Option<(ChatPane, &QuestionDraft)> {
+        let pane = if self.question.is_some() { ChatPane::Main } else { ChatPane::Side };
+        let draft = self.question(pane)?;
+        (!draft.collapsed && self.question_answerable(pane)).then_some((pane, draft))
     }
 
     /// Next question, or submit on the last; a no-op while the active one is unanswered.
-    pub(super) fn advance_question(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(draft) = &mut self.question else { return };
-        let question = &draft.questions[draft.index];
-        if requests::answer(question, draft.drafts.get(&question.id)).is_none() {
+    pub(super) fn advance_question(&mut self, pane: ChatPane, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.question_answerable(pane) {
+            return;
+        }
+        let Some(draft) = self.question(pane) else { return };
+        let question = draft.active();
+        let attached = self.question_attached(pane, &question.id);
+        if requests::answer(question, draft.drafts.get(&question.id), attached).is_none() {
             return;
         }
         if draft.index + 1 < draft.questions.len() {
-            draft.index += 1;
-            self.load_custom_answer(window, cx);
-            cx.notify();
+            let next = draft.index + 1;
+            self.show_question(pane, next, window, cx);
             return;
         }
-        let Some(answers) = requests::answers(&draft.questions, &draft.drafts) else { return };
+        let attached = |id: &str| self.question_attached(pane, id);
+        let Some(answers) = requests::answers(&draft.questions, &draft.drafts, attached) else { return };
         let request_id = draft.request_id.clone();
-        if self.responding.is_some() {
+        let mut response = json!({"answers": answers});
+        if pane == ChatPane::Main {
+            match self.question_attachments_payload() {
+                Ok(by_question) => {
+                    if let Some(by_question) = by_question {
+                        response["attachmentsByQuestionId"] = by_question;
+                    }
+                }
+                Err(error) => {
+                    self.error = Some(error.into());
+                    cx.notify();
+                    return;
+                }
+            }
+        }
+        self.respond(pane, request_id, response, cx);
+    }
+
+    pub(super) fn previous_question(&mut self, pane: ChatPane, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(draft) = self.question(pane) else { return };
+        let previous = draft.index.saturating_sub(1);
+        self.show_question(pane, previous, window, cx);
+    }
+
+    fn pick_option(&mut self, pane: ChatPane, value: String, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.question_answerable(pane) {
             return;
         }
-        self.respond(request_id, json!({"answers": answers}), cx);
-    }
-
-    fn previous_question(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(draft) = &mut self.question else { return };
-        draft.index = draft.index.saturating_sub(1);
-        self.load_custom_answer(window, cx);
-        cx.notify();
-    }
-
-    fn pick_option(&mut self, value: String, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(draft) = &mut self.question else { return };
+        let shown = self.pane_thread(pane);
+        let Some(draft) = self.question_mut(pane) else { return };
         let question = &draft.questions[draft.index];
         let next = requests::toggle(question, draft.drafts.get(&question.id), &value);
         let advance = !question.multi_select;
         draft.drafts.insert(question.id.clone(), next);
-        let at = (draft.request_id.clone(), draft.index);
-        self.set_composer_text("", window, cx);
+        // Request ids repeat across environments, so the pane's thread is part of where it was.
+        let at = (shown, draft.request_id.clone(), draft.index);
+        self.set_pane_text(pane, String::new(), window, cx);
         cx.notify();
-        if advance {
+        // A pick replaces the previous one's timer, as the web's does.
+        let task = advance.then(|| {
             cx.spawn_in(window, async move |this, cx| {
                 cx.background_executor().timer(AUTO_ADVANCE).await;
                 let _ = this.update_in(cx, |this, window, cx| {
-                    if this.question.as_ref().is_some_and(|q| (q.request_id.clone(), q.index) == at) {
-                        this.advance_question(window, cx);
+                    let now = this.question(pane).map(|q| (this.pane_thread(pane), q.request_id.clone(), q.index));
+                    if now.as_ref() == Some(&at) {
+                        this.advance_question(pane, window, cx);
                     }
                 });
             })
-            .detach();
-        }
+        });
+        self.set_question_advance(pane, task);
     }
 
-    fn dismiss_question(&mut self, request_id: String, cx: &mut Context<Self>) {
-        let Some(thread) = &self.thread else { return };
-        let command = json!({"type": "thread.user-input.dismiss", "commandId": new_id(), "threadId": thread.id, "requestId": request_id});
-        self.dispatch(command, cx);
+    fn dismiss_question(&mut self, pane: ChatPane, request_id: String, cx: &mut Context<Self>) {
+        self.dispatch_response(
+            pane,
+            request_id,
+            |thread_id, request_id| {
+                json!({"type": "thread.user-input.dismiss", "commandId": new_id(), "threadId": thread_id, "requestId": request_id})
+            },
+            cx,
+        );
     }
 
-    /// Sending while an approval waits declines it: with the text as its
-    /// feedback when the provider takes feedback (the text is then used up and
-    /// `true` comes back), else every live approval is declined before the
-    /// message goes out.
-    pub(super) fn approval_declines(&self, text: &str) -> (Vec<Value>, bool) {
-        // Approvals the typing guard holds stay unseen and pending.
-        let live: Vec<_> =
-            self.shown_approvals().into_iter().map(|(request, _)| request).filter(|r| r.is_live()).collect();
+    /// Sending from the pane while an approval waits declines it: with the text
+    /// as its feedback when the provider takes feedback (the text is then used
+    /// up and `true` comes back), else every live approval is declined before
+    /// the message goes out.
+    pub(super) fn approval_declines(&self, pane: ChatPane, text: &str) -> (Vec<Value>, bool) {
+        let Some((_, thread_id)) = self.pane_thread(pane) else { return (Vec::new(), false) };
+        // Approvals the open thread's typing guard holds stay unseen and pending.
+        let shown = match pane {
+            ChatPane::Main => self.shown_approvals(),
+            ChatPane::Side => self.side_chat_projection().map(|p| p.pending_approvals()).unwrap_or_default(),
+        };
+        let live: Vec<_> = shown.into_iter().map(|(request, _)| request).filter(|r| r.is_live()).collect();
+        let decline = |id: &str, response| super::respond_value(&thread_id, id, response);
         match live.first() {
             None => (Vec::new(), false),
             Some(first) if first.supports_feedback() => {
-                let decline = self.respond_command(&first.id, json!({"decision": "decline", "feedback": text}));
-                (decline.into_iter().collect(), true)
+                (vec![decline(&first.id, json!({"decision": "decline", "feedback": text}))], true)
             }
-            Some(_) => (
-                live.iter().filter_map(|r| self.respond_command(&r.id, json!({"decision": "decline"}))).collect(),
-                false,
-            ),
+            Some(_) => (live.iter().map(|r| decline(&r.id, json!({"decision": "decline"}))).collect(), false),
         }
     }
 
@@ -799,16 +1134,19 @@ impl Workspace {
 
     pub(super) fn set_runtime_mode(&mut self, mode: &str, cx: &mut Context<Self>) {
         match &self.target {
-            Some(Target::Thread { id: thread_id, .. }) => {
+            Some(Target::Thread { .. }) => {
+                // Changing a started thread needs `orchestration:operate` on its environment.
+                let Some((client, _, thread_id)) = self.pane_client(ChatPane::Main, cx) else { return };
                 let command = json!({"type": "thread.runtime-mode.set", "commandId": new_id(), "threadId": thread_id, "runtimeMode": mode});
-                self.dispatch(command, cx);
+                self.dispatch_in_order(client, vec![command], cx);
             }
             _ => self.runtime_mode_override = Some(mode.to_owned()),
         }
+        self.drafts_changed(cx);
         cx.notify();
     }
 
-    /// `ChatComposer.tsx` placeholder precedence.
+    /// `ChatComposer.tsx` placeholder precedence; an offered prompt suggestion replaces only the default.
     fn placeholder(&self, approval: Option<&RuntimeRequest>) -> &'static str {
         if let Some(approval) = approval {
             return if approval.supports_feedback() {
@@ -818,14 +1156,7 @@ impl Workspace {
             };
         }
         if let Some(draft) = &self.question {
-            return if draft.questions[draft.index].allows_custom() {
-                "Type your own answer, or leave this blank to use the selected option"
-            } else {
-                "Choose an option above"
-            };
-        }
-        if self.has_plan_follow_up() {
-            return "Add feedback to refine the plan, or leave this blank to implement it";
+            return question_placeholder(draft);
         }
         if self.target.is_none() {
             return "Choose a project above to start a thread";
@@ -866,17 +1197,34 @@ impl Workspace {
         let approvals = self.shown_approvals();
         let first_approval = approvals.first().map(|(request, _)| *request);
         let placeholder = self.placeholder(first_approval);
-        let outline = if t.dark { white(0.05) } else { black(0.08) };
+        let suggestion = self
+            .offered_prompt_suggestion(first_approval.is_some())
+            .map(|text| super::composer_suggestion::suggested_placeholder(text, &t, window));
+        let outline = t.composer_outline();
         let view = cx.weak_entity();
         let chip_view = view.clone();
         let hover_view = view.clone();
-        let pull_requests = Rc::new(pull_request_contexts(self.queue_edit_records()));
+        let pull_requests = Rc::new(pull_request_contexts(self.context.records.iter()));
         let chip_tooltip = self.render_chip_tooltip(&pull_requests, &t);
         let machines: Rc<[(String, Lucide)]> = (self.sessions().iter())
             .filter_map(|s| {
                 Some((s.id.as_ref()?.to_string(), super::host_picker::machine_icon(s.server_info.machine_kind())))
             })
             .collect();
+        let held: Rc<HashSet<String>> =
+            Rc::new(self.context.records.iter().filter_map(|r| r["contextId"].as_str().map(str::to_owned)).collect());
+        let models: Rc<HashMap<String, ModelMention>> = Rc::new(
+            (self.composer.read(cx).tokens().iter())
+                .filter_map(|span| {
+                    let Some(Chip::Model { instance_id, model, .. }) = Chip::from_id(span.token().id()) else {
+                        return None;
+                    };
+                    Some((span.token().id().to_string(), self.model_mention(&instance_id, &model)?))
+                })
+                .collect(),
+        );
+        // The web's composer host turns `inert` while a queued edit saves.
+        let saving = self.saving_queue_edit();
         let editor = Textarea::new(&self.composer)
             .appearance(false)
             .xsmall()
@@ -884,8 +1232,14 @@ impl Workspace {
             .text_size(px(t.fonts.prompt_size))
             .line_height(px(t.fonts.prompt_size * PROMPT_LEADING))
             .mx(px(-4.))
-            .disabled(self.target.is_none())
-            .token(move |token, _, _| render_chip(token, &pull_requests, &machines, &t))
+            // A choice-only question, or one whose answer is on its way, takes no typing.
+            .disabled(self.target.is_none() || !self.question_takes_text(ChatPane::Main))
+            .readonly(saving)
+            .token(move |token, _, _| {
+                let records =
+                    ChipRecords { pull_requests: &pull_requests, held: &held, machines: &machines, models: &models };
+                render_chip(token, &records, &t)
+            })
             // A pull request chip shows its details while hovered (`PullRequestContextDetails`).
             .on_token_hover(move |event, _, cx| {
                 let hovered = event.is_hovered().then(|| (event.token().id().to_string(), event.bounds()));
@@ -912,6 +1266,18 @@ impl Workspace {
                     let path = if trimmed.is_empty() || drive_root { path.clone() } else { trimmed.to_owned() };
                     let _ = chip_view.update(cx, |this, cx| this.open_file_surface(path, window, cx));
                 }
+                Some(Chip::Citation { .. }) => {
+                    let (id, range, bounds) = (event.token().id().to_string(), event.range(), event.bounds());
+                    let _ = chip_view.update(cx, |this, cx| {
+                        this.citation_chip_clicked(ChatPane::Main, id, range, bounds, event.click(), window, cx);
+                    });
+                }
+                // `ModelMentionChip`: a click or Enter opens its details popover.
+                Some(Chip::Model { instance_id, model, .. }) => {
+                    let at = model_chip_menu_at(event.bounds());
+                    let _ = chip_view
+                        .update(cx, |this, cx| this.open_model_menu(&instance_id, &model, None, at, window, cx));
+                }
                 _ => {}
             })
             .on_paste(move |item, window, cx| {
@@ -922,24 +1288,26 @@ impl Workspace {
         let subagent = subagent_bar.is_some();
         let surface = v_flex()
             .w_full()
+            .relative()
+            .children(super::theme_inspect::probe(&["surfaceRaised", "toolbarBorder", "input"], cx))
             .rounded(px(16.))
             .border_1()
             .border_color(outline)
             // The glass fill over the canvas, opaque so the banner tucked under it stays hidden.
-            .bg(t.background.blend(t.card.opacity(t.glass)))
+            .bg(t.background.blend(t.composer_glass().opacity(t.glass)))
             .shadow(if t.dark {
-                vec![BoxShadow::new(px(0.), px(1.), white(0.03)).inset()]
+                vec![BoxShadow::new(px(0.), px(1.), t.composer_highlight()).inset()]
             } else {
                 vec![BoxShadow::new(px(0.), px(1.), black(0.05)).blur_radius(px(2.))]
             })
             // A Files row dropped here joins the prompt as a mention (`isDragOverComposer`).
             .drag_over::<super::files::MentionDrag>(move |style, _, _, _| {
                 style
-                    .bg(t.background.blend(t.card.opacity(t.glass)).blend(t.accent.opacity(0.45)))
+                    .bg(t.background.blend(t.composer_glass().opacity(t.glass)).blend(t.accent.opacity(0.45)))
                     .border_color(t.primary.opacity(0.7))
             })
             .on_drop(cx.listener(|this, drag: &super::files::MentionDrag, window, cx| {
-                if this.target.is_some() {
+                if this.target.is_some() && !this.saving_queue_edit() {
                     this.add_file_to_chat(&drag.path, window, cx);
                     this.focus_composer(window, cx);
                 }
@@ -974,8 +1342,12 @@ impl Workspace {
                                             .font_family(t.fonts.composer)
                                             .text_size(px(t.fonts.prompt_size))
                                             .line_height(px(t.fonts.prompt_size * PROMPT_LEADING))
-                                            .text_color(t.muted_foreground)
-                                            .child(placeholder),
+                                            .text_color(t.placeholder)
+                                            .children(super::theme_inspect::probe(&["placeholder"], cx))
+                                            .map(|el| match suggestion {
+                                                Some(suggested) => el.child(suggested),
+                                                None => el.child(placeholder),
+                                            }),
                                     )
                                 }),
                             ),
@@ -984,7 +1356,8 @@ impl Workspace {
                         div().px(px(16.)).pb(px(8.)).text_xs().line_height(px(16.)).text_color(t.error).child(error)
                     }))
                     .child(self.render_footer(window, &t, cx))
-            });
+            })
+            .when(saving, |el| el.child(inert_cover("composer-inert")));
         // The draft hero centers the bare stack; under a thread the overlay keeps `sm:pt-2`.
         let top = if matches!(self.target, Some(Target::Draft { .. })) { 0. } else { 8. };
         div().w_full().flex_none().pt(px(top)).pl(px(lane.left)).pr(px(lane.right)).pb(px(20.)).child(
@@ -998,7 +1371,7 @@ impl Workspace {
                     approvals
                         .iter()
                         .filter(|(request, _)| !self.timeline_shows_approval(&request.id))
-                        .map(|(request, item)| self.render_approval(request, *item, &t, cx)),
+                        .map(|(request, item)| self.render_approval(ChatPane::Main, request, *item, &t, cx)),
                 )
                 .children(self.render_banner_dock(&t, cx))
                 .child(
@@ -1006,28 +1379,28 @@ impl Workspace {
                         .relative()
                         .children(self.render_command_menu(&t, cx))
                         .children(self.render_stash_menu(f32::from(window.viewport_size().height) * 0.4, &t, cx))
+                        .children(self.render_language_picker(&t, window, cx))
                         .child(surface),
                 )
-                .children(self.render_context_strip(&t, cx)),
+                .children(self.render_context_strip(&t, cx))
+                // Message and composer chips share one menu; both surfaces draw the composer.
+                .children(self.render_chat_menu()),
         )
     }
 
     /// `resolveComposerControlsOwnership` plus the width check: the permissions chip (off the
-    /// default only) and the Build/Plan toggle, labelled, icons only, or in the overflow menu.
+    /// default only), labelled, icon only, or in the overflow menu.
     fn render_mode_block(&self, window: &Window, t: &Tokens, cx: &mut Context<Self>) -> (Option<AnyElement>, ModeFit) {
         let mode = self.runtime_mode();
         // Drafts name their permissions in the row under the composer instead.
         let strip_owns_mode = matches!(self.target, Some(Target::Draft { .. }));
-        let (plan_ui, interaction) = self.interaction_mode();
-        let chip = (!strip_owns_mode && mode != self.default_runtime_mode())
-            .then(|| runtime_modes().into_iter().find(|(id, ..)| *id == mode).unwrap_or(runtime_modes()[3]));
-        if chip.is_none() && !plan_ui {
+        if strip_owns_mode || mode == self.default_runtime_mode() {
             return (None, ModeFit::Label);
         }
+        let (_, label, icon) = runtime_modes().into_iter().find(|(id, ..)| *id == mode).unwrap_or(runtime_modes()[3]);
         let text = FooterText {
             picker: self.model_trigger_text(),
-            chip: chip.map(|(_, label, _)| label),
-            toggle: plan_ui.then_some(if interaction == "plan" { "Plan" } else { "Build" }),
+            chip: Some(label),
             font: gpui_kit::Font { weight: FontWeight::MEDIUM, ..window.text_style().font() },
             size: gpui_kit::rems(0.875).to_pixels(window.rem_size()),
             scale: window.scale_factor(),
@@ -1048,21 +1421,15 @@ impl Workspace {
             .footer_host
             .map_or(ModeFit::Label, |host| resolve_mode_fit(widths, host, self.composer_ui.mode_fit));
         let element = match fit {
-            ModeFit::Hidden if plan_ui => self.render_mode_overflow_menu(interaction, t, cx),
-            // Without the Plan toggle the overflow menu holds Permissions alone.
+            // The overflow menu holds Permissions alone.
             ModeFit::Hidden => {
-                let (_, label, icon) = chip.unwrap_or(runtime_modes()[3]);
                 self.render_permissions_control("footer-permissions", icon, label, PermissionsForm::Overflow, t, cx)
             }
-            ModeFit::Label | ModeFit::Icon => h_flex()
-                .flex_none()
-                .gap(px(4.))
-                .children(chip.map(|(_, label, icon)| {
-                    let form = PermissionsForm::Chip { label: fit == ModeFit::Label };
-                    self.render_permissions_control("footer-permissions", icon, label, form, t, cx)
-                }))
-                .when(plan_ui, |el| el.child(self.render_interaction_toggle(interaction, fit == ModeFit::Label, t, cx)))
-                .into_any_element(),
+            ModeFit::Label | ModeFit::Icon => {
+                let form = PermissionsForm::Chip { label: fit == ModeFit::Label };
+                let chip = self.render_permissions_control("footer-permissions", icon, label, form, t, cx);
+                h_flex().flex_none().child(chip).into_any_element()
+            }
         };
         (Some(element), fit)
     }
@@ -1125,12 +1492,19 @@ impl Workspace {
                             None => el.child(self.render_model_picker(t, cx)).children(mode_block),
                         }
                     }))
-                    .children(self.render_context_meter(t, cx))
+                    // `@max-[480px]/composer-surface:hidden` on the toggle's label.
+                    .children(self.render_compact_toggle(self.chat_layout(window).0.width < 480., t, cx))
                     .child(self.render_primary_action(t, cx)),
             )
     }
 
+    /// `canOperateThread`: this connection may change the open target's environment.
+    pub(super) fn target_can_operate(&self) -> bool {
+        self.target.as_ref().is_some_and(|target| self.can_operate(target.environment()))
+    }
+
     fn render_primary_action(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+        let operate = self.target_can_operate();
         let running = self
             .thread
             .as_ref()
@@ -1141,29 +1515,16 @@ impl Workspace {
                 .hover(|s| s.bg(t.error))
                 .child(div().size(px(8.)).rounded(px(1.5)).bg(t.primary_foreground))
                 .tooltip(|window, cx| Tooltip::new("Interrupt").build(window, cx))
-                .on_click(cx.listener(|this, _, _, cx| this.stop(cx)))
+                .when(operate, |el| el.on_click(cx.listener(|this, _, _, cx| this.stop(cx))))
         };
         if let Some(draft) = &self.question {
-            let responding = self.responding.as_ref() == Some(&draft.request_id);
-            let can_respond =
-                self.pending_question_request().is_some_and(|(r, _)| r.capability() != Some("not_resumable"));
-            let last = draft.index + 1 == draft.questions.len();
-            let question = &draft.questions[draft.index];
-            let answered = requests::answer(question, draft.drafts.get(&question.id)).is_some();
-            let ready = if last {
-                draft.questions.iter().enumerate().all(|(i, q)| {
-                    (i == draft.index && answered) || requests::answer(q, draft.drafts.get(&q.id)).is_some()
-                })
-            } else {
-                answered
-            };
-            let label = match (responding, last) {
-                (true, _) => "Submitting...",
-                (false, false) => "Next question",
-                (false, true) if draft.index > 0 => "Submit answers",
-                (false, true) => "Submit answer",
-            };
-            let enabled = ready && can_respond && !responding;
+            let responding = self.pane_responding(ChatPane::Main, &draft.request_id);
+            let can_respond = self
+                .pending_question_request(ChatPane::Main)
+                .is_some_and(|(r, _)| r.capability() != Some("not_resumable"));
+            let attached = |id: &str| self.question_attached(ChatPane::Main, id);
+            let (label, enabled) = question_submit(draft, attached, responding, can_respond);
+            let enabled = enabled && operate;
             let submit = div().id("submit-answer");
             let submit = if enabled { action_control(submit, &self.composer_action_focus[PRIMARY], t) } else { submit };
             return h_flex()
@@ -1176,7 +1537,9 @@ impl Workspace {
                             .small()
                             .label("Previous")
                             .disabled(responding)
-                            .on_click(cx.listener(|this, _, window, cx| this.previous_question(window, cx))),
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.previous_question(ChatPane::Main, window, cx)),
+                            ),
                     )
                 })
                 .child(
@@ -1194,25 +1557,23 @@ impl Workspace {
                         .child(label)
                         .when(!enabled, |el| el.opacity(0.64))
                         .when(enabled, |el| {
-                            el.cursor_pointer()
-                                .hover(|s| s.bg(t.primary_hover))
-                                .on_click(cx.listener(|this, _, window, cx| this.advance_question(window, cx)))
+                            el.cursor_pointer().hover(|s| s.bg(t.primary_hover)).on_click(
+                                cx.listener(|this, _, window, cx| this.advance_question(ChatPane::Main, window, cx)),
+                            )
                         }),
                 )
                 .into_any_element();
         }
-        let sendable = !self.composer_empty || self.has_attachments();
+        let sendable = !self.composer_empty || self.has_attachments() || self.queue_edit_keeps_attachments();
         let can_resume = self.can_resume();
-        if self.has_plan_follow_up() && (!self.composer_empty || !can_resume) {
-            return self.render_plan_follow_up_action(t, cx);
-        }
         let editing = self.editing_queued();
         if running && !sendable && !editing {
             return stop().into_any_element();
         }
-        let busy = self.sending || self.saving_queue_edit();
+        let sending = self.target_sending();
+        let busy = sending || self.saving_queue_edit();
         if can_resume && !sendable {
-            let enabled = !self.sending && !self.target_rewinding() && self.client().is_some();
+            let enabled = operate && !sending && !self.target_rewinding() && self.client().is_some();
             // The web's send button in its resume state: the same stage art, a filled play.
             let stage = self.stage_art();
             let (fill, icon) = if stage.is_some() {
@@ -1220,7 +1581,7 @@ impl Workspace {
             } else {
                 (t.primary, t.primary_foreground)
             };
-            let content = if self.sending {
+            let content = if sending {
                 Spinner::new().small().color(icon).into_any_element()
             } else {
                 Icon::empty().path("icons/app/play-filled.svg").with_size(px(16.)).text_color(icon).into_any_element()
@@ -1239,8 +1600,14 @@ impl Workspace {
                 .tooltip(|window, cx| Tooltip::new("Resume thread").build(window, cx))
                 .into_any_element();
         }
-        let disabled_reason: Option<SharedString> = if self.attachments_busy() {
+        let disabled_reason: Option<SharedString> = if !operate {
+            Some(super::side_chat::NOT_OPERATE.into())
+        } else if self.model_fanout().is_some_and(<[_]>::is_empty) {
+            Some("Select at least one model.".into())
+        } else if self.attachments_busy() {
             Some("Attachment(s) still uploading".into())
+        } else if let Some(reason) = self.clone_send_block() {
+            Some(reason.into())
         } else {
             // An answer to an open question still goes through.
             self.runtime_mode_ceiling().filter(|_| self.question.is_none()).map(|(denial, _)| denial.into())
@@ -1275,9 +1642,13 @@ impl Workspace {
         } else {
             svg().path("icons/app/send.svg").size(px(14.)).text_color(icon).into_any_element()
         };
+        let compact_tokens = self.compact_send_tokens().map(super::details::format_context_tokens);
         let tooltip: Option<SharedString> = match (disabled_reason, running && can_send) {
             (Some(reason), _) => Some(reason),
             (None, _) if editing => Some(if busy { "Updating queued message" } else { "Update queued message" }.into()),
+            (None, _) if compact_tokens.is_some() && !busy => {
+                compact_tokens.map(|tokens| format!("Summarize {tokens} tokens of history, then send").into())
+            }
             (None, true) if !can_steer => Some("Queue message".into()),
             (None, true) => {
                 let shortcut = self.client_settings.values.get("sendShortcut").as_str().unwrap_or("enter");
@@ -1298,7 +1669,8 @@ impl Workspace {
             }
             _ => None,
         };
-        let send = round_button("send", fill, t.primary, t);
+        let send = round_button("send", fill, t.primary, t)
+            .children(super::theme_inspect::probe(&["messageAction", "messageActionForeground"], cx));
         let send = if can_send { action_control(send, &self.composer_action_focus[PRIMARY], t) } else { send };
         send.when_some(stage, |el, art| {
             el.relative().when(!can_send, |el| el.opacity(0.64)).child(super::sidebar::stage_button_art(art, t.dark))
@@ -1327,6 +1699,7 @@ impl Workspace {
 
     pub(super) fn render_approval(
         &self,
+        pane: ChatPane,
         request: &RuntimeRequest,
         item: Option<&TurnItem>,
         t: &Tokens,
@@ -1370,27 +1743,27 @@ impl Workspace {
                         .collect()
                 },
             );
-        let enabled = request.is_live() && self.responding.as_ref() != Some(&request.id);
+        let enabled = request.is_live() && !self.pane_responding(pane, &request.id) && self.pane_can_operate(pane);
         let inline =
             |decision: &str, label: &str, warning: Option<SharedString>, tone: Hsla, cx: &mut Context<Self>| {
                 let request_id = request.id.clone();
                 let decision = decision.to_owned();
-                h_flex()
-                    .id(ElementId::Name(format!("approval-{}-{decision}", request.id).into()))
-                    .gap(px(4.))
+                // A button, so Tab reaches it and Enter or Space answers (`InlineButton`).
+                Button::new(ElementId::Name(format!("approval-{}-{decision}", request.id).into()))
+                    .text()
+                    .xsmall()
+                    .h(px(16.))
+                    .text_xs()
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(tone)
-                    .when(warning.is_some(), |el| el.child(Icon::new(Lucide::TriangleAlert).with_size(px(12.))))
-                    .child(label.to_owned())
-                    .when_some(warning, |el, warning| {
-                        el.tooltip(move |window, cx| Tooltip::new(warning.clone()).build(window, cx))
-                    })
+                    .when(warning.is_some(), |el| el.icon(Icon::new(Lucide::TriangleAlert).with_size(px(12.))))
+                    .label(label.to_owned())
+                    .when_some(warning, Button::tooltip)
+                    .disabled(!enabled)
                     .when(!enabled, |el| el.opacity(0.64))
-                    .when(enabled, |el| {
-                        el.cursor_pointer().hover(|s| s.underline().text_color(t.foreground)).on_click(cx.listener(
-                            move |this, _, _, cx| this.respond(request_id.clone(), json!({"decision": decision}), cx),
-                        ))
-                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.respond(pane, request_id.clone(), json!({"decision": decision}), cx);
+                    }))
             };
         let primary: Vec<_> = options.iter().filter(|(d, ..)| d == "decline" || d == "accept").collect();
         let more: Rc<Vec<_>> =
@@ -1432,7 +1805,7 @@ impl Workspace {
                                 let item =
                                     if warning.is_some() { item.icon(Icon::new(Lucide::TriangleAlert)) } else { item };
                                 menu = menu.item(item.on_click(window.listener_for(&view, move |this, _, _, cx| {
-                                    this.respond(request_id.clone(), json!({"decision": decision}), cx);
+                                    this.respond(pane, request_id.clone(), json!({"decision": decision}), cx);
                                 })));
                             }
                             menu
@@ -1503,16 +1876,19 @@ impl Workspace {
     /// `ComposerBanner.Dock`: the banners tucked under the composer, with the stash tab
     /// on their right.
     fn render_banner_dock(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let banners: Vec<AnyElement> = (self.render_environment_banner(t, cx).into_iter())
-            .chain(self.render_fallback_banner(t, cx))
-            .chain(self.render_recovery_banner(t, cx))
-            .chain(self.render_extension_status_banner(t))
-            .chain(self.render_fresh_session_banner(t, cx))
-            .chain(self.render_branch_banner(t, cx))
-            .chain(self.render_runtime_mode_ceiling_banner(t, cx))
-            .chain(self.render_question(t, cx).or_else(|| self.render_plan_ready(t)))
-            .chain(self.render_child_approvals(t, cx))
-            .collect();
+        // Each card after the first joins the one above it.
+        let mut banners: Vec<AnyElement> = self.render_environment_banner(t, cx).into_iter().collect();
+        banners.extend(self.render_fallback_banner(!banners.is_empty(), t, cx));
+        banners.extend(self.render_recovery_banner(!banners.is_empty(), t, cx));
+        banners.extend(self.render_extension_status_banner(!banners.is_empty(), t));
+        banners.extend(self.render_usage_limits_banner(!banners.is_empty(), t, cx));
+        banners.extend(self.render_clone_banner(!banners.is_empty(), t, cx));
+        banners.extend(self.render_fresh_session_banner(!banners.is_empty(), t, cx));
+        banners.extend(self.render_branch_banner(!banners.is_empty(), t, cx));
+        banners.extend(self.render_runtime_mode_ceiling_banner(!banners.is_empty(), t, cx));
+        let joined = !banners.is_empty();
+        banners.extend(self.render_question(ChatPane::Main, joined, t, cx));
+        banners.extend(self.render_child_approvals(t, cx));
         let badge = self.render_stash_badge(t, cx);
         if banners.is_empty() && badge.is_none() {
             return None;
@@ -1529,9 +1905,9 @@ impl Workspace {
     }
 
     /// `modelFallbackBannerItem`: "Using X", why, and a way back to the default.
-    fn render_fallback_banner(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let Some(Target::Draft { project_id, .. }) = &self.target else { return None };
-        let project = self.shell.projects.iter().find(|p| &p.id == project_id);
+    fn render_fallback_banner(&self, joined: bool, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let Some(Target::Draft { env, project_id, .. }) = &self.target else { return None };
+        let project = self.shell.projects.iter().find(|p| &p.environment_id == env && &p.id == project_id);
         let default = self.server_info().new_thread_model(project)?;
         let fallback = self.draft_usage_fallback(&default)?;
         let window = format!("{}:{}", fallback.exhausted_instance, fallback.resets_at.as_deref().unwrap_or_default());
@@ -1555,7 +1931,7 @@ impl Workspace {
             .and_then(|at| crate::timestamp::upcoming_local(at, hour12))
             .map(|at| format!(" · resets {at}"))
             .unwrap_or_default();
-        let outline = if t.dark { white(0.05) } else { black(0.08) };
+        let outline = t.composer_outline();
         let use_default = format!("Use {}", model_name(&default));
         Some(
             div()
@@ -1567,10 +1943,10 @@ impl Workspace {
                         // 5px padding plus the 17px the composer covers.
                         .pb(px(22.))
                         .gap(px(4.))
-                        .rounded_t(px(16.))
                         .border_1()
+                        .map(|el| if joined { el.border_t_0() } else { el.rounded_t(px(16.)) })
                         .border_color(outline)
-                        .bg(t.card.opacity(t.glass))
+                        .bg(t.composer_glass().opacity(t.glass))
                         .text_xs()
                         .child(
                             div()
@@ -1610,10 +1986,12 @@ impl Workspace {
                                 .gap(px(2.))
                                 .child(
                                     Button::new("fallback-use-default").ghost().xsmall().label(use_default).on_click(
-                                        cx.listener(move |this, _, _, cx| this.pick_model(default.clone(), cx)),
+                                        cx.listener(move |this, _, window, cx| {
+                                            this.pick_model(default.clone(), window, cx);
+                                        }),
                                     ),
                                 )
-                                .child(
+                                .child(super::banners::corner_action(
                                     Button::new("fallback-dismiss")
                                         .ghost()
                                         .xsmall()
@@ -1623,23 +2001,30 @@ impl Workspace {
                                             this.composer_ui.dismissed_fallback = Some(window.clone());
                                             cx.notify();
                                         })),
-                                ),
+                                    joined,
+                                )),
                         ),
                 )
                 .into_any_element(),
         )
     }
 
-    fn render_question(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let draft = self.question.as_ref()?;
-        let (request, item) = self.pending_question_request()?;
+    pub(super) fn render_question(
+        &self,
+        pane: ChatPane,
+        joined: bool,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let draft = self.question(pane)?;
+        let (request, item) = self.pending_question_request(pane)?;
         let question = &draft.questions[draft.index];
-        let disabled = request.capability() == Some("not_resumable") || self.responding.as_ref() == Some(&request.id);
+        let disabled = !self.question_answerable(pane);
         let dismissible = item.str("responseMode") == Some("message") || request.capability() == Some("message");
         let collapsed = draft.collapsed;
         let count = draft.questions.len();
-        let header = h_flex()
-            .id("question-toggle")
+        // The toggle, Dismiss and each option are buttons on the web, so Tab reaches them.
+        let header = super::chat::focusable(h_flex().id("question-toggle"), t)
             .w_full()
             .min_h(px(24.))
             .px(px(16.))
@@ -1648,8 +2033,8 @@ impl Workspace {
             .rounded(px(12.))
             .cursor_pointer()
             .hover(|s| s.bg(t.foreground.opacity(0.05)))
-            .on_click(cx.listener(|this, _, _, cx| {
-                if let Some(draft) = &mut this.question {
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if let Some(draft) = this.question_mut(pane) {
                     draft.collapsed = !draft.collapsed;
                     cx.notify();
                 }
@@ -1699,19 +2084,20 @@ impl Workspace {
                     ))
                     .when(dismissible, |el| {
                         let request_id = request.id.clone();
+                        // Off while an answer or dismissal is on its way, as the web's `isResponding`.
+                        let responding = self.pane_responding(pane, &request.id);
                         el.child(
-                            icon_box(t)
-                                .id("question-dismiss")
-                                .cursor_pointer()
-                                .hover(|s| s.bg(t.accent))
+                            super::chat::focusable(icon_box(t).id("question-dismiss"), t)
                                 .child(Icon::new(Lucide::X).with_size(px(14.)))
                                 .tooltip(|window, cx| {
                                     Tooltip::new("Dismiss question without answering").build(window, cx)
                                 })
+                                .when(responding, |el| el.opacity(0.64))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
-                                    this.dismiss_question(request_id.clone(), cx);
-                                })),
+                                    this.dismiss_question(pane, request_id.clone(), cx);
+                                }))
+                                .when(!responding, |el| el.cursor_pointer().hover(|s| s.bg(t.accent))),
                         )
                     }),
             );
@@ -1737,37 +2123,57 @@ impl Workspace {
                         let value = option.value().to_owned();
                         let selected = requests::is_selected(question, draft_answer, &value);
                         render_option(question, option, index, selected, disabled, t).when(!disabled, |el| {
-                            el.on_click(
-                                cx.listener(move |this, _, window, cx| this.pick_option(value.clone(), window, cx)),
-                            )
+                            super::chat::focusable(el, t).on_click(cx.listener(move |this, _, window, cx| {
+                                this.pick_option(pane, value.clone(), window, cx);
+                            }))
                         })
                     },
                 )))
         });
-        Some(top_drawer(v_flex().child(header).children(body), t))
-    }
-
-    /// `ComposerPlanFollowUpBanner`: the plan the next send refines or implements.
-    fn render_plan_ready(&self, t: &Tokens) -> Option<AnyElement> {
-        let (_, markdown) = self.active_plan_follow_up()?;
-        let title = crate::proposed_plan::title(markdown).map(str::to_owned);
-        let row = h_flex()
-            .min_h(px(24.))
-            .gap(px(4.))
-            .child(div().w(px(24.)).flex_none())
-            .child(div().flex_none().font_weight(FontWeight::MEDIUM).text_color(t.muted_foreground).child("Plan ready"))
-            .children(
-                title.map(|title| {
-                    div().flex_1().min_w_0().truncate().text_color(t.foreground.opacity(0.85)).child(title)
-                }),
-            );
-        Some(top_drawer(row, t))
+        Some(top_drawer(v_flex().child(header).children(body), joined, t))
     }
 }
 
+/// The editor's placeholder while a question card holds it.
+pub(super) fn question_placeholder(draft: &QuestionDraft) -> &'static str {
+    if draft.questions[draft.index].allows_custom() {
+        "Type your own answer, or leave this blank to use the selected option"
+    } else {
+        "Choose an option above"
+    }
+}
+
+/// The question card's submit (`ComposerPrimaryActions`): its label, and whether it can go. The
+/// last question submits once every question has an answer; an earlier one moves on once it has.
+pub(super) fn question_submit(
+    draft: &QuestionDraft,
+    attached: impl Fn(&str) -> Attached,
+    responding: bool,
+    can_respond: bool,
+) -> (&'static str, bool) {
+    let last = draft.index + 1 == draft.questions.len();
+    let answered = |index: usize| {
+        let question = &draft.questions[index];
+        requests::answer(question, draft.drafts.get(&question.id), attached(&question.id)).is_some()
+    };
+    let ready = if last { (0..draft.questions.len()).all(answered) } else { answered(draft.index) };
+    let label = match (responding, last) {
+        (true, _) => "Submitting...",
+        (false, false) => "Next question",
+        (false, true) if draft.index > 0 => "Submit answers",
+        (false, true) => "Submit answer",
+    };
+    (label, ready && can_respond && !responding)
+}
+
 /// `ComposerBanner.Root variant="info"` in the top drawer, its bottom tucked under the composer.
-fn top_drawer(content: impl IntoElement, t: &Tokens) -> AnyElement {
-    let outline = if t.dark { white(0.05) } else { black(0.08) };
+/// `inert` over a composer card: it takes the pointer, so nothing under it is clicked or selected.
+pub(super) fn inert_cover(id: &'static str) -> gpui_kit::Stateful<gpui_kit::Div> {
+    div().id(id).absolute().inset_0().block_mouse_except_scroll()
+}
+
+pub(super) fn top_drawer(content: impl IntoElement, joined: bool, t: &Tokens) -> AnyElement {
+    let outline = t.composer_outline();
     div()
         .mb(px(-17.))
         .child(
@@ -1776,10 +2182,10 @@ fn top_drawer(content: impl IntoElement, t: &Tokens) -> AnyElement {
                 .pt(px(4.))
                 // 4px padding plus the 17px the composer covers.
                 .pb(px(21.))
-                .rounded_t(px(16.))
                 .border_1()
+                .map(|el| if joined { el.border_t_0() } else { el.rounded_t(px(16.)) })
                 .border_color(outline)
-                .bg(t.card.opacity(t.glass))
+                .bg(t.composer_glass().opacity(t.glass))
                 .text_xs()
                 .line_height(px(16.))
                 .shadow(if t.dark {
@@ -1876,57 +2282,107 @@ fn render_option(
         })
 }
 
-/// A chip in the editor (`ContextChip`): icon and label in the kind's accent ink.
-/// The web's `strong`, `em`, `s` and inline `code` (`index.css` `.composer-tiptap`), and its
-/// shown delimiters (`.composer-rich-marker`). Highlights can't change the font family or size
-/// or hide text, so code keeps the prompt font and headings their size, and markers stay visible.
-fn mark_style(style: u8, t: &Tokens) -> HighlightStyle {
-    use crate::composer_markdown::{BOLD, CODE, HEADING, ITALIC, MARKER, STRIKE};
-    if style & MARKER != 0 {
-        return HighlightStyle {
-            color: Some(t.muted_foreground),
-            fade_out: Some(0.25),
-            font_weight: Some(FontWeight::NORMAL),
-            ..Default::default()
-        };
-    }
-    let weight =
-        if style & BOLD != 0 { Some(FontWeight::BOLD) } else { (style & HEADING != 0).then_some(FontWeight::SEMIBOLD) };
-    HighlightStyle {
-        font_weight: weight,
-        font_style: (style & ITALIC != 0).then_some(FontStyle::Italic),
-        strikethrough: (style & STRIKE != 0).then_some(StrikethroughStyle { thickness: px(1.), color: None }),
-        background_color: (style & CODE != 0).then(|| t.muted_foreground.opacity(0.12)),
-        ..Default::default()
+/// What a chip shows of the record behind it.
+struct ChipRecords<'a> {
+    pull_requests: &'a HashMap<String, PullRequestContext>,
+    /// The context ids the draft holds records for.
+    held: &'a HashSet<String>,
+    machines: &'a [(String, Lucide)],
+    /// What each `model:` chip names.
+    models: &'a HashMap<String, ModelMention>,
+}
+
+/// What a `model:` chip shows of the model it names (`ModelMentionPresentation`).
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct ModelMention {
+    pub label: String,
+    /// Its sub-provider, else its provider.
+    pub provider_label: String,
+    pub driver: String,
+}
+
+/// `--context-chip-model`: `oklch(0.62 0.13 105)`.
+const MODEL_CHIP_ACCENT: crate::theme_color::Oklch = crate::theme_color::Oklch { l: 0.62, c: 0.13, h: 105. };
+
+/// `logoAccent`: the model chip's lightness with the hue and chroma of the provider logo's own
+/// color, for logos that keep one color in both themes; else the model chip's own accent.
+#[expect(clippy::cast_possible_truncation, reason = "colour channels; f32 is plenty")]
+pub(super) fn model_chip_accent(driver: &str) -> Hsla {
+    use crate::theme_color::{Oklch, Rgb, oklch_to_rgb, rgb_to_oklch};
+    // `BUNDLED_LOGO_COLOR_BY_PROVIDER` also colors Antigravity, whose logo isn't bundled here.
+    let logo = match driver {
+        "antigravity" => Some(Hsla::from(rgb(0x5b87bf))),
+        _ => crate::assets::provider_icon(driver).and_then(|(_, tint)| tint),
+    };
+    let color = logo.map_or(MODEL_CHIP_ACCENT, |logo| {
+        let logo = logo.to_rgb();
+        let [r, g, b] = [logo.r, logo.g, logo.b].map(|channel| f64::from(channel) * 255.);
+        Oklch { l: MODEL_CHIP_ACCENT.l, ..rgb_to_oklch(Rgb { r, g, b }) }
+    });
+    let rgb = oklch_to_rgb(color, false);
+    gpui_kit::Rgba { r: (rgb.r / 255.) as f32, g: (rgb.g / 255.) as f32, b: (rgb.b / 255.) as f32, a: 1. }.into()
+}
+
+/// The provider logo a model chip leads with, in the logo's own color or else `accent`.
+pub(super) fn model_chip_icon(driver: &str, accent: Hsla) -> Icon {
+    match crate::assets::provider_icon(driver) {
+        Some((asset, tint)) => Icon::empty().path(asset).text_color(tint.unwrap_or(accent)),
+        None => Icon::new(Lucide::Bot).text_color(accent),
     }
 }
 
-fn render_chip(
-    token: &InlineTokenContext,
-    pull_requests: &HashMap<String, PullRequestContext>,
-    machines: &[(String, Lucide)],
-    t: &Tokens,
-) -> AnyElement {
+/// `ModelMentionChip`'s details: the model, its provider, and the reference the prompt holds.
+pub(super) fn model_mention_details(mention: &ModelMention, source: &str, t: &Tokens) -> gpui_kit::Div {
+    v_flex()
+        .gap(px(4.))
+        .max_w(px(320.))
+        .text_sm()
+        .child(div().font_weight(FontWeight::MEDIUM).text_color(t.foreground).child(mention.label.clone()))
+        .child(div().text_color(t.muted_foreground).child(mention.provider_label.clone()))
+        .child(div().font_family(t.fonts.mono).text_xs().text_color(t.muted_foreground).child(source.to_owned()))
+}
+
+/// A chip in the editor (`ContextChip`): icon and label in the kind's accent ink.
+fn render_chip(token: &InlineTokenContext, records: &ChipRecords, t: &Tokens) -> AnyElement {
     let id = token.token().id();
     let chip = Chip::from_id(id);
+    if let Some(Chip::Citation { .. }) = chip {
+        let label = token.token().label().clone();
+        return super::citations::citation_chip(label, t.fonts.prompt_size, token.is_selected(), t)
+            .h(token.line_height())
+            .max_w(token.available_width())
+            .into_any_element();
+    }
+    // A record-backed chip whose record is gone sends nothing (`UnresolvedContextChip`);
+    // attachments and machines carry their own.
+    let unresolved = matches!(&chip, Some(Chip::Context { kind, id, .. })
+        if !matches!(kind.as_str(), "image" | "file" | "environment") && !records.held.contains(id));
     // `WorkspaceEntryTooltip`: a mention names its workspace path.
-    let path = match &chip {
+    let tooltip = match &chip {
+        _ if unresolved => Some(SharedString::from(UNRESOLVED_CONTEXT)),
         Some(Chip::File { path }) => Some(SharedString::from(path.clone())),
         _ => None,
     };
+    if matches!(chip, Some(Chip::Model { .. })) {
+        return render_model_chip(token, records.models.get(id.as_ref()), t);
+    }
     let (accent, icon) = match chip {
+        _ if unresolved => (t.foreground.into(), Lucide::CircleDashed),
         Some(Chip::Skill { .. }) => (rgb(0xb261be), Lucide::Box),
         Some(Chip::Context { kind, id, .. })
-            if let Some(pr) = pull_requests.get(&id).filter(|_| kind == REVIEW_COMMENT) =>
+            if let Some(pr) = records.pull_requests.get(&id).filter(|_| kind == REVIEW_COMMENT) =>
         {
             (rgb(0x0090cd), pr.state().0)
         }
+        Some(Chip::Context { kind, .. }) if kind == REVIEW_COMMENT => (rgb(0x0090cd), Lucide::MessageCircle),
+        Some(Chip::Context { kind, .. }) if kind == "preview-annotation" => (rgb(0x0090cd), Lucide::MousePointerClick),
         Some(Chip::Context { kind, .. }) if kind == "image" => (rgb(0x0090cd), Lucide::Image),
         Some(Chip::Context { kind, .. }) if kind == "terminal" => (rgb(0x0090cd), Lucide::Terminal),
         // `EnvironmentContextChip`: the machine's own icon.
         Some(Chip::Context { kind, id, .. }) if kind == "environment" => {
             let environment = id.strip_prefix("environment_").unwrap_or_default();
-            let icon = machines.iter().find(|(id, _)| id == environment).map_or(Lucide::Server, |(_, icon)| *icon);
+            let icon =
+                records.machines.iter().find(|(id, _)| id == environment).map_or(Lucide::Server, |(_, icon)| *icon);
             (rgb(0x0090cd), icon)
         }
         Some(Chip::Context { .. }) => (rgb(0x0090cd), Lucide::File),
@@ -1943,7 +2399,41 @@ fn render_chip(
         .child(Icon::new(icon).with_size(px(14.)).flex_none())
         .child(div().min_w_0().truncate().child(token.token().label().clone()))
         .id(ElementId::Name(format!("chip-{}-{id}", token.range().start).into()))
-        .when_some(path, |el, path| el.tooltip(move |window, cx| Tooltip::new(path.clone()).build(window, cx)))
+        .when_some(tooltip, |el, tip| el.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx)))
+        .into_any_element()
+}
+
+const UNRESOLVED_CONTEXT: &str = "This context is no longer available. Remove it or attach it again.";
+
+/// The chip a selection covers exactly, as a click or Shift+Arrow selects one.
+fn selected_chip(spans: &[gpui_kit::base::input::InlineTokenSpan], selection: &std::ops::Range<usize>) -> Option<Chip> {
+    let span = spans.iter().find(|span| span.range() == *selection)?;
+    Chip::from_id(span.token().id())
+}
+
+/// Where a composer model chip's popover opens: under the chip.
+fn model_chip_menu_at(bounds: gpui_kit::Bounds<gpui_kit::Pixels>) -> gpui_kit::Point<gpui_kit::Pixels> {
+    gpui_kit::point(bounds.left(), bounds.bottom() + px(4.))
+}
+
+/// A `model:` chip: the provider's logo and the model's name, its details while hovered. A model
+/// the environment no longer offers keeps the name it was picked with.
+fn render_model_chip(token: &InlineTokenContext, mention: Option<&ModelMention>, t: &Tokens) -> AnyElement {
+    let id = token.token().id();
+    let accent = mention.map_or_else(|| model_chip_accent(""), |m| model_chip_accent(&m.driver));
+    let icon = model_chip_icon(mention.map_or("", |m| m.driver.as_str()), accent);
+    h_flex()
+        .h(token.line_height())
+        .max_w(token.available_width())
+        .gap(px(3.))
+        .rounded(px(4.))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(accent)
+        .when(token.is_selected(), |el| el.bg(t.primary.opacity(0.25)))
+        .child(icon.with_size(px(14.)).flex_none())
+        .child(div().min_w_0().truncate().child(token.token().label().clone()))
+        .id(ElementId::Name(format!("chip-{}-{id}", token.range().start).into()))
+        .cursor_pointer()
         .into_any_element()
 }
 
@@ -1953,10 +2443,10 @@ const REVIEW_COMMENT: &str = "review-comment";
 /// `PullRequestContextMetadata`: the change request a review-comment chip names.
 #[derive(Clone, Debug, serde::Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-struct PullRequestContext {
-    number: u64,
+pub(super) struct PullRequestContext {
+    pub(super) number: u64,
     title: String,
-    url: String,
+    pub(super) url: String,
     head_branch: String,
     base_branch: String,
     state: String,
@@ -1964,14 +2454,8 @@ struct PullRequestContext {
 }
 
 impl PullRequestContext {
-    /// `resolvePullRequestState`: the glyph, the label, and the tone as light, dark and dark alpha.
-    fn state(&self) -> (Lucide, &'static str, u32, u32, f32) {
-        match self.state.as_str() {
-            "merged" => (Lucide::GitMerge, "Merged", 0x7f22fe, 0xc4b4ff, 0.9),
-            "closed" => (Lucide::GitPullRequestClosed, "Closed", 0xe7000b, 0xffa2a2, 0.9),
-            _ if self.is_draft => (Lucide::GitPullRequestDraft, "Draft", 0x71717b, 0x9f9fa9, 0.8),
-            _ => (Lucide::GitPullRequestArrow, "Open", 0x009966, 0x5ee9b5, 0.9),
-        }
+    pub(super) fn state(&self) -> (Lucide, &'static str, u32, u32, f32) {
+        pull_request_state(&self.state, self.is_draft)
     }
 
     /// `capitalizeTerm(singular)` for the host the URL names (`findByChangeRequestUrl`).
@@ -1987,10 +2471,56 @@ impl PullRequestContext {
     }
 }
 
+/// `resolvePullRequestState`: the glyph, the label, and the tone as light, dark and dark alpha.
+pub(super) fn pull_request_state(state: &str, is_draft: bool) -> (Lucide, &'static str, u32, u32, f32) {
+    match state {
+        "merged" => (Lucide::GitMerge, "Merged", 0x7f22fe, 0xc4b4ff, 0.9),
+        "closed" => (Lucide::GitPullRequestClosed, "Closed", 0xe7000b, 0xffa2a2, 0.9),
+        _ if is_draft => (Lucide::GitPullRequestDraft, "Draft", 0x71717b, 0x9f9fa9, 0.8),
+        _ => (Lucide::GitPullRequestArrow, "Open", 0x009966, 0x5ee9b5, 0.9),
+    }
+}
+
+/// [`pull_request_state`]'s tone for the theme.
+pub(super) fn pull_request_tone(light: u32, dark: u32, alpha: f32, t: &Tokens) -> Hsla {
+    if t.dark { Hsla::from(rgb(dark)).opacity(alpha) } else { rgb(light).into() }
+}
+
+/// `PullRequestContextDetails`: the change request's number, state, title and branches.
+pub(super) fn pull_request_details(pr: &PullRequestContext, t: &Tokens) -> gpui_kit::Div {
+    let (glyph, label, light, dark, alpha) = pr.state();
+    let tone = pull_request_tone(light, dark, alpha, t);
+    let branch = |name: &str| div().min_w_0().truncate().font_family(t.fonts.mono).child(name.to_owned());
+    v_flex()
+        .max_w(px(320.))
+        .gap(px(4.))
+        .py(px(2.))
+        .overflow_hidden()
+        .child(
+            h_flex()
+                .gap(px(6.))
+                .font_weight(FontWeight::MEDIUM)
+                .child(Icon::new(glyph).with_size(px(14.)).flex_none().text_color(tone))
+                .child(div().text_color(t.foreground).child(format!("{} #{}", pr.noun(), pr.number)))
+                .child(div().text_color(tone).child(label)),
+        )
+        .child(div().text_color(t.foreground).child(pr.title.clone()))
+        .child(
+            h_flex()
+                .min_w_0()
+                .gap(px(4.))
+                .text_size(px(10.))
+                .text_color(t.muted_foreground)
+                .child(branch(&pr.head_branch))
+                .child(Icon::new(Lucide::ArrowRight).with_size(px(12.)).flex_none())
+                .child(branch(&pr.base_branch)),
+        )
+}
+
 /// The review-comment records' change requests, by the context id their chips carry.
-fn pull_request_contexts(records: &[Value]) -> HashMap<String, PullRequestContext> {
+fn pull_request_contexts<'a>(records: impl IntoIterator<Item = &'a Value>) -> HashMap<String, PullRequestContext> {
     records
-        .iter()
+        .into_iter()
         .filter(|record| record["kind"].as_str() == Some(REVIEW_COMMENT))
         .filter_map(|record| {
             let id = record["contextId"].as_str()?.to_owned();
@@ -2009,33 +2539,7 @@ impl Workspace {
         let (chip, bounds) = self.composer_ui.chip_hover.as_ref()?;
         let Some(Chip::Context { kind, id, .. }) = Chip::from_id(chip) else { return None };
         let pr = pull_requests.get(&id).filter(|_| kind == REVIEW_COMMENT)?;
-        let (glyph, label, light, dark, alpha) = pr.state();
-        let tone: Hsla = if t.dark { Hsla::from(rgb(dark)).opacity(alpha) } else { rgb(light).into() };
-        let branch = |name: &str| div().min_w_0().truncate().font_family(t.fonts.mono).child(name.to_owned());
-        let details = v_flex()
-            .max_w(px(320.))
-            .gap(px(4.))
-            .py(px(2.))
-            .overflow_hidden()
-            .child(
-                h_flex()
-                    .gap(px(6.))
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(Icon::new(glyph).with_size(px(14.)).flex_none().text_color(tone))
-                    .child(div().text_color(t.foreground).child(format!("{} #{}", pr.noun(), pr.number)))
-                    .child(div().text_color(tone).child(label)),
-            )
-            .child(div().text_color(t.foreground).child(pr.title.clone()))
-            .child(
-                h_flex()
-                    .min_w_0()
-                    .gap(px(4.))
-                    .text_size(px(10.))
-                    .text_color(t.muted_foreground)
-                    .child(branch(&pr.head_branch))
-                    .child(Icon::new(Lucide::ArrowRight).with_size(px(12.)).flex_none())
-                    .child(branch(&pr.base_branch)),
-            );
+        let details = pull_request_details(pr, t);
         // `TooltipPopup side="top"`, placed in window coordinates over the chip.
         let at = gpui_kit::point(bounds.left(), bounds.top() - px(4.));
         Some(
@@ -2071,7 +2575,7 @@ pub(super) fn control_button(id: &'static str, t: &Tokens) -> Button {
 const ATTACH: usize = 0;
 const STOP: usize = 1;
 pub(super) const PRIMARY: usize = 2;
-pub(super) const METER: usize = 3;
+pub(super) const COMPACT: usize = 3;
 
 /// A `<button>`: a tab stop that Enter and Space press, ringed while keyboard-focused, which a
 /// click leaves the composer focused past (`preventPointerFocus`).
@@ -2121,9 +2625,133 @@ fn black(alpha: f32) -> Hsla {
     gpui_kit::hsla(0., 0., 0., alpha)
 }
 
+/// What a key pressed with only the workspace focused puts in the composer
+/// (`shouldTypeToFocusComposer`, `usePasteToFocusComposer`).
+#[derive(Debug, PartialEq, Eq)]
+enum FocusRedirect {
+    /// A printable character, typed at the composer's end.
+    Type(String),
+    /// Ctrl+V (⌘V) pastes the clipboard's text there; with Shift, as text even when long (`isPasteAsTextShortcut`).
+    Paste { as_text: bool },
+}
+
+/// Why keys stay off the composer.
+#[derive(Clone, Copy, Default)]
+struct RedirectGate {
+    /// Only the workspace's own focus: a focused text field, side chat, terminal or preview keeps its keys
+    /// (`isInSideChatPane`, the editable and interactive selectors).
+    resting: bool,
+    /// A thread is open and no palette, dialog, page or settings covers it (the floating-layer selector).
+    open: bool,
+    /// The composer host is `inert` while a queued edit saves.
+    inert: bool,
+    /// The open question takes no typed answer, so its options keep their digits (`insertComposerText`).
+    answer_locked: bool,
+}
+
+fn focus_redirect(keystroke: &Keystroke, gate: RedirectGate) -> Option<FocusRedirect> {
+    if !gate.resting || !gate.open || gate.inert || gate.answer_locked {
+        return None;
+    }
+    let m = keystroke.modifiers;
+    if keystroke.key == "v" && (m.control || m.platform) && !m.alt {
+        return Some(FocusRedirect::Paste { as_text: m.shift });
+    }
+    if m.control || m.alt || m.platform || m.function {
+        return None;
+    }
+    let typed = keystroke.key_char.as_ref().filter(|c| c.chars().count() == 1 && !c.chars().any(char::is_control));
+    typed.map(|c| FocusRedirect::Type(c.clone()))
+}
+
+/// 1-9 without a command modifier: an open question's option shortcut.
+fn option_digit(keystroke: &Keystroke) -> Option<usize> {
+    let m = keystroke.modifiers;
+    if m.control || m.platform || m.alt {
+        return None;
+    }
+    keystroke.key.parse::<usize>().ok().filter(|d| (1..=9).contains(d))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_question_submits_once_every_answer_is_in() {
+        let question = |id: &str| -> Question {
+            serde_json::from_value(json!({"id": id, "header": "H", "question": "?", "options": [{"label": "Red"}]}))
+                .unwrap()
+        };
+        let none = |_: &str| Attached::default();
+        let mut draft = QuestionDraft::new("r".into(), vec![question("a"), question("b")]).unwrap();
+        assert_eq!(question_submit(&draft, none, false, true), ("Next question", false), "unanswered");
+        let ready = |id: &str| Attached { count: usize::from(id == "a"), blocked: false };
+        assert_eq!(question_submit(&draft, ready, false, true), ("Next question", true), "attachments answer it");
+        let uploading = |id: &str| Attached { count: usize::from(id == "a"), blocked: id == "a" };
+        assert_eq!(question_submit(&draft, uploading, false, true), ("Next question", false), "until they upload");
+        draft.drafts.insert("a".into(), requests::toggle(&draft.questions[0], None, "Red"));
+        assert_eq!(question_submit(&draft, none, false, true), ("Next question", true));
+        draft.index = 1;
+        assert_eq!(question_submit(&draft, none, false, true), ("Submit answers", false), "the last needs its answer");
+        draft.drafts.insert("b".into(), requests::toggle(&draft.questions[1], None, "Red"));
+        assert_eq!(question_submit(&draft, none, false, true), ("Submit answers", true));
+        assert_eq!(question_submit(&draft, none, true, true), ("Submitting...", false));
+        assert_eq!(question_submit(&draft, none, false, false), ("Submit answers", false), "not resumable");
+    }
+
+    #[test]
+    fn chips_catch_up_once_the_composer_provider_changes() {
+        let mut seen = None;
+        assert!(note_provider(&mut seen, Some("codex")), "the thread's provider arrives");
+        assert!(!note_provider(&mut seen, Some("codex")), "a model change within it");
+        assert!(note_provider(&mut seen, Some("claudeAgent")), "another client moved the thread");
+        assert_eq!(seen.as_deref(), Some("claudeAgent"));
+        assert!(note_provider(&mut seen, None), "its provider went");
+        assert!(!note_provider(&mut seen, None));
+    }
+
+    #[test]
+    fn a_chip_catch_up_refused_mid_composition_runs_once_it_ends() {
+        use gpui_kit::base::input::InlineTokenError::{CompositionActive, TextMismatch};
+        let mut pending = None;
+        let sync = take_chip_sync(&mut pending, ChipSync::Remount);
+        assert!(!settle_chip_sync(&mut pending, sync, Err(CompositionActive)), "rich text turned on mid-composition");
+        assert_eq!(pending, Some(ChipSync::Remount));
+        let sync = take_chip_sync(&mut pending, ChipSync::Lists);
+        assert_eq!(sync, ChipSync::Remount, "a narrower catch-up still runs the waiting one");
+        assert!(!settle_chip_sync(&mut pending, sync, Err(CompositionActive)), "still composing");
+        let sync = take_chip_sync(&mut pending, ChipSync::Restored);
+        assert!(settle_chip_sync(&mut pending, sync, Ok(())), "the commit's change runs it");
+        assert_eq!((sync, pending), (ChipSync::Remount, None));
+        let sync = take_chip_sync(&mut pending, ChipSync::Lists);
+        assert!(!settle_chip_sync(&mut pending, sync, Err(TextMismatch)));
+        assert_eq!(pending, None, "only a composition defers one");
+    }
+
+    #[test]
+    fn an_undo_that_brings_back_a_chip_is_noticed() {
+        let ids = |ids: &[&str]| ids.iter().map(|id| (*id).to_owned()).collect::<Vec<_>>();
+        let gpt = "model:codex/gpt-6.1";
+        assert!(adds_chip(&ids(&["skill:review"]), &ids(&["skill:review", gpt])));
+        assert!(adds_chip(&ids(&[gpt]), &ids(&[gpt, gpt])), "a second chip for one model");
+        assert!(!adds_chip(&ids(&[gpt, gpt]), &ids(&[gpt])));
+        assert!(!adds_chip(&ids(&[gpt, "skill:review"]), &ids(&["skill:review", gpt])));
+    }
+
+    #[test]
+    fn enter_opens_a_model_chip_only_while_the_selection_is_that_chip() {
+        let text = "ask model:codex/gpt-6.1 or $review now";
+        let content = InputContent::new(text)
+            .with_token(4..23, InlineToken::new("model:codex/gpt-6.1", "model:codex/gpt-6.1"))
+            .and_then(|content| content.with_token(27..34, InlineToken::new("skill:review", "$review")))
+            .unwrap();
+        let spans = content.tokens();
+        assert!(matches!(selected_chip(spans, &(4..23)), Some(Chip::Model { model, .. }) if model == "gpt-6.1"));
+        assert_eq!(selected_chip(spans, &(23..23)), None, "a caret beside it sends");
+        assert_eq!(selected_chip(spans, &(0..23)), None, "a wider selection");
+        assert_eq!(selected_chip(spans, &(27..34)), Some(Chip::Skill { name: "review".into() }));
+    }
 
     #[test]
     fn review_comment_chips_keep_their_change_request() {
@@ -2146,6 +2774,39 @@ mod tests {
         assert_eq!((draft.noun(), draft.state().1), ("Pull request", "Draft"));
         let merged = &contexts["rc-3"];
         assert_eq!((merged.noun(), merged.state().1), ("Merge request", "Merged"));
+    }
+
+    #[test]
+    fn only_resting_printable_keys_and_pastes_reach_the_composer() {
+        let key = |text: &'static str| Keystroke::parse(text).unwrap();
+        let typed = |text: &'static str, c: &str| Keystroke { key_char: Some(c.into()), ..key(text) };
+        let open = RedirectGate { resting: true, open: true, ..RedirectGate::default() };
+        let redirect = |keystroke: &Keystroke, gate| focus_redirect(keystroke, gate);
+        assert_eq!(redirect(&typed("a", "a"), open), Some(FocusRedirect::Type("a".into())));
+        assert_eq!(redirect(&typed("shift-a", "A"), open), Some(FocusRedirect::Type("A".into())));
+        // No question, or one taking a custom answer: the web's capture listener types the digit before
+        // its options' listener sees it.
+        assert_eq!(redirect(&typed("1", "1"), open), Some(FocusRedirect::Type("1".into())));
+        assert_eq!(redirect(&key("ctrl-v"), open), Some(FocusRedirect::Paste { as_text: false }));
+        assert_eq!(redirect(&key("cmd-shift-v"), open), Some(FocusRedirect::Paste { as_text: true }));
+        assert_eq!(redirect(&key("ctrl-alt-v"), open), None);
+        assert_eq!(redirect(&typed("ctrl-a", "a"), open), None, "a chord");
+        assert_eq!(redirect(&typed("alt-a", "å"), open), None);
+        assert_eq!(redirect(&key("enter"), open), None, "no character");
+        assert_eq!(redirect(&key("f2"), open), None);
+        let elsewhere = RedirectGate { resting: false, ..open };
+        assert_eq!(redirect(&typed("a", "a"), elsewhere), None, "a text field or the side chat has focus");
+        let covered = RedirectGate { open: false, ..open };
+        assert_eq!(redirect(&key("ctrl-v"), covered), None, "a palette or dialog is open");
+        // A queued edit saving makes the composer inert, so neither typing nor pasting edits it.
+        let inert = RedirectGate { inert: true, ..open };
+        assert_eq!(redirect(&typed("a", "a"), inert), None);
+        assert_eq!(redirect(&key("ctrl-v"), inert), None);
+        // A choice-only question, or one whose answer is on its way, refuses text: its options take digits.
+        let choosing = RedirectGate { answer_locked: true, ..open };
+        assert_eq!(redirect(&typed("1", "1"), choosing), None);
+        assert_eq!(redirect(&typed("a", "a"), choosing), None);
+        assert_eq!(redirect(&key("ctrl-v"), choosing), None);
     }
 
     #[test]

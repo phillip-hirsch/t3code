@@ -2,6 +2,7 @@
 //! doubles as the window's drag region (`ChatView.tsx` header + `ChatHeader.tsx`).
 
 use gpui_kit::component::input::Input;
+use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Sizable as _, StyledExt as _, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -12,6 +13,7 @@ use gpui_kit::{
 
 use super::titlebar::{self, CAPTION_BUTTONS_WIDTH, RIGHT_RESIZE_INSET, TITLEBAR_HEIGHT, icon};
 use super::{Target, Workspace};
+use crate::model::ScopedId;
 use crate::theme;
 
 impl Workspace {
@@ -19,39 +21,50 @@ impl Workspace {
         let tokens = *theme::tokens(cx);
         // Clears the caption buttons plus 12px, like `--workspace-native-controls-inset`.
         let controls_inset = CAPTION_BUTTONS_WIDTH + px(12.) - RIGHT_RESIZE_INSET;
-        // An open right panel owns the titlebar controls, so the header keeps only its `px-5`.
-        let panel_open = self.right_panel_open()
+        // An open inline right panel owns the titlebar controls, so the header keeps only its `px-5`;
+        // a sheet leaves them to the header (`inlineRightPanelOwnsTitleBar`).
+        let panel_open = self.right_panel_docked_width(window).is_some()
             || (self.page == Some(super::pages::Page::PullRequests) && self.pull_request_panel_shown());
         let header = h_flex()
             .id("chat-header")
             .h(TITLEBAR_HEIGHT)
             .flex_none()
-            .pl(if self.sidebar_open.docked() { px(20.) } else { titlebar::collapsed_content_left(window) })
+            .pl(if self.sidebar_open.docked() && !self.welcome_open() {
+                px(20.)
+            } else {
+                titlebar::collapsed_content_left(window)
+            })
             .pr(if panel_open { px(20.) } else { controls_inset })
-            .bg(tokens.background);
-        let header = titlebar::drag_region(header);
+            // `bg-background`, which a theme replaces with its toolbar (`[data-chat-header]`).
+            .bg(tokens.toolbar.background);
+        let header = titlebar::drag_region(header)
+            .children(crate::app::theme_inspect::probe(&["toolbar", "toolbarForeground"], cx));
+        // The Welcome page keeps only a strip the window moves by (`WorkspacePageHeader electron`).
+        if self.welcome_open() {
+            return header;
+        }
         if let Some(page) = self.page.filter(|page| !page.is_modal()) {
             return header.child(div().text_sm().font_medium().text_color(tokens.foreground).child(page.title()));
         }
         let mut link_origin: Option<SharedString> = None;
         let (project, title, parent) = match &self.target {
-            Some(Target::Thread { id, .. }) => {
-                let shell = self.shell.threads.iter().find(|thread| &thread.id == id);
+            Some(Target::Thread { env, id }) => {
+                let shell = self.shell.thread(&ScopedId::new(env.clone(), id.as_str()));
                 let projection = self.thread.as_ref().and_then(|t| t.state.projection.as_ref());
                 let title: SharedString = shell
                     .map(|thread| thread.title.clone())
                     .or_else(|| projection.map(|p| p.thread.title.clone()))
                     .unwrap_or_default()
                     .into();
-                let project = shell.and_then(|thread| self.shell.projects.iter().find(|p| p.id == thread.project_id));
+                let project = shell.and_then(|thread| self.shell.project(&ScopedId::thread_project(thread)));
                 let parent = shell
                     .and_then(|thread| thread.lineage.parent_thread_id.as_ref())
-                    .and_then(|parent| self.shell.threads.iter().find(|thread| &thread.id == parent));
+                    .and_then(|parent| self.shell.thread(&ScopedId::new(env.clone(), parent.as_str())));
                 link_origin = shell.and_then(|thread| thread.link_origin.as_ref()).map(|o| o.label.clone().into());
                 (project, title, parent)
             }
-            Some(Target::Draft { project_id, .. }) => {
-                (self.shell.projects.iter().find(|p| &p.id == project_id), "New thread".into(), None)
+            Some(Target::Draft { env, project_id, .. }) => {
+                (self.shell.project(&ScopedId::new(env.clone(), project_id.as_str())), "New thread".into(), None)
             }
             // `NoActiveThreadState`: a bordered header with a quiet label.
             None => {
@@ -78,6 +91,7 @@ impl Workspace {
                 .hover(|style| style.text_color(tokens.foreground))
                 .children(focus_ring(focus, window, tokens.ring))
                 .on_mouse_down(MouseButton::Right, Self::header_context_menu(cx))
+                .on_context_menu_key(Self::header_context_menu_key(cx))
         };
         let [project_focus, parent_focus, _] = &self.title.crumbs;
         let separator = || div().flex_none().text_color(tokens.muted_foreground).child("/");
@@ -86,7 +100,7 @@ impl Workspace {
         if let Some(project) = project {
             // `ChatHeader.tsx` names the project by its title, not its repository.
             let name: SharedString = project.title.clone().into();
-            let project_id = project.id.clone();
+            let ScopedId { env: project_env, id: project_id } = ScopedId::of_project(project);
             let tooltip: SharedString = format!("New thread in {name}").into();
             breadcrumb = breadcrumb
                 .child(
@@ -96,22 +110,22 @@ impl Workspace {
                         .child(super::sidebar::project_icon(project, &tokens, false, 14., self.favicon(project)))
                         .child(div().max_w(px(160.)).truncate().child(name))
                         .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
-                        .on_click(
-                            cx.listener(move |this, _, window, cx| this.start_draft(project_id.clone(), window, cx)),
-                        ),
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.start_draft_in(project_env.clone(), project_id.clone(), window, cx);
+                        })),
                 )
                 .child(separator());
         }
         if let Some(parent) = parent {
-            let parent_id = parent.id.clone();
+            let ScopedId { env: parent_env, id: parent_id } = ScopedId::of_thread(parent);
             breadcrumb = breadcrumb
                 .child(
                     crumb("crumb-parent", parent_focus, cx)
                         .flex_shrink(1.)
                         .child(div().min_w_0().truncate().child(parent.title.clone()))
-                        .on_click(
-                            cx.listener(move |this, _, window, cx| this.select_thread(parent_id.clone(), window, cx)),
-                        ),
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.select_thread_in(parent_env.clone(), parent_id.clone(), window, cx);
+                        })),
                 )
                 .child(separator());
         }
@@ -175,6 +189,17 @@ impl Workspace {
         })
     }
 
+    /// The menu key or Shift+F10 on a focused crumb or the title: the same menu, below it, as
+    /// the browser's `contextmenu` event reaches `onContextMenu` from the keyboard.
+    fn header_context_menu_key(
+        cx: &mut Context<Self>,
+    ) -> impl Fn(gpui_kit::Point<gpui_kit::Pixels>, &mut Window, &mut gpui_kit::App) + 'static {
+        let view = cx.weak_entity();
+        move |position, window, cx| {
+            let _ = view.update(cx, |this, cx| this.context_click_header(position, window, cx));
+        }
+    }
+
     /// The server thread's title: a menu on click (after the double-click interval), rename on double-click.
     fn render_title_button(
         &self,
@@ -202,6 +227,7 @@ impl Workspace {
             .occlude()
             .cursor_pointer()
             .text_color(tokens.foreground)
+            .children(crate::app::theme_inspect::probe(&["text"], cx))
             .child(div().min_w_0().truncate().child(title))
             .child(
                 div()
@@ -235,6 +261,7 @@ impl Workspace {
                 }
             }))
             .on_mouse_down(MouseButton::Right, Self::header_context_menu(cx))
+            .on_context_menu_key(Self::header_context_menu_key(cx))
             // Mouse-down, like the panel toggles: the drag region swallows the release.
             .on_mouse_down(
                 MouseButton::Left,

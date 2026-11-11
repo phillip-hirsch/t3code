@@ -9,7 +9,8 @@ use std::rc::Rc;
 use gpui_kit::StyledImage as _;
 use gpui_kit::assets::IconName;
 use gpui_kit::base::SelectableText;
-use gpui_kit::component::{Icon, h_flex, v_flex};
+use gpui_kit::component::button::Button;
+use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, App, Context, ElementId, FontWeight, HighlightStyle, InteractiveElement as _, IntoElement,
     ParentElement as _, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Task, WeakEntity,
@@ -19,6 +20,7 @@ use serde_json::{Value, json};
 
 use super::Workspace;
 use super::markdown_images::Source::WorkspaceFile;
+use super::side_chat::ChatPane;
 use crate::file_links::workspace_display_path;
 use crate::model::TurnItem;
 use crate::rpc::StreamEvent;
@@ -113,8 +115,8 @@ fn needs_fetch(item: &TurnItem, streams_output: bool) -> bool {
     }
 }
 
-/// `"live"` until the item settles, then its `updatedAt`.
-fn revision(item: &TurnItem) -> SharedString {
+/// `"live"` until the item settles, then its `updatedAt` (`turnItemDetailRevision`).
+pub(super) fn revision(item: &TurnItem) -> SharedString {
     match item.status.as_str() {
         "idle" | "pending" | "running" | "waiting" => "live".into(),
         _ => item.str("updatedAt").unwrap_or_default().to_owned().into(),
@@ -150,6 +152,11 @@ fn is_empty_value(value: &Value) -> bool {
     }
 }
 
+/// The view key an open entry's images load under in `pane`, for its row there to remeasure.
+fn thought_view_key(pane: ChatPane, entry_id: &str) -> SharedString {
+    super::chat::view_key(pane, &super::chat::thought_key(entry_id))
+}
+
 fn open_entries(rows: &[Row]) -> impl Iterator<Item = &Rc<Entry>> {
     rows.iter().flat_map(|row| -> Vec<&Rc<Entry>> {
         match row {
@@ -166,17 +173,18 @@ impl Workspace {
     /// Starts loading the output of entries that just opened and drops it for closed ones.
     pub(super) fn sync_details(&mut self, cx: &mut Context<Self>) {
         let streams_output = self.server_info().capability("commandOutputStreaming");
-        let shown = self.shown_open_entries();
-        let open: Vec<Rc<Entry>> = shown.iter().filter(|entry| has_inspector(entry)).cloned().collect();
+        let shown = self.pane_open_entries();
+        let open: Vec<Rc<Entry>> =
+            shown.iter().filter(|(_, entry)| has_inspector(entry)).map(|(_, e)| e.clone()).collect();
         self.details.loads.retain(|id, _| open.iter().any(|entry| entry.id == *id));
         self.details.tools.retain(|id, _| open.iter().any(|entry| entry.id == *id));
-        for entry in &open {
+        for (pane, entry) in shown.iter().filter(|(_, entry)| has_inspector(entry)) {
             self.details.format_tool(entry);
-            self.load_tool_images(entry, cx);
+            self.load_tool_images(*pane, entry, cx);
         }
         let viewed: Vec<(SharedString, String)> = shown
             .iter()
-            .filter_map(|entry| Some((super::chat::thought_key(&entry.id), self.viewed_image(entry)?)))
+            .filter_map(|(pane, entry)| Some((thought_view_key(*pane, &entry.id), self.viewed_image(entry)?)))
             .collect();
         for (key, path) in viewed {
             self.load_images(&key, vec![path], cx);
@@ -248,10 +256,10 @@ impl Workspace {
                     let _ = this.update(cx, |this, cx| {
                         if let Some(Detail::Item { fetched: slot, .. }) = this.details.loads.get_mut(&id) {
                             *slot = fetched;
-                            let entry = this.shown_open_entries().into_iter().find(|entry| entry.id == id);
-                            if let Some(entry) = entry {
+                            let shown = this.pane_open_entries();
+                            for (pane, entry) in shown.into_iter().filter(|(_, entry)| entry.id == id) {
                                 this.details.format_tool(&entry);
-                                this.load_tool_images(&entry, cx);
+                                this.load_tool_images(pane, &entry, cx);
                             }
                             cx.notify();
                         }
@@ -266,7 +274,7 @@ impl Workspace {
     }
 
     /// Starts loading the images a tool's output holds (`turnItemOutputImages`).
-    fn load_tool_images(&mut self, entry: &Entry, cx: &mut Context<Self>) {
+    fn load_tool_images(&mut self, pane: ChatPane, entry: &Entry, cx: &mut Context<Self>) {
         let item = self.details.shown_item(entry);
         let assets: Vec<(String, Value)> = (0..tool_output_image_count(&item))
             .map(|index| {
@@ -277,7 +285,7 @@ impl Workspace {
             })
             .collect();
         if !assets.is_empty() {
-            self.load_asset_images(&super::chat::thought_key(&entry.id), assets, cx);
+            self.load_asset_images(&thought_view_key(pane, &entry.id), assets, cx);
         }
     }
 
@@ -292,15 +300,15 @@ impl Workspace {
     }
 
     /// The open entries of the timeline and of the side chat on screen, which loads its own.
-    fn shown_open_entries(&self) -> Vec<Rc<Entry>> {
+    fn pane_open_entries(&self) -> Vec<(ChatPane, Rc<Entry>)> {
         let side = self.side_chat.view.as_ref().map(|view| view.rows.clone());
-        let mut open: Vec<Rc<Entry>> = open_entries(&self.rows).cloned().collect();
-        open.extend(side.iter().flat_map(|rows| open_entries(rows)).cloned());
+        let mut open: Vec<_> = open_entries(&self.rows).map(|entry| (ChatPane::Main, entry.clone())).collect();
+        open.extend(side.iter().flat_map(|rows| open_entries(rows)).map(|entry| (ChatPane::Side, entry.clone())));
         open
     }
 
     /// The thread and item an item was projected from, for the item RPCs.
-    fn source_of(&self, item_id: &str) -> Option<(String, String)> {
+    pub(super) fn source_of(&self, item_id: &str) -> Option<(String, String)> {
         let main = self.thread.as_ref().and_then(|thread| thread.state.projection.as_ref());
         let rows = main.into_iter().chain(self.side_chat_projection()).flat_map(|p| &p.visible_turn_items);
         let row = rows.into_iter().find(|row| row.item.id == item_id)?;
@@ -494,7 +502,12 @@ pub(super) fn inspector(entry: &Entry, this: &WeakEntity<Workspace>, t: &Tokens,
         "command_execution" | "dynamic_tool" => tool_body(entry, &item, workspace, t),
         "file_change" => {
             let scheme = super::git::DiffColorScheme::from_settings(&workspace.client_settings.values);
-            file_change(&entry.id, &item, root.as_deref(), scheme, t)
+            // `onOpenToolDiff`, on a server thread only.
+            let open_diff = matches!(workspace.target, Some(super::Target::Thread { .. }))
+                .then(|| workspace.source_of(&entry.item.0.id))
+                .flatten()
+                .map(|source| open_diff_button(&entry.id, source, this, t));
+            file_change(&entry.id, &item, root.as_deref(), scheme, open_diff, t)
         }
         "file_search" | "web_search" => search(entry, &item, root.as_deref(), this, t),
         _ => {
@@ -604,6 +617,7 @@ fn file_change(
     item: &TurnItem,
     root: Option<&str>,
     scheme: super::git::DiffColorScheme,
+    open_diff: Option<Button>,
     t: &Tokens,
 ) -> gpui_kit::Div {
     let raw = &item.raw;
@@ -627,7 +641,8 @@ fn file_change(
                 .items_center()
                 .gap(px(8.))
                 .child(div().font_family(FONT_MONO).text_color(t.muted_foreground).child(selectable("path", path)))
-                .children(counts),
+                .children(counts)
+                .children(open_diff),
         )
         .children(failed_diff.map(|diff| structured(&format!("diff:{id}"), diff.to_owned().into(), t)))
         .when(!changes.is_empty(), |el| {
@@ -638,6 +653,31 @@ fn file_change(
                     }),
                 ),
             )
+        })
+}
+
+/// `Open diff` (`Button size="xs" variant="outline"`): the change's recorded diff in the panel.
+fn open_diff_button(
+    id: &str,
+    (thread_id, item_id): (String, String),
+    this: &WeakEntity<Workspace>,
+    t: &Tokens,
+) -> Button {
+    let this = this.clone();
+    Button::new(ElementId::Name(format!("open-tool-diff:{id}").into()))
+        .outline()
+        .xsmall()
+        .h(px(24.))
+        .px(px(8.))
+        .rounded(px(6.))
+        .border_color(t.input)
+        .text_xs()
+        .font_weight(FontWeight::MEDIUM)
+        .label("Open diff")
+        .on_click(move |_, window, cx| {
+            cx.stop_propagation();
+            let (thread_id, item_id) = (thread_id.clone(), item_id.clone());
+            let _ = this.update(cx, |workspace, cx| workspace.open_tool_call_diff(thread_id, item_id, window, cx));
         })
 }
 

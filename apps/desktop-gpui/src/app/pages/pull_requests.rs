@@ -5,6 +5,7 @@
 
 pub(super) mod facets;
 mod row_popovers;
+pub(super) mod speed_actions;
 use facets::FacetKind;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -43,6 +44,7 @@ const PREFETCH_FRESH: Duration = Duration::from_mins(1);
 
 fn reference_of(entry: &Entry) -> Reference {
     Reference {
+        environment_id: entry.environment_id.clone(),
         project_id: entry.project_id.clone(),
         host: Some(entry.host.clone()),
         repository: entry.repository.clone(),
@@ -77,6 +79,10 @@ enum Row {
         stat: Option<(u64, u64)>,
         elsewhere: bool,
         first: bool,
+        /// Its display group, which a close sweep stays within.
+        group: usize,
+        /// The Shift quick actions its state and host offer.
+        quick: Rc<[&'static str]>,
     },
     /// The read failed but earlier rows are still shown.
     Stale(SharedString),
@@ -108,6 +114,8 @@ pub(in crate::app) struct PullRequestsState {
     typed: String,
     sent: String,
     list: Option<ListResult>,
+    /// The question `list` last answered from the top (`pull_request_list_scope`).
+    list_scope: Option<Value>,
     /// The dedicated authored and review-requested reads, and the scope they answer.
     partitions: Option<Partitions>,
     partition_generation: u64,
@@ -131,11 +139,15 @@ pub(in crate::app) struct PullRequestsState {
     pub(super) panel: Option<super::pull_request_detail::Panel>,
     /// The merge method last picked in any panel (`uiStateStore.pullRequestMergeMethod`).
     pub(super) last_merge_method: &'static str,
+    /// The Code tab's file tree shows, in every panel (`t3code.pullRequestFileTreeOpen`).
+    pub(super) file_tree_open: bool,
     /// Unsent reviews by pull request, kept across panels (`usePullRequestReviewStore`).
     pub(super) reviews: std::collections::HashMap<String, super::pull_request_detail::write::ReviewDraft>,
     /// Open pull requests in tab order; `panel` is the shown one and `parked` holds the rest.
     pub(super) tabs: Vec<Reference>,
     pub(super) parked: std::collections::HashMap<String, super::pull_request_detail::Panel>,
+    /// Review guide runs being watched, by pull request key, whether or not a panel shows them.
+    pub(super) guide_runs: std::collections::HashMap<String, super::pull_request_detail::guide_runs::GuideRun>,
     /// The panel's dragged width; `None` is half the window.
     pub(super) panel_width: Option<f32>,
     /// Whether the panel shows beside the list, or over it; hiding keeps every tab.
@@ -158,11 +170,23 @@ pub(in crate::app) struct PullRequestsState {
     avatars_unread: bool,
     /// A row's open checks or stack popover and what it read.
     row_popover: Option<(row_popovers::Kind, row_popovers::RowPopover)>,
+    /// The stack popover's layer list, which takes focus as it opens so arrow keys reach the layers.
+    stack_focus: FocusHandle,
     /// Each tab's close button and title, as the web's two buttons: Tab reaches them, Enter or Space presses.
     pub(super) tab_focus: std::collections::HashMap<String, [FocusHandle; 2]>,
     /// The right-click menu on one of the panel's tabs, where it opened.
+    /// The detail's actions trigger, which focus returns to from the dialogs it opens.
+    pub(super) actions_focus: FocusHandle,
     pub(super) tab_menu:
         Option<(Entity<gpui_kit::component::menu::PopupMenu>, gpui_kit::Point<gpui_kit::Pixels>, Subscription)>,
+    /// Shift's quick actions on rows and the close sweep.
+    speed: speed_actions::SpeedActions,
+    /// Each linked pull request row's focus in the thread's Linked pull requests surface, by its key.
+    pub(super) linked_focus: std::collections::HashMap<String, FocusHandle>,
+    /// The thread card's pull request rows: their reads, actions and unfolded list.
+    pub(super) card: super::thread_card_pull_requests::CardPullRequests,
+    /// The host reads of thread rows that have no synced link, by pull request key.
+    pub(super) row_reads: super::thread_pull_request_badge::RowReads,
 }
 
 impl PullRequestsState {
@@ -190,6 +214,7 @@ impl PullRequestsState {
             typed: String::new(),
             sent: String::new(),
             list: None,
+            list_scope: None,
             partitions: None,
             partition_generation: 0,
             stale: false,
@@ -207,9 +232,11 @@ impl PullRequestsState {
             _search_subscription: subscription,
             panel: None,
             last_merge_method: "merge",
+            file_tree_open: super::pull_request_detail::stored_file_tree_open(),
             reviews: std::collections::HashMap::new(),
             tabs: Vec::new(),
             parked: std::collections::HashMap::new(),
+            guide_runs: std::collections::HashMap::new(),
             panel_width: None,
             layout: super::pull_request_detail::PanelLayout::default(),
             refreshes: std::collections::HashMap::new(),
@@ -222,13 +249,19 @@ impl PullRequestsState {
             row_focus_unheard: false,
             avatars_unread: false,
             row_popover: None,
+            stack_focus: cx.focus_handle(),
             tab_menu: None,
+            actions_focus: cx.focus_handle(),
             tab_focus: std::collections::HashMap::new(),
+            speed: speed_actions::SpeedActions::default(),
+            linked_focus: std::collections::HashMap::new(),
+            card: Default::default(),
+            row_reads: Default::default(),
         }
     }
 
     /// The listed row for a pull request, which the panel shows while its detail loads.
-    pub(super) fn entry_for(&self, reference: &Reference) -> Option<Rc<Entry>> {
+    pub(in crate::app) fn entry_for(&self, reference: &Reference) -> Option<Rc<Entry>> {
         self.held_entries().find(|e| reference_of(e) == *reference).cloned()
     }
 
@@ -279,16 +312,28 @@ impl PullRequestsState {
 impl Workspace {
     /// Reads the list the first time the page opens; later opens show what was read.
     pub(in crate::app) fn pull_requests_opened(&mut self, cx: &mut Context<Self>) {
+        // The page was away for a press's release or a Shift's.
+        self.pull_requests.speed.reset();
         if self.pull_requests.list.is_none() && !self.pull_requests.loading {
             self.read_pull_requests(false, cx);
         } else if std::mem::take(&mut self.pull_requests.stale) {
             self.live_refresh_pull_requests(cx);
         }
+        self.read_unread_shown_pr(cx);
         self.follow_pull_requests(cx);
+    }
+
+    /// The page shows a list that never read (opened offline, or its read failed): it reads now.
+    pub(super) fn read_unread_pull_requests(&mut self, cx: &mut Context<Self>) {
+        let state = &self.pull_requests;
+        if self.page == Some(super::Page::PullRequests) && state.list.is_none() && !state.loading {
+            self.read_pull_requests(false, cx);
+        }
     }
 
     /// Changes what the list asks for and reads it again from the first page.
     fn set_pull_request_scope(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut PullRequestsState)) {
+        self.cancel_close_sweep(cx);
         change(&mut self.pull_requests);
         self.pull_requests.page_size = PAGE_SIZE;
         self.read_pull_requests(false, cx);
@@ -360,6 +405,15 @@ impl Workspace {
         input
     }
 
+    /// The question a list read asks, apart from its page length and cursors.
+    fn pull_request_list_scope(&self) -> Value {
+        let mut input = self.pull_request_input(None);
+        if let Some(input) = input.as_object_mut() {
+            input.remove("limit");
+        }
+        json!([input, self.pull_requests.environment.as_deref()])
+    }
+
     /// The machines the list asks and, where a repository lives on several, the projects each
     /// asks about (`usePullRequestScope`'s `environmentQueries`).
     pub(super) fn pull_request_targets(&self) -> Vec<(SharedString, RpcClient, Option<Vec<String>>)> {
@@ -369,8 +423,9 @@ impl Workspace {
         if let Some(environment) = &self.pull_requests.environment {
             connected.retain(|(id, _)| *id == environment);
         }
-        if let Some(project) = &self.pull_requests.project {
-            let environment = self.shell.project_environment(project);
+        if self.pull_requests.project.is_some() {
+            // Picking a project sets its server too; a project id alone may repeat across servers.
+            let environment = self.pull_requests.environment.as_ref();
             connected.retain(|(id, _)| Some(*id) == environment);
             return connected.into_iter().map(|(id, client)| (id.clone(), client, None)).collect();
         }
@@ -425,6 +480,7 @@ impl Workspace {
         state.loading = true;
         state.loading_more = more;
         let continuing = cursors.is_some();
+        let scope = self.pull_request_list_scope();
         let requests: Vec<(String, RpcClient, Value)> = targets
             .into_iter()
             .filter_map(|(environment, client, project_ids)| {
@@ -453,27 +509,36 @@ impl Workspace {
                 }
                 state.loading = false;
                 state.loading_more = false;
-                // An unreachable machine must not hide the others' rows.
+                // An unreachable machine must not hide the others' rows, and keeps its own last
+                // answer to this question beside them while its error shows.
                 let mut answers = Vec::new();
                 let mut failure = None;
+                let held = state.list.as_ref().filter(|_| !continuing && state.list_scope.as_ref() == Some(&scope));
                 for (environment, result) in results {
-                    match result.map(serde_json::from_value::<ListResult>) {
-                        Ok(Ok(answer)) => answers.push((environment, answer)),
-                        Ok(Err(error)) => {
-                            failure.get_or_insert_with(|| format!("Unreadable pull request list: {error}"));
+                    let error = match result.map(serde_json::from_value::<ListResult>) {
+                        Ok(Ok(answer)) => {
+                            answers.push((environment, answer));
+                            continue;
                         }
-                        Err(error) => {
-                            failure.get_or_insert_with(|| logic::error_message(&error));
-                        }
+                        Ok(Err(error)) => format!("Unreadable pull request list: {error}"),
+                        Err(error) => logic::error_message(&error),
+                    };
+                    failure.get_or_insert(error);
+                    if let Some(held) = held {
+                        let kept = logic::held_answer(held, &environment);
+                        answers.push((environment, kept));
                     }
                 }
                 let result = match (answers.is_empty(), failure) {
                     (true, Some(failure)) => Err(failure),
-                    _ => Ok(logic::merge_lists(answers)),
+                    (_, failure) => Ok((logic::merge_lists(answers), failure)),
                 };
                 match result {
-                    Ok(mut answer) => {
-                        state.error = None;
+                    Ok((mut answer, failure)) => {
+                        state.error = failure.map(Into::into);
+                        if !continuing {
+                            state.list_scope = Some(scope);
+                        }
                         let (text, _) = logic::parse_query(&state.sent);
                         match (continuing, state.list.as_mut()) {
                             (true, Some(held)) => logic::append_page(held, answer, &text),
@@ -632,7 +697,7 @@ impl Workspace {
         if self.pull_requests.prefetched.as_ref().is_some_and(fresh) {
             return;
         }
-        let Some(client) = self.project_client(&reference.project_id) else { return };
+        let Some(client) = self.env_client(&entry.environment_id) else { return };
         let mut input = reference.to_json();
         input["allowStale"] = json!(false);
         let landed = key.clone();
@@ -659,35 +724,41 @@ impl Workspace {
     /// Asks each pull request's own machine for the diff sizes the listing left at zero.
     fn read_pull_request_stats(&mut self, cx: &mut Context<Self>) {
         let stats = &self.pull_requests.stats;
-        let mut by_environment: Vec<(&SharedString, Vec<Value>)> = Vec::new();
+        let mut by_environment: Vec<(&str, Vec<Value>)> = Vec::new();
         let mut asked = std::collections::HashSet::new();
         let missing = self.pull_requests.held_entries().filter(|e| {
             e.additions + e.deletions == 0 && !stats.contains_key(&e.stat_key()) && asked.insert(e.stat_key())
         });
         for entry in missing.take(500) {
-            let Some(environment) = self.shell.project_environment(&entry.project_id) else { continue };
+            let environment = entry.environment_id.as_str();
             match by_environment.iter_mut().find(|(held, _)| *held == environment) {
                 Some((_, refs)) => refs.push(entry.reference()),
                 None => by_environment.push((environment, vec![entry.reference()])),
             }
         }
-        let reads: Vec<(RpcClient, Vec<Value>)> = by_environment
+        let reads: Vec<(String, RpcClient, Vec<Value>)> = by_environment
             .into_iter()
-            .filter_map(|(environment, refs)| Some((self.env_client(environment)?, refs)))
+            .filter_map(|(environment, refs)| Some((environment.to_owned(), self.env_client(environment)?, refs)))
             .collect();
-        for (client, refs) in reads {
-            self.read_pull_request_stats_from(client, refs, cx);
+        for (environment, client, refs) in reads {
+            self.read_pull_request_stats_from(environment, client, refs, cx);
         }
     }
 
-    fn read_pull_request_stats_from(&mut self, client: RpcClient, refs: Vec<Value>, cx: &mut Context<Self>) {
+    fn read_pull_request_stats_from(
+        &mut self,
+        environment: String,
+        client: RpcClient,
+        refs: Vec<Value>,
+        cx: &mut Context<Self>,
+    ) {
         cx.spawn(async move |this, cx| {
             let Ok(answer) = client.request("pullRequests.listStats", json!({"refs": refs})).await else { return };
             let _ = this.update(cx, |this, cx| {
                 for stat in answer.get("stats").and_then(Value::as_array).into_iter().flatten() {
                     let field = |key: &str| stat.get(key).and_then(Value::as_str).unwrap_or_default();
                     let count = |key: &str| stat.get(key).and_then(Value::as_u64).unwrap_or_default();
-                    let key = logic::stat_key(field("projectId"), field("repository"), count("number"));
+                    let key = logic::stat_key(&environment, field("projectId"), count("number"));
                     this.pull_requests.stats.insert(key, (count("additions"), count("deletions")));
                 }
                 this.rebuild_pull_request_rows(cx);
@@ -738,6 +809,7 @@ impl Workspace {
                 answered_locally: state.typed == state.sent && !state.loading,
                 partitions: partitions.map(|p| logic::PartitionRows { authored: &p.authored, reviewing: &p.reviewing }),
             };
+            let host_actions = |entry: &Entry| logic::host_actions(&list.providers, entry);
             for (index, group) in logic::display_groups(list, &view, &state.stats).into_iter().enumerate() {
                 if !group.label.is_empty() {
                     rows.push(Row::Header {
@@ -762,6 +834,8 @@ impl Workspace {
                         stat: logic::diff_stat(&entry, &state.stats),
                         elsewhere: logic::matched_elsewhere(&entry, &text),
                         first: position == 0 && (index == 0 || !group.label.is_empty()),
+                        group: index,
+                        quick: Rc::from(logic::quick_actions(&entry, &host_actions(&entry))),
                         entry,
                     });
                 }
@@ -830,7 +904,8 @@ impl Workspace {
                 &tokens,
                 cx,
             )))
-            .child(div().flex_1().min_h_0().child(body));
+            .child(div().flex_1().min_h_0().child(body))
+            .children(self.close_sweep_tracker(cx));
         if !self.pull_request_panel_shown() {
             return column.into_any_element();
         }
@@ -899,6 +974,7 @@ impl Workspace {
             .child("Sort")
             .dropdown_menu(radio_menu(SORTS, sort, sort_icon, view.clone(), |this, value, cx| {
                 this.pull_requests.sort = value;
+                this.cancel_close_sweep(cx);
                 this.rebuild_pull_request_rows(cx);
                 cx.notify();
             }));
@@ -1190,12 +1266,17 @@ impl Workspace {
             let project_view = view.clone();
             let project_choices = projects.clone();
             let picked_project = project.clone();
-            let project_label = picked_project
-                .as_ref()
-                .and_then(|id| project_choices.iter().find(|p| &p.0 == id))
+            let picked_environment = environment.clone();
+            let is_picked = move |id: &String, environment: &SharedString| {
+                picked_project.as_ref() == Some(id) && picked_environment.as_ref() == Some(environment)
+            };
+            let project_label = project_choices
+                .iter()
+                .find(|p| is_picked(&p.0, &p.3))
                 .map_or("All projects".to_owned(), |p| p.1.clone());
+            let any_picked = project.is_some();
             root.submenu(format!("Project  {project_label}"), window, cx, move |mut menu, window, _| {
-                menu = menu.item(PopupMenuItem::new("All projects").checked(picked_project.is_none()).on_click(
+                menu = menu.item(PopupMenuItem::new("All projects").checked(!any_picked).on_click(
                     window.listener_for(&project_view, |this, _, _, cx| {
                         this.set_pull_request_scope(cx, |state| state.project = None);
                     }),
@@ -1208,7 +1289,7 @@ impl Workspace {
                         PopupMenuItem::new(label)
                             .icon(Lucide::FolderGit2)
                             .disabled(*unavailable)
-                            .checked(picked_project.as_ref() == Some(id))
+                            .checked(is_picked(id, &environment))
                             .on_click(window.listener_for(&project_view, move |this, _, _, cx| {
                                 let project = value.clone();
                                 let environment = environment.clone();
@@ -1275,15 +1356,16 @@ impl Workspace {
         list(self.pull_requests.list_state.clone(), move |index, window, cx| {
             let content = match &rows[index] {
                 Row::Header { key, label, count, first } => group_header(key, label, *count, *first, &t),
-                Row::Entry { entry, focus, stat, elsewhere, first } => {
+                Row::Entry { entry, focus, stat, elsewhere, first, quick, .. } => {
                     let selected = selected.as_ref().is_some_and(|r| *r == reference_of(entry));
                     let origin = RowOrigin {
                         show_provider,
                         environment: environment_labels.get(&entry.environment_id).cloned(),
                     };
+                    let speed = view.read(cx).row_speed(entry, quick, focus, window, cx);
                     pull_request_row(
-                        entry, focus, *stat, *elsewhere, *first, selected, &origin, meta_width, now, &view, &t, window,
-                        cx,
+                        entry, focus, *stat, *elsewhere, *first, selected, &origin, &speed, meta_width, now, &view, &t,
+                        window, cx,
                     )
                 }
                 Row::Stale(error) => stale_banner(error.clone(), &view, &t, window),
@@ -1593,7 +1675,7 @@ fn state_glyph(state: logic::State, is_draft: bool, t: &Tokens) -> (Lucide, Hsla
     }
 }
 
-fn checks_glyph(state: &str, t: &Tokens) -> Option<(Lucide, Hsla, &'static str)> {
+pub(super) fn checks_glyph(state: &str, t: &Tokens) -> Option<(Lucide, Hsla, &'static str)> {
     Some(match state {
         "passing" => (Lucide::CircleCheck, tone(t, 0x009966, 0x5ee9b5, 0.9), "All checks have passed"),
         "failing" => (Lucide::CircleX, t.error, "Some checks were not successful"),
@@ -1602,7 +1684,7 @@ fn checks_glyph(state: &str, t: &Tokens) -> Option<(Lucide, Hsla, &'static str)>
     })
 }
 
-fn review_glyph(decision: &str, t: &Tokens) -> Option<(Lucide, Hsla, &'static str)> {
+pub(super) fn review_glyph(decision: &str, t: &Tokens) -> Option<(Lucide, Hsla, &'static str)> {
     Some(match decision {
         "approved" => (Lucide::UserCheck, tone(t, 0x009966, 0x5ee9b5, 0.9), "Approved"),
         "changes-requested" => (Lucide::UserRoundX, tone(t, 0xe17100, 0xffb900, 0.8), "Changes requested"),
@@ -1611,7 +1693,13 @@ fn review_glyph(decision: &str, t: &Tokens) -> Option<(Lucide, Hsla, &'static st
     })
 }
 
-fn glyph(id: String, icon: Lucide, size: f32, color: Hsla, label: impl Into<SharedString>) -> impl IntoElement {
+pub(super) fn glyph(
+    id: String,
+    icon: Lucide,
+    size: f32,
+    color: Hsla,
+    label: impl Into<SharedString>,
+) -> impl IntoElement {
     let label: SharedString = label.into();
     div()
         .id(ElementId::Name(id.into()))
@@ -1672,13 +1760,13 @@ struct RowOrigin {
     environment: Option<SharedString>,
 }
 
-/// A source control host's mark (`getSourceControlPresentationForKind(kind).Icon`): GitHub's is
-/// one color and follows the text, the others are drawn as they are.
-fn host_mark(kind: &str, size: f32, color: Hsla) -> AnyElement {
+/// A source control host's mark (`getSourceControlPresentationForKind(kind).Icon`): GitHub's and
+/// Cursor's are one color and follow the text, the others are drawn as they are.
+pub(super) fn host_mark(kind: &str, size: f32, color: Hsla) -> AnyElement {
     let path = match kind {
-        "github" => {
+        "github" | "cursor-origin" => {
             return svg()
-                .path("icons/app/source-control/github.svg")
+                .path(format!("icons/app/source-control/{kind}.svg"))
                 .size(px(size))
                 .text_color(color)
                 .into_any_element();
@@ -1701,6 +1789,7 @@ fn pull_request_row(
     first: bool,
     selected: bool,
     origin: &RowOrigin,
+    speed: &speed_actions::RowSpeed,
     meta_width: f32,
     now: i64,
     view: &Entity<Workspace>,
@@ -1715,8 +1804,8 @@ fn pull_request_row(
     let conflict_label = format!("Conflicts with {}", entry.base_branch);
     let url = entry.url.clone();
     let open_label = logic::open_on_host_label(&entry.provider);
-    let number = div()
-        .id(ElementId::Name(id("number").into()))
+    // A tab stop, so the keyboard opens its menu (`contextmenu` on the focused number).
+    let number = crate::app::chat::focusable(div().id(ElementId::Name(id("number").into())), t)
         .flex_none()
         .font_family(t.fonts.mono)
         .text_xs()
@@ -1751,7 +1840,7 @@ fn pull_request_row(
             .child(div().text_color(addition).child(format!("+{additions}")))
             .child(div().text_color(t.error).child(format!("-{deletions}")));
         let subject = breakdown::Subject {
-            project_id: entry.project_id.clone(),
+            environment_id: entry.environment_id.clone(),
             reference: entry.reference(),
             additions,
             deletions,
@@ -1872,13 +1961,18 @@ fn pull_request_row(
         .id(ElementId::Name(id("row").into()))
         .track_focus(focus)
         .when_some(ring, gpui_kit::Styled::shadow)
-        .on_key_down(window.listener_for(view, move |this, event: &gpui_kit::KeyDownEvent, _, cx| {
-            let key = event.keystroke.key.as_str();
-            if matches!(key, "enter" | "space") && !event.keystroke.modifiers.modified() {
-                cx.stop_propagation();
-                this.open_pull_request_panel(reference_of(&pressed), Some(pressed.clone()), cx);
-            }
-        }))
+        .on_key_down({
+            let focus = focus.clone();
+            window.listener_for(view, move |this, event: &gpui_kit::KeyDownEvent, window, cx| {
+                let key = event.keystroke.key.as_str();
+                // A quick action inside the row takes its own Enter and Space.
+                if matches!(key, "enter" | "space") && !event.keystroke.modifiers.modified() && focus.is_focused(window)
+                {
+                    cx.stop_propagation();
+                    this.open_pull_request_panel(reference_of(&pressed), Some(pressed.clone()), cx);
+                }
+            })
+        })
         .on_hover(window.listener_for(view, move |this, resting: &bool, _, cx| {
             // `onPointerLeave` keeps the intent of a row that still has focus.
             if *resting || !focused {
@@ -1914,6 +2008,7 @@ fn pull_request_row(
                 }),
         )
         .child(v_flex().flex_1().min_w_0().child(title_line).child(meta_line))
+        .children(speed_actions::speed_group(entry, speed, view, t, window))
         .on_click({
             let focus = focus.clone();
             window.listener_for(view, move |this, _, window, cx| {
@@ -1933,7 +2028,7 @@ fn stale_banner(error: SharedString, view: &Entity<Workspace>, t: &Tokens, windo
         .rounded(px(8.))
         .border_1()
         .border_color(Hsla { a: 0.3, ..t.warning })
-        .bg(Hsla { a: 0.08, ..t.warning })
+        .bg(t.warning_surface)
         .px(px(12.))
         .py(px(8.))
         .text_xs()

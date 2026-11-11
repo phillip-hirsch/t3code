@@ -2,9 +2,11 @@
 //! (`getTriggerDisplayModelName`, `packages/provider-core/src/modelShortName.ts`)
 //! and the effort word (`describeComposerEffort` with `effortDisplay: "label"`).
 
+use std::borrow::Cow;
+
 use serde_json::{Value, json};
 
-use crate::model::{ModelSelection, OptionDescriptor, ProviderModel};
+use crate::model::{ModelSelection, OptionDescriptor, Provider, ProviderModel};
 
 const FAMILY_PREFIXES: [&str; 6] = ["Claude ", "GPT-", "GPT ", "Gemini ", "Muse ", "Grok "];
 
@@ -250,17 +252,17 @@ pub fn ultrathink_select(descriptors: &[OptionDescriptor], prompt: Ultrathink) -
     (prompt != Ultrathink::None && !primary.prompt_injected_values.is_empty()).then_some(primary)
 }
 
-/// Codex's service tier, which the picker's footer offers as speed segments (`splitSpeed`).
-pub fn speed_select<'a>(descriptors: &'a [OptionDescriptor], driver: &str) -> Option<&'a OptionDescriptor> {
-    descriptors.iter().find(|d| driver == "codex" && d.id == "serviceTier" && d.kind == "select")
+/// Any provider's service tier, which the picker's footer offers as speed segments (`splitSpeed`).
+pub fn speed_select(descriptors: &[OptionDescriptor]) -> Option<&OptionDescriptor> {
+    descriptors.iter().find(|d| d.id == "serviceTier" && d.kind == "select")
 }
 
 /// `buildTraitsTriggerDisplay`'s `speedLabel`: "Fast" or "Ultrafast" while a speed option is on.
-pub fn speed_label(descriptors: &[OptionDescriptor], driver: &str, selection: &ModelSelection) -> Option<&'static str> {
+pub fn speed_label(descriptors: &[OptionDescriptor], selection: &ModelSelection) -> Option<&'static str> {
     if toggle_on(descriptors, "fastMode", selection) {
         return Some("Fast");
     }
-    let tier = speed_select(descriptors, driver)?;
+    let tier = speed_select(descriptors)?;
     let value = current_value(tier, selection)?;
     let labelled = |label: &str| tier.options.iter().find(|o| o.label == label).map(|o| o.id.as_str());
     match value.as_str() {
@@ -287,6 +289,59 @@ pub fn with_option(selection: &ModelSelection, id: &str, value: Value) -> ModelS
         .collect();
     options.push(json!({"id": id, "value": value}));
     ModelSelection { options: Some(options), ..selection.clone() }
+}
+
+/// `withoutPlanAgentOption`: the agent select without the `opencode` Plan agent, which retired with plan
+/// mode; the select goes when nothing is left.
+pub fn without_plan_agent(descriptors: &[OptionDescriptor]) -> Cow<'_, [OptionDescriptor]> {
+    let is_agent = |d: &OptionDescriptor| d.kind == "select" && d.id == "agent";
+    if !descriptors.iter().any(|d| is_agent(d) && d.options.iter().any(|o| o.id == "plan")) {
+        return Cow::Borrowed(descriptors);
+    }
+    let filtered = descriptors.iter().filter_map(|descriptor| {
+        if !is_agent(descriptor) {
+            return Some(descriptor.clone());
+        }
+        let options: Vec<_> = descriptor.options.iter().filter(|o| o.id != "plan").cloned().collect();
+        let survives = |id: &str| options.iter().any(|o| o.id == id);
+        let current = descriptor.current_value.as_ref().and_then(Value::as_str).filter(|id| survives(id));
+        let current =
+            current.or_else(|| options.iter().find(|o| o.is_default).or(options.first()).map(|o| o.id.as_str()));
+        let current_value = current.map(|id| Value::String(id.to_owned()));
+        (!options.is_empty()).then(|| OptionDescriptor { options, current_value, ..descriptor.clone() })
+    });
+    Cow::Owned(filtered.collect())
+}
+
+/// `selectsPlanAgent`: whether `selection` runs the `opencode` Plan agent.
+pub fn selects_plan_agent(selection: &ModelSelection) -> bool {
+    selection.options.iter().flatten().any(is_plan_agent)
+}
+
+fn is_plan_agent(option: &Value) -> bool {
+    option.get("id").and_then(Value::as_str) == Some("agent")
+        && option.get("value").and_then(Value::as_str) == Some("plan")
+}
+
+/// The outgoing selection for `descriptors` from [`without_plan_agent`]: a Plan agent becomes the
+/// select's current agent, or goes when the model offers none (`getComposerProviderState`).
+pub fn without_plan_agent_selection(descriptors: &[OptionDescriptor], selection: ModelSelection) -> ModelSelection {
+    if !selects_plan_agent(&selection) {
+        return selection;
+    }
+    let agent =
+        descriptors.iter().find(|d| d.kind == "select" && d.id == "agent").and_then(|d| d.current_value.clone());
+    let options: Vec<Value> = selection
+        .options
+        .iter()
+        .flatten()
+        .filter_map(|option| match (is_plan_agent(option), &agent) {
+            (false, _) => Some(option.clone()),
+            (true, Some(agent)) => Some(json!({"id": "agent", "value": agent})),
+            (true, None) => None,
+        })
+        .collect();
+    ModelSelection { options: (!options.is_empty()).then_some(options), ..selection }
 }
 
 /// `getDisplayModelName`: the model's full name without its sub-provider prefix.
@@ -327,6 +382,80 @@ pub fn search_score(
             fields.iter().enumerate().filter_map(|(i, f)| token_score(f, token, i64::try_from(i).ok()? * 10)).min()?;
     }
     Some(if favorite { total - 24 } else { total })
+}
+
+/// `COMPOSER_MODEL_MENTION_LIMIT`.
+const MENTION_LIMIT: usize = 8;
+
+/// The provider name a picker or mention shows: its display name, else its instance id.
+pub fn provider_name(provider: &Provider) -> &str {
+    provider.display_name.as_deref().unwrap_or(&provider.instance_id)
+}
+
+/// `rankComposerModelMentions`: the models an `@` query names, best first. Every word must start
+/// a word of the model's names, so fuzzy hits can't push files out of the menu; `:`, `/` and `-`
+/// join words, since a mention has no spaces. A bare or one-letter query names none.
+pub fn rank_mentions<'a>(
+    candidates: &[(&'a Provider, &'a ProviderModel)],
+    query: &str,
+) -> Vec<(&'a Provider, &'a ProviderModel)> {
+    for words in mention_queries(query) {
+        let tokens: Vec<String> = words.to_lowercase().split_whitespace().map(str::to_owned).collect();
+        let mut ranked: Vec<_> = (candidates.iter().enumerate())
+            .filter_map(|(order, &(provider, model))| {
+                let haystack = [
+                    model.name.as_deref().unwrap_or(&model.slug),
+                    model.short_name.as_deref().unwrap_or_default(),
+                    model.sub_provider.as_deref().unwrap_or_default(),
+                    provider.driver.as_str(),
+                    provider_name(provider),
+                ]
+                .join(" ")
+                .to_lowercase();
+                if !tokens.iter().all(|token| starts_a_word(&haystack, token)) {
+                    return None;
+                }
+                let score = search_score(model, &provider.driver, provider_name(provider), false, &words)?;
+                Some((score, order, (provider, model)))
+            })
+            .collect();
+        if !ranked.is_empty() {
+            ranked.sort_by_key(|(score, order, _)| (*score, *order));
+            return ranked.into_iter().take(MENTION_LIMIT).map(|(.., candidate)| candidate).collect();
+        }
+    }
+    Vec::new()
+}
+
+/// `mentionSearchQueries`: the query with `:` and `/` as spaces, then with `-` too.
+fn mention_queries(query: &str) -> Vec<String> {
+    let spaced = collapse_to_spaces(query, &[':', '/']);
+    let unhyphenated = collapse_to_spaces(&spaced, &['-']);
+    if unhyphenated.chars().filter(|c| !c.is_whitespace()).count() < 2 {
+        return Vec::new();
+    }
+    if unhyphenated == spaced { vec![spaced] } else { vec![spaced, unhyphenated] }
+}
+
+/// Each run of `separators` as one space, trimmed.
+fn collapse_to_spaces(text: &str, separators: &[char]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_run = false;
+    for c in text.chars() {
+        let separator = separators.contains(&c);
+        if !separator {
+            out.push(c);
+        } else if !in_run {
+            out.push(' ');
+        }
+        in_run = separator;
+    }
+    out.trim().to_owned()
+}
+
+/// `(?:^|[^\p{L}\p{N}])token`: `token` starts the text or follows a non-alphanumeric.
+fn starts_a_word(haystack: &str, token: &str) -> bool {
+    haystack.match_indices(token).any(|(at, _)| haystack[..at].chars().next_back().is_none_or(|c| !c.is_alphanumeric()))
 }
 
 /// `scoreQueryMatch` with `ignorePosition`.
@@ -410,6 +539,48 @@ mod tests {
     }
 
     #[test]
+    fn mentions_need_every_word_to_start_a_name_word() {
+        let provider = |id: &str, driver: &str, name: &str| -> Provider {
+            serde_json::from_value(json!({"instanceId": id, "driver": driver, "displayName": name})).unwrap()
+        };
+        let named = |slug: &str, name: &str, sub: Option<&str>| -> ProviderModel {
+            serde_json::from_value(json!({"slug": slug, "name": name, "subProvider": sub})).unwrap()
+        };
+        let (traex, opencode, claude) = (
+            provider("traex", "codex", "Traex"),
+            provider("opencode", "opencode", "OpenCode"),
+            provider("claude", "claudeAgent", "Claude"),
+        );
+        let models = [
+            named("gpt", "GPT-6.1", None),
+            named("traex-gpt", "GPT-6.1", Some("Traex")),
+            named("opus", "Claude Opus 5.5", Some("Anthropic")),
+            named("opus", "Claude Opus 5.5", None),
+        ];
+        let candidates =
+            [(&traex, &models[0]), (&opencode, &models[1]), (&opencode, &models[2]), (&claude, &models[3])];
+        let rank = |query: &str| {
+            let mut ids: Vec<String> = rank_mentions(&candidates, query)
+                .into_iter()
+                .map(|(p, m)| format!("{}:{}", p.instance_id, m.slug))
+                .collect();
+            ids.sort();
+            ids
+        };
+        for query in ["", "-", "---", ":/-/:", "g"] {
+            assert_eq!(rank(query), Vec::<String>::new(), "a bare or one-letter @{query}");
+        }
+        assert_eq!(rank("gpt"), ["opencode:traex-gpt", "traex:gpt"], "every provider that serves it");
+        for query in ["opencode:traex", "opencode/gpt", "opencode-gpt"] {
+            assert_eq!(rank(query), ["opencode:traex-gpt"], "{query} joins words");
+        }
+        assert_eq!(rank("gpt-6.1"), ["opencode:traex-gpt", "traex:gpt"], "a hyphenated name stays whole");
+        for query in ["src", "agent", "pus"] {
+            assert_eq!(rank(query), Vec::<String>::new(), "words that only contain @{query}");
+        }
+    }
+
+    #[test]
     fn trigger_names_drop_the_native_family() {
         assert_eq!(trigger_model_name(&model("Claude Opus 5.5"), "claudeAgent"), "Opus 5.5");
         assert_eq!(trigger_model_name(&model("GPT-6.1-Sol"), "codex"), "6.1 Sol");
@@ -451,23 +622,22 @@ mod tests {
     }
 
     #[test]
-    fn codex_service_tiers_are_speeds_and_name_the_fast_ones() {
+    fn service_tiers_are_speeds_and_name_the_fast_ones() {
         let descriptors: Vec<OptionDescriptor> = serde_json::from_value(json!([
             {"id": "serviceTier", "label": "Service Tier", "type": "select", "currentValue": "default", "options": [
-                {"id": "default", "label": "Standard", "isDefault": true},
+                {"id": "default", "label": "Normal", "isDefault": true},
                 {"id": "fast", "label": "Fast"}, {"id": "priority", "label": "Ultrafast"}
             ]}
         ]))
         .unwrap();
-        let selection = ModelSelection { instance_id: "codex".into(), model: "m".into(), options: None };
-        assert!(speed_select(&descriptors, "codex").is_some());
-        assert!(speed_select(&descriptors, "opencode").is_none(), "only Codex's tier is a speed");
-        assert_eq!(speed_label(&descriptors, "codex", &selection), None);
+        // Pi offers the same tiers as Codex, so the tier alone makes the speed control.
+        let selection = ModelSelection { instance_id: "pi".into(), model: "m".into(), options: None };
+        assert!(speed_select(&descriptors).is_some());
+        assert_eq!(speed_label(&descriptors, &selection), None);
         let fast = with_option(&selection, "serviceTier", json!("fast"));
-        assert_eq!(speed_label(&descriptors, "codex", &fast), Some("Fast"));
+        assert_eq!(speed_label(&descriptors, &fast), Some("Fast"));
         let ultra = with_option(&selection, "serviceTier", json!("priority"));
-        assert_eq!(speed_label(&descriptors, "codex", &ultra), Some("Ultrafast"));
-        assert_eq!(speed_label(&descriptors, "opencode", &ultra), None);
+        assert_eq!(speed_label(&descriptors, &ultra), Some("Ultrafast"));
     }
 
     #[test]
@@ -490,5 +660,59 @@ mod tests {
         unset[1].id = "thinking".into();
         unset[1].label = "Thinking".into();
         assert_eq!(effort_label(&unset, &selection).as_deref(), Some("Thinking"), "Pi's thinking names itself");
+    }
+
+    #[test]
+    fn the_plan_agent_leaves_the_agent_select_and_outgoing_selections() {
+        let agent = |current: Option<&str>, options: Value| {
+            let mut descriptor = json!({"id": "agent", "label": "Agent", "type": "select", "options": options});
+            if let Some(current) = current {
+                descriptor["currentValue"] = json!(current);
+            }
+            let effort = json!({"id": "effort", "label": "Effort", "type": "select", "options": [{"id": "low", "label": "Low"}]});
+            serde_json::from_value::<Vec<OptionDescriptor>>(json!([effort, descriptor])).unwrap()
+        };
+        let choice = |id: &str, default: bool| json!({"id": id, "label": id, "isDefault": default});
+        let ids = |descriptor: &OptionDescriptor| descriptor.options.iter().map(|o| o.id.clone()).collect::<Vec<_>>();
+        let filtered = |descriptors: &[OptionDescriptor]| without_plan_agent(descriptors).into_owned();
+
+        let kept = filtered(&agent(Some("build"), json!([choice("plan", false), choice("build", false)])));
+        assert_eq!((ids(&kept[1]), kept[1].current_value.clone()), (vec!["build".into()], Some(json!("build"))));
+        let defaulted =
+            filtered(&agent(Some("plan"), json!([choice("plan", false), choice("x", false), choice("build", true)])));
+        assert_eq!(defaulted[1].current_value, Some(json!("build")), "a Plan current value falls back to the default");
+        let first = filtered(&agent(None, json!([choice("plan", true), choice("x", false), choice("y", false)])));
+        assert_eq!(first[1].current_value, Some(json!("x")), "with no default left, the first agent");
+        let only_plan = filtered(&agent(Some("plan"), json!([choice("plan", true)])));
+        assert_eq!(only_plan.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(), ["effort"], "an empty select goes");
+        let untouched = agent(None, json!([choice("build", true)]));
+        assert!(matches!(without_plan_agent(&untouched), Cow::Borrowed(_)));
+
+        let selection = |options: Value| ModelSelection {
+            instance_id: "opencode".into(),
+            model: "m".into(),
+            options: serde_json::from_value(options).unwrap(),
+        };
+        let plan = selection(json!([{"id": "effort", "value": "low"}, {"id": "agent", "value": "plan"}]));
+        assert!(selects_plan_agent(&plan));
+        assert!(!selects_plan_agent(&selection(json!([{"id": "agent", "value": "build"}]))));
+        assert_eq!(
+            without_plan_agent_selection(&defaulted, plan.clone()),
+            selection(json!([{"id": "effort", "value": "low"}, {"id": "agent", "value": "build"}])),
+            "the stored Plan agent dispatches as the default agent"
+        );
+        assert_eq!(
+            without_plan_agent_selection(&only_plan, plan),
+            selection(json!([{"id": "effort", "value": "low"}])),
+            "with no agent select left, the agent option goes"
+        );
+        let uncatalogued = selection(json!([{"id": "agent", "value": "plan"}]));
+        assert_eq!(
+            without_plan_agent_selection(&[], uncatalogued),
+            selection(json!(null)),
+            "an uncatalogued model drops it too"
+        );
+        let build = selection(json!([{"id": "agent", "value": "build"}]));
+        assert_eq!(without_plan_agent_selection(&[], build.clone()), build);
     }
 }

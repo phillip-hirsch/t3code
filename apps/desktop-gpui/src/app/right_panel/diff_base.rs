@@ -9,10 +9,12 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, AppContext as _, Context, ElementId, Entity, Focusable as _, InteractiveElement as _, IntoElement,
-    KeyDownEvent, ParentElement as _, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _,
-    Subscription, Task, Window, div, px,
+    AnyElement, AppContext as _, Context, ElementId, Entity, FocusHandle, Focusable as _, InteractiveElement as _,
+    IntoElement, KeyDownEvent, ParentElement as _, ScrollHandle, SharedString, StatefulInteractiveElement as _,
+    Styled as _, Subscription, Task, Window, div, px,
 };
+use std::collections::HashMap;
+
 use serde_json::{Value, json};
 
 use super::super::Workspace;
@@ -88,6 +90,12 @@ pub(super) fn matches(choice: &Choice, query: &str) -> bool {
         || choice.remote.as_ref().is_some_and(|r| r.name.to_lowercase().contains(&query))
 }
 
+/// The ref the "Use remote version" switch picks: the remote one unless that is the one picked.
+fn switched(choice: &Choice, selected: Option<&str>) -> Option<String> {
+    let (local, remote) = (choice.local.as_ref()?, choice.remote.as_ref()?);
+    Some(if selected == Some(remote.name.as_str()) { local.name.clone() } else { remote.name.clone() })
+}
+
 /// `valueForBaseRefChoice`: the remote ref when that is the one picked, else the local one.
 pub(super) fn value(choice: &Choice, selected: Option<&str>) -> String {
     match (&choice.remote, &choice.local) {
@@ -110,6 +118,9 @@ fn step_highlight(len: usize, current: Option<usize>, down: bool) -> Option<usiz
     }
 }
 
+/// The checkout a ref list answers: its environment and cwd.
+type RefsSource = (Option<SharedString>, String);
+
 #[derive(Default)]
 pub(in crate::app) struct BasePicker {
     open: bool,
@@ -118,14 +129,30 @@ pub(in crate::app) struct BasePicker {
     highlight: Option<usize>,
     list_scroll: ScrollHandle,
     search: Option<Entity<InputState>>,
+    /// The checkout `local` and `remote` came from; another checkout's refs never show.
+    source: Option<RefsSource>,
     local: Vec<Ref>,
     remote: Vec<Ref>,
     loading: bool,
+    /// Each local-and-remote row's "Use remote version" switch, a Tab stop as the web's `Switch` is.
+    switch_focus: HashMap<String, FocusHandle>,
     _task: Option<Task<()>>,
     _search_changes: Option<Subscription>,
 }
 
+impl BasePicker {
+    /// The refs loaded for `source`'s checkout; none while only another checkout's are loaded.
+    fn refs(&self, source: Option<&RefsSource>) -> (&[Ref], &[Ref]) {
+        if source.is_some() && self.source.as_ref() == source { (&self.local, &self.remote) } else { (&[], &[]) }
+    }
+}
+
 impl Workspace {
+    /// The checkout the picker lists refs of: the active environment and the git cwd.
+    fn base_refs_source(&self) -> Option<RefsSource> {
+        Some((self.active_environment().cloned(), self.git_cwd()?))
+    }
+
     /// The base ref picked for the open thread's branch diff (`selectBranchBaseRef`).
     pub(super) fn diff_base_ref(&self) -> Option<&str> {
         self.right_panel.base_refs.get(self.target.as_ref()?).map(String::as_str)
@@ -171,7 +198,8 @@ impl Workspace {
 
     /// `vcs.listRefs` twice, local and remote, for the query (the head branch is left out).
     fn fetch_base_refs(&mut self, cx: &mut Context<Self>) {
-        let (Some(client), Some(cwd)) = (self.client(), self.git_cwd()) else { return };
+        let (Some(client), Some(source)) = (self.client(), self.base_refs_source()) else { return };
+        let cwd = source.1.clone();
         let query = self.right_panel.base_picker.query.clone();
         let input = |kind: &str| {
             let mut input = json!({"cwd": cwd, "includeMatchingRemoteRefs": true, "refKind": kind, "limit": 100});
@@ -197,7 +225,16 @@ impl Workspace {
             let (local, remote) = (parse(local), parse(remote));
             let _ = this.update(cx, |this, cx| {
                 let picker = &mut this.right_panel.base_picker;
-                (picker.local, picker.remote, picker.loading) = (local, remote, false);
+                let mut focus = std::mem::take(&mut picker.switch_focus);
+                picker.switch_focus = choices(&local, &remote)
+                    .into_iter()
+                    .filter(|choice| choice.local.is_some() && choice.remote.is_some())
+                    .map(|choice| {
+                        let handle = focus.remove(&choice.label).unwrap_or_else(|| cx.focus_handle().tab_stop(true));
+                        (choice.label, handle)
+                    })
+                    .collect();
+                (picker.source, picker.local, picker.remote, picker.loading) = (Some(source), local, remote, false);
                 cx.notify();
             });
         }));
@@ -279,17 +316,30 @@ impl Workspace {
     /// The rows the picker lists for `head`, Automatic (`None`) first while nothing is searched.
     fn base_ref_items(&self, head: &str) -> (bool, Vec<Choice>) {
         let picker = &self.right_panel.base_picker;
-        let local: Vec<Ref> = picker.local.iter().filter(|r| r.name != head).cloned().collect();
-        let shown = choices(&local, &picker.remote).into_iter().filter(|c| matches(c, &picker.query)).collect();
+        let (local, remote) = picker.refs(self.base_refs_source().as_ref());
+        let local: Vec<Ref> = local.iter().filter(|r| r.name != head).cloned().collect();
+        let shown = choices(&local, remote).into_iter().filter(|c| matches(c, &picker.query)).collect();
         (picker.query.is_empty(), shown)
     }
 
-    /// Up and Down move the highlight from the search box, Enter picks the highlighted row.
-    fn base_picker_key(&mut self, head: &str, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+    /// Up and Down move the highlight from the search box, Enter picks the highlighted row; on a
+    /// focused remote switch, Enter and Space flip it instead.
+    fn base_picker_key(&mut self, head: &str, event: &KeyDownEvent, window: &Window, cx: &mut Context<Self>) -> bool {
         if event.keystroke.modifiers.modified() {
             return false;
         }
         let (automatic, shown) = self.base_ref_items(head);
+        let switch_focus = &self.right_panel.base_picker.switch_focus;
+        if let Some(choice) =
+            shown.iter().find(|c| switch_focus.get(&c.label).is_some_and(|handle| handle.is_focused(window)))
+        {
+            if !matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                return false;
+            }
+            let next = switched(choice, self.diff_base_ref());
+            self.select_base_ref(next, cx);
+            return true;
+        }
         let len = usize::from(automatic) + shown.len();
         let picker = &mut self.right_panel.base_picker;
         match event.keystroke.key.as_str() {
@@ -343,7 +393,7 @@ impl Workspace {
         let rows = shown.iter().enumerate().map(|(index, choice)| {
             let value = value(choice, selected.as_deref());
             let checked = selected.as_deref() == Some(value.as_str());
-            let both = choice.local.as_ref().zip(choice.remote.as_ref()).map(|(l, r)| (l.name.clone(), r.name.clone()));
+            let both = switched(choice, selected.as_deref()).zip(picker.switch_focus.get(&choice.label).cloned());
             let use_remote = choice.remote.as_ref().is_some_and(|r| r.name == value);
             let remote_only = choice.local.is_none();
             let pick = value;
@@ -351,17 +401,24 @@ impl Workspace {
                 .child(div().flex_1().min_w_0().truncate().child(choice.label.clone()))
                 .child(div().w(px(32.)).flex_none().flex().justify_end().map(|el| {
                     match both {
-                        Some((local, remote)) => el.child(
+                        Some((next, focus)) => el.child({
+                            let ring = tokens.ring;
                             div()
                                 .id(ElementId::Name(format!("diff-base-remote-{}", choice.label).into()))
+                                .track_focus(&focus)
+                                // The focus ring sits outside the switch, as `ring-offset` does, without moving it.
+                                .m(px(-1.))
+                                .rounded_full()
+                                .border_1()
+                                .border_color(gpui_kit::transparent_black())
+                                .focus_visible(move |s| s.border_color(ring))
                                 .child(switch(use_remote, tokens))
                                 .tooltip(move |window, cx| Tooltip::new("Use remote version").build(window, cx))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
-                                    let next = if use_remote { local.clone() } else { remote.clone() };
-                                    this.select_base_ref(Some(next), cx);
-                                })),
-                        ),
+                                    this.select_base_ref(Some(next.clone()), cx);
+                                }))
+                        }),
                         None if remote_only => el.child(
                             div()
                                 .id(ElementId::Name(format!("diff-base-remote-only-{}", choice.label).into()))
@@ -383,8 +440,8 @@ impl Workspace {
             .id("diff-base-ref-body")
             .w(px(288.))
             .bg(tokens.popover)
-            .capture_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
-                if this.base_picker_key(&key_head, event, cx) {
+            .capture_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                if this.base_picker_key(&key_head, event, window, cx) {
                     cx.stop_propagation();
                 }
             }))
@@ -475,6 +532,9 @@ mod tests {
         assert_eq!(value(&all[0], None), "main");
         assert_eq!(value(&all[0], Some("origin/main")), "origin/main");
         assert_eq!(value(&all[2], None), "upstream/main");
+        assert_eq!(switched(&all[0], None).as_deref(), Some("origin/main"));
+        assert_eq!(switched(&all[0], Some("origin/main")).as_deref(), Some("main"));
+        assert_eq!((switched(&all[1], None), switched(&all[2], None)), (None, None));
         assert!(matches(&all[0], "ORIGIN/m") && !matches(&all[1], "origin"));
     }
 
@@ -486,5 +546,20 @@ mod tests {
         assert_eq!(step_highlight(3, None, false), Some(2));
         assert_eq!(step_highlight(3, Some(0), false), None);
         assert_eq!(step_highlight(0, None, true), None);
+    }
+
+    #[test]
+    fn refs_show_only_for_the_checkout_they_came_from() {
+        let source = |env: &str, cwd: &str| (Some(SharedString::from(env.to_owned())), cwd.to_owned());
+        let picker = BasePicker {
+            source: Some(source("a", "/repo")),
+            local: vec![local("main")],
+            remote: vec![remote("origin/main", "origin")],
+            ..Default::default()
+        };
+        assert_eq!(picker.refs(Some(&source("a", "/repo"))).0, [local("main")]);
+        for other in [Some(source("b", "/repo")), Some(source("a", "/other")), None] {
+            assert_eq!(picker.refs(other.as_ref()), (&[][..], &[][..]));
+        }
     }
 }

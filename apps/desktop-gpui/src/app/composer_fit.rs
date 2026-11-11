@@ -1,5 +1,5 @@
 //! Which footer controls fit beside the model picker (`resolveRestingComposerControlsLayout` for
-//! the composer's one resting block, the permissions chip with the Build/Plan toggle).
+//! the composer's one resting block, the permissions chip).
 
 /// How the mode block shows: labelled, icons only, or folded into the "More composer controls" menu.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

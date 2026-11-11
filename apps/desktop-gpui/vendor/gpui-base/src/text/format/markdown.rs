@@ -7,6 +7,7 @@ use markdown::{
     unist::Point,
 };
 
+use super::details::DetailsGrouper;
 use crate::text::{
     document::ParsedDocument,
     markdown_ext::MarkdownParseContext,
@@ -45,7 +46,7 @@ fn flatten_unclaimed_math(node: &mut Node, source: &str, options: &ParseOptions,
     while ix < children.len() {
         let prose = match &children[ix] {
             Node::InlineMath(_) => {
-                let parse_cx = MarkdownParseContext::new(source, cx.offset);
+                let parse_cx = MarkdownParseContext::new(source, cx.offset, &cx.link_refs);
                 if cx
                     .markdown_extensions
                     .parse_inline(&children[ix], &parse_cx)
@@ -766,6 +767,30 @@ fn append_inline_html_blocks(paragraph: &mut Paragraph, blocks: Vec<BlockNode>) 
     Some(text)
 }
 
+/// The mark a link puts on its text.
+fn link_text_mark(link: &mdast::Link) -> TextMark {
+    TextMark {
+        link: Some(LinkMark {
+            url: link.url.clone().into(),
+            title: link.title.clone().map(|s| s.into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// The mark a link reference puts on its text, resolved through its definition when drawn.
+fn reference_text_mark(link: &mdast::LinkReference) -> TextMark {
+    TextMark {
+        link: Some(LinkMark {
+            url: "".into(),
+            title: link.label.clone().map(Into::into),
+            identifier: Some(link.identifier.clone().into()),
+        }),
+        ..Default::default()
+    }
+}
+
 fn parse_paragraph(
     source: &str,
     paragraph: &mut Paragraph,
@@ -780,8 +805,24 @@ fn parse_paragraph(
         paragraph.set_span(span);
     }
 
-    let parse_cx = MarkdownParseContext::new(source, cx.offset);
+    // The source slice, without holding the definitions the parse context borrows.
+    let node_source = |node: &Node| node.position().and_then(|p| source.get(p.start.offset..p.end.offset));
+    let parse_cx = MarkdownParseContext::new(source, cx.offset, &cx.link_refs);
     if let Some(mut custom) = cx.markdown_extensions.parse_inline(node, &parse_cx) {
+        let led = match node {
+            Node::Link(link) => Some((link_text_mark(link), &link.children)),
+            Node::LinkReference(link) => Some((reference_text_mark(link), &link.children)),
+            _ => None,
+        };
+        if custom.leading
+            && let Some((mark, children)) = led
+        {
+            let mut lead = InlineNode::custom(custom);
+            lead.marks.push((0..lead.text.len(), mark.clone()));
+            paragraph.push(lead);
+            let text = merge_children_with_mark(source, paragraph, children, mark, cx);
+            return text;
+        }
         let label_start = paragraph.children.len();
         let mut text = match node.children() {
             Some(children) if custom.after_children => {
@@ -793,7 +834,7 @@ fn parse_paragraph(
             label.covered = true;
         }
         custom.set_span(span);
-        let custom = custom.with_inline_source(parse_cx.node_source(node).unwrap_or_default());
+        let custom = custom.with_inline_source(node_source(node).unwrap_or_default());
         text.push_str(custom.as_text());
         paragraph.push(InlineNode::custom(custom));
         return text;
@@ -863,22 +904,7 @@ fn parse_paragraph(
             );
         }
         Node::Link(val) => {
-            let link_mark = Some(LinkMark {
-                url: val.url.clone().into(),
-                title: val.title.clone().map(|s| s.into()),
-                ..Default::default()
-            });
-
-            text = merge_children_with_mark(
-                source,
-                paragraph,
-                &val.children,
-                TextMark {
-                    link: link_mark,
-                    ..Default::default()
-                },
-                cx,
-            );
+            text = merge_children_with_mark(source, paragraph, &val.children, link_text_mark(val), cx);
         }
         Node::Image(raw) => {
             paragraph.push_image(ImageNode {
@@ -917,8 +943,7 @@ fn parse_paragraph(
             // `raw.value` would drop the delimiters and restyle the run as
             // code, silently rewriting what the author typed. Fall back to the
             // original source so unclaimed math stays literal.
-            text = parse_cx
-                .node_source(node)
+            text = node_source(node)
                 .map(str::to_string)
                 .unwrap_or_else(|| raw.value.clone());
             paragraph.push(mapped_inline(source, text.clone(), node, cx));
@@ -966,22 +991,8 @@ fn parse_paragraph(
             )]));
         }
         Node::LinkReference(link) => {
-            let link_mark = LinkMark {
-                url: "".into(),
-                title: link.label.clone().map(Into::into),
-                identifier: Some(link.identifier.clone().into()),
-            };
-
-            text = merge_children_with_mark(
-                source,
-                paragraph,
-                &link.children,
-                TextMark {
-                    link: Some(link_mark),
-                    ..Default::default()
-                },
-                cx,
-            );
+            text =
+                merge_children_with_mark(source, paragraph, &link.children, reference_text_mark(link), cx);
         }
         _ => {
             if cfg!(debug_assertions) {
@@ -1024,15 +1035,31 @@ fn ast_to_document(source: &str, root: mdast::Node, cx: &mut NodeContext) -> Par
         _ => panic!("expected root node"),
     };
 
-    let blocks = root
-        .children
-        .into_iter()
-        .map(|c| ast_to_node(source, c, cx))
-        .collect();
+    let blocks = block_children(source, root.children, cx);
     ParsedDocument {
         source: source.to_string().into(),
         blocks: Arc::new(blocks),
     }
+}
+
+/// A container's blocks, with each `<details>` holding the blocks up to its
+/// `</details>` (see [`DetailsGrouper`]).
+fn block_children(source: &str, nodes: Vec<Node>, cx: &mut NodeContext) -> Vec<BlockNode> {
+    let end = nodes
+        .last()
+        .and_then(|node| new_span(node.position().cloned(), cx))
+        .map_or(cx.offset + source.len(), |span| span.end);
+    let mut grouper = DetailsGrouper::default();
+    for node in nodes {
+        if let Node::Html(html) = &node
+            && let Some(span) = new_span(html.position.clone(), cx)
+            && grouper.html(&html.value, span.start, cx)
+        {
+            continue;
+        }
+        grouper.push(ast_to_node(source, node, cx));
+    }
+    grouper.finish(end)
 }
 
 fn new_span(pos: Option<markdown::unist::Position>, cx: &NodeContext) -> Option<Span> {
@@ -1046,7 +1073,7 @@ fn new_span(pos: Option<markdown::unist::Position>, cx: &NodeContext) -> Option<
 
 fn ast_to_node(source: &str, value: mdast::Node, cx: &mut NodeContext) -> BlockNode {
     let span = new_span(value.position().cloned(), cx);
-    let parse_cx = MarkdownParseContext::new(source, cx.offset);
+    let parse_cx = MarkdownParseContext::new(source, cx.offset, &cx.link_refs);
     if let Some(mut node) = cx.markdown_extensions.parse_block(&value, &parse_cx) {
         node.set_span(span);
         return BlockNode::Custom {
@@ -1064,11 +1091,7 @@ fn ast_to_node(source: &str, value: mdast::Node, cx: &mut NodeContext) -> BlockN
             BlockNode::Paragraph(paragraph)
         }
         Node::Blockquote(val) => {
-            let children = val
-                .children
-                .into_iter()
-                .map(|c| ast_to_node(source, c, cx))
-                .collect();
+            let children = block_children(source, val.children, cx);
             BlockNode::Blockquote {
                 children,
                 span: new_span(val.position, cx),
@@ -1097,11 +1120,7 @@ fn ast_to_node(source: &str, value: mdast::Node, cx: &mut NodeContext) -> BlockN
             }
         }
         Node::ListItem(val) => {
-            let children = val
-                .children
-                .into_iter()
-                .map(|c| ast_to_node(source, c, cx))
-                .collect();
+            let children = block_children(source, val.children, cx);
             BlockNode::ListItem {
                 children,
                 spread: val.spread,
@@ -2527,6 +2546,77 @@ mod tests {
     }
 
     #[test]
+    fn a_leading_object_opens_the_link_whose_text_follows_it() {
+        let extensions = MarkdownExtensions::default().plugin(
+            crate::text::markdown_ext::TestInlinePlugin::new("test").parse_with(|node, _| {
+                match node {
+                    Node::Link(link) if link.url.starts_with("https:") => {
+                        Some(MarkdownNode::new("icon", ()).leading())
+                    }
+                    Node::LinkReference(_) => Some(MarkdownNode::new("icon", ()).leading()),
+                    _ => None,
+                }
+            }),
+        );
+        let mut cx = NodeContext {
+            markdown_extensions: extensions.into(),
+            ..Default::default()
+        };
+        let source = "See *[the **docs**](https://a.dev)* and <https://b.dev>";
+        let document = parse(source, &mut cx).unwrap();
+        let BlockNode::Paragraph(paragraph) = &document.blocks[0] else {
+            panic!()
+        };
+        let runs: Vec<_> = paragraph
+            .children
+            .iter()
+            .map(|node| {
+                let link = node
+                    .marks
+                    .iter()
+                    .find_map(|(_, mark)| mark.link.as_ref().map(|link| link.url.to_string()));
+                (node.text.as_str(), node.custom.is_some(), link)
+            })
+            .collect();
+        let a = Some("https://a.dev".to_owned());
+        let b = Some("https://b.dev".to_owned());
+        assert_eq!(
+            runs,
+            [
+                ("See ", false, None),
+                ("", true, a.clone()),
+                ("the docs", false, a),
+                (" and ", false, None),
+                ("", true, b.clone()),
+                ("https://b.dev", false, b),
+            ]
+        );
+        assert_eq!(bold_runs(paragraph), ["docs"]);
+        // The object adds no text, and copying writes each link once.
+        assert_eq!(document.text(), "See the docs and https://b.dev\n");
+        // A reference's object leads its text and opens its definition once drawn.
+        let document = parse("[the docs][a]\n\n[a]: https://a.dev", &mut cx).unwrap();
+        let BlockNode::Paragraph(paragraph) = &document.blocks[0] else {
+            panic!()
+        };
+        let references: Vec<_> = paragraph
+            .children
+            .iter()
+            .map(|node| {
+                let link = node.marks.iter().find_map(|(_, mark)| mark.link.as_ref());
+                let identifier = link.and_then(|link| link.identifier.as_deref());
+                (node.text.as_str(), node.custom.is_some(), identifier)
+            })
+            .collect();
+        assert_eq!(references, [("", true, Some("a")), ("the docs", false, Some("a"))]);
+        let document = parse("See [docs](https://a.dev) and <https://b.dev>", &mut cx).unwrap();
+        assert_eq!(
+            document.to_markdown(),
+            "See [docs](https://a.dev) and [https://b.dev](https://b.dev)"
+        );
+    }
+
+    #[test]
     fn block_math_parses_as_a_block_and_falls_back_to_a_code_block() {
         // `$$` is a block fence. With only the inline construct enabled it was
         // swallowed as one long inline formula, so a block plugin matching
@@ -2812,5 +2902,88 @@ mod tests {
                 symbol: "TSLA.US".to_string()
             })
         );
+    }
+
+    /// A disclosure's summary text, `open` attribute and child blocks.
+    fn details(block: &BlockNode) -> (String, bool, &[BlockNode], Span) {
+        let BlockNode::Details {
+            summary,
+            children,
+            open,
+            span,
+        } = block
+        else {
+            panic!("expected a disclosure, got {block:?}");
+        };
+        (summary.text(), *open, children, span.expect("a span"))
+    }
+
+    #[test]
+    fn details_tags_hold_the_markdown_blocks_between_them() {
+        let source = "Intro\n\n<details>\n<summary>More <b>info</b></summary>\n\nInner **bold**\n\n- item\n\n</details>\n\nAfter";
+        let mut cx = NodeContext::default();
+        let document = parse(source, &mut cx).unwrap();
+        assert_eq!(document.blocks.len(), 3);
+        let (summary, open, children, span) = details(&document.blocks[1]);
+        assert_eq!(summary, "More info");
+        assert!(!open);
+        assert!(matches!(&children[0], BlockNode::Paragraph(p) if p.text() == "Inner bold"));
+        assert!(matches!(&children[1], BlockNode::List { .. }));
+        assert_eq!(
+            &source[span.start..span.end],
+            &source[source.find("<details>").unwrap()..source.find("\n\nAfter").unwrap()]
+        );
+        let BlockNode::Details { summary, .. } = &document.blocks[1] else {
+            unreachable!()
+        };
+        let summary_span = summary.span.unwrap();
+        assert!(source[summary_span.start..summary_span.end].starts_with("<summary>"));
+        assert_eq!(
+            document.text(),
+            "Intro\nMore info\nInner bold\nitem\n\nAfter\n"
+        );
+    }
+
+    #[test]
+    fn details_nest_close_and_open_within_one_html_block() {
+        let source = "<details open><summary>A</summary>\n\na\n\n<details><summary>B</summary>\n\nb\n\n</details>\n</details>\n<details>\n\nc";
+        let mut cx = NodeContext::default();
+        let document = parse(source, &mut cx).unwrap();
+        assert_eq!(document.blocks.len(), 2);
+        let (summary, open, children, _) = details(&document.blocks[0]);
+        assert_eq!((summary.as_str(), open, children.len()), ("A", true, 2));
+        let (inner, inner_open, inner_children, _) = details(&children[1]);
+        assert_eq!((inner.as_str(), inner_open, inner_children.len()), ("B", false, 1));
+        // Never closed: it holds the rest, under the browser's default label.
+        let (summary, open, children, span) = details(&document.blocks[1]);
+        assert_eq!((summary.as_str(), open), ("Details", false));
+        assert!(matches!(&children[..], [BlockNode::Paragraph(p)] if p.text() == "c"));
+        assert_eq!(span.end, source.len());
+    }
+
+    #[test]
+    fn a_details_element_in_one_html_block_is_a_disclosure() {
+        let mut cx = NodeContext::default();
+        let document =
+            parse("<details><summary>S</summary><p>body</p></details>", &mut cx).unwrap();
+        let (summary, _, children, _) = details(&document.blocks[0]);
+        assert_eq!(summary, "S");
+        assert_eq!(
+            children.iter().map(BlockNode::text).collect::<String>().trim(),
+            "body"
+        );
+    }
+
+    #[test]
+    fn a_summary_in_its_own_html_block_still_labels_the_disclosure() {
+        let mut cx = NodeContext::default();
+        let document = parse(
+            "<details>\n\n<summary>Late</summary>\n\nbody\n\n</details>",
+            &mut cx,
+        )
+        .unwrap();
+        let (summary, _, children, _) = details(&document.blocks[0]);
+        assert_eq!(summary, "Late");
+        assert_eq!(children.len(), 1);
     }
 }

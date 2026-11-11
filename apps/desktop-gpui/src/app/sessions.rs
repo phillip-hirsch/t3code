@@ -1,11 +1,13 @@
 //! One session per connected environment (the web's per-environment runtime): its socket,
-//! server config and shell subscription. The workspace's own server is the primary session;
-//! each enabled saved environment adds one on the socket `SavedEnvironments` keeps open.
+//! server config and shell subscription. The workspace's own server is the primary session
+//! (none while the local environment is off); each enabled saved environment adds one on the
+//! socket `SavedEnvironments` keeps open.
 //! Every environment's projects and threads land in the one merged `Workspace::shell`.
 //!
 //! `client()`, `server_info()` and `endpoint()` resolve the open target's environment, so code
 //! about the open thread or draft needs no environment of its own; code acting on a listed
-//! thread or project resolves that item's environment (`thread_client`, `project_client`).
+//! thread or project passes that item's environment (`env_client`): ids repeat across
+//! environments, so there is no lookup by a bare thread or project id.
 
 use std::mem;
 
@@ -16,14 +18,17 @@ use super::pages::settings::{SessionLoad, check_session, operates_terminals};
 use super::{Target, Workspace};
 use crate::backend::Endpoint;
 use crate::device::DeviceState;
-use crate::environments::Presented;
-use crate::model::ServerInfo;
+use crate::environments::{ConnectionState, Phase, Presented};
+use crate::model::{ScopedId, ServerInfo};
 use crate::project_groups::ScratchRoot;
 use crate::rpc::RpcClient;
 use crate::theme::Tokens;
 
-/// The primary session's index in `Workspace::sessions`; it is always there.
+/// The primary session's index in `Workspace::sessions`; it is always there, without an id
+/// while the local environment is off.
 const PRIMARY: usize = 0;
+/// How long a first connection's shell waits for the config before subscribing without it.
+const SHELL_CONFIG_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 #[derive(Default)]
 pub(super) struct EnvironmentSession {
@@ -41,6 +46,9 @@ pub(super) struct EnvironmentSession {
     /// See `OpenThread::snapshot_failed` / `OpenThread::retried`.
     shell_snapshot_failed: bool,
     shell_retried: bool,
+    /// The shell subscription waits for this connection's first config, which says whether it
+    /// may leave older settled threads out.
+    shell_waits_for_config: bool,
     /// Config, terminal, preview and device streams, and the session's grants.
     _streams: Vec<Task<()>>,
     _shell: Option<Task<()>>,
@@ -76,6 +84,14 @@ impl Target {
     pub(super) fn environment(&self) -> &SharedString {
         match self {
             Target::Thread { env, .. } | Target::Draft { env, .. } => env,
+        }
+    }
+
+    /// The open thread's id on its environment.
+    pub(super) fn thread_key(&self) -> Option<ScopedId> {
+        match self {
+            Target::Thread { env, id } => Some(ScopedId::new(env.clone(), id.clone())),
+            Target::Draft { .. } => None,
         }
     }
 }
@@ -114,6 +130,17 @@ impl Workspace {
         self.session(environment_id).is_some_and(|s| s.grants.grants(scope))
     }
 
+    /// This client's session check on the environment, rechecked on each connection.
+    pub(super) fn env_auth(&self, environment_id: &str) -> Option<&SessionLoad> {
+        Some(&self.session(environment_id)?.grants)
+    }
+
+    /// `permissionAtom`: whether a control that sends `method` with `payload` to the environment
+    /// may be used. Its socket refuses the request otherwise.
+    pub(super) fn env_permits(&self, environment_id: &str, method: &str, payload: &Value) -> bool {
+        self.session(environment_id).is_some_and(|s| s.grants.permits(method, payload))
+    }
+
     /// `env_grants`, or `None` while the session check is pending or failing.
     pub(super) fn env_grant(&self, environment_id: &str, scope: &str) -> Option<bool> {
         Some(self.session(environment_id)?.grants.session()?.grants(scope))
@@ -126,7 +153,7 @@ impl Workspace {
 
     /// The open target lives on the primary environment (or nothing is open).
     pub(super) fn target_on_primary(&self) -> bool {
-        self.active_index() == PRIMARY
+        self.active_index() == Some(PRIMARY)
     }
 
     /// The footer status of the saved environment the open target lives on, read as the
@@ -146,18 +173,19 @@ impl Workspace {
         }
     }
 
-    /// The open target's session's index, so callers can borrow it beside other fields.
-    pub(super) fn active_index(&self) -> usize {
-        self.target.as_ref().and_then(|t| self.session_index(t.environment())).unwrap_or(PRIMARY)
+    /// The open target's session's index, so callers can borrow it beside other fields; `None`
+    /// once the target's environment is gone. See [`target_session_index`].
+    pub(super) fn active_index(&self) -> Option<usize> {
+        target_session_index(&self.sessions, self.target.as_ref().map(|t| t.environment().as_ref()))
     }
 
-    fn active_env_session(&self) -> &EnvironmentSession {
-        &self.sessions[self.active_index()]
+    fn active_env_session(&self) -> Option<&EnvironmentSession> {
+        Some(&self.sessions[self.active_index()?])
     }
 
-    /// The open target's environment's server config.
+    /// The open target's environment's server config, or an empty one once that environment is gone.
     pub(super) fn server_info(&self) -> &ServerInfo {
-        &self.active_env_session().server_info
+        self.active_env_session().map_or(&self.unscoped_server_info, |session| &session.server_info)
     }
 
     /// One environment's config, to apply what it saved.
@@ -175,6 +203,11 @@ impl Workspace {
         self.settings_session()?.device_state.as_ref()
     }
 
+    /// One environment's device state, `None` until its stream's first state arrives.
+    pub(super) fn env_device_state(&self, environment_id: &str) -> Option<&DeviceState> {
+        self.session(environment_id)?.device_state.as_ref()
+    }
+
     pub(super) fn set_device_state(&mut self, environment_id: &str, state: DeviceState) {
         if let Some(session) = self.session_mut(environment_id) {
             session.device_state = Some(state);
@@ -188,31 +221,11 @@ impl Workspace {
 
     /// The open target's environment's socket.
     pub(super) fn client(&self) -> Option<RpcClient> {
-        self.active_env_session().client.clone()
+        self.active_env_session()?.client.clone()
     }
 
     pub(super) fn env_client(&self, environment_id: &str) -> Option<RpcClient> {
         self.session(environment_id)?.client.clone()
-    }
-
-    /// The environment of a listed thread, else the open target's.
-    pub(super) fn thread_environment(&self, thread_id: &str) -> Option<SharedString> {
-        self.shell.thread_environment(thread_id).or_else(|| self.active_environment()).cloned()
-    }
-
-    /// The environment of a listed project, else the open target's.
-    pub(super) fn project_environment(&self, project_id: &str) -> Option<SharedString> {
-        self.shell.project_environment(project_id).or_else(|| self.active_environment()).cloned()
-    }
-
-    /// The socket of the environment a listed thread lives on.
-    pub(super) fn thread_client(&self, thread_id: &str) -> Option<RpcClient> {
-        self.env_client(&self.thread_environment(thread_id)?)
-    }
-
-    /// The socket of the environment a listed project lives on.
-    pub(super) fn project_client(&self, project_id: &str) -> Option<RpcClient> {
-        self.env_client(&self.project_environment(project_id)?)
     }
 
     /// One environment's address, for its HTTP routes.
@@ -220,25 +233,14 @@ impl Workspace {
         self.session(environment_id)?.endpoint.as_ref()
     }
 
-    /// The address of the environment a listed project lives on.
-    pub(super) fn project_endpoint(&self, project_id: &str) -> Option<&Endpoint> {
-        self.env_endpoint(&self.project_environment(project_id)?)
-    }
-
-    /// The socket for an orchestration command: its thread's environment, else its project's.
-    pub(super) fn command_client(&self, command: &Value) -> Option<RpcClient> {
-        if let Some(thread_id) = command.get("threadId").and_then(Value::as_str) {
-            return self.thread_client(thread_id);
-        }
-        match command.get("projectId").and_then(Value::as_str) {
-            Some(project_id) => self.project_client(project_id),
-            None => self.client(),
-        }
+    /// The socket and address `environment_id` has now.
+    pub(super) fn env_connection(&self, environment_id: &str) -> Option<(RpcClient, Endpoint)> {
+        Some((self.env_client(environment_id)?, self.env_endpoint(environment_id)?.clone()))
     }
 
     /// The open target's environment's address, for its HTTP routes (`/api/auth/*`).
     pub(super) fn endpoint(&self) -> Option<&Endpoint> {
-        self.active_env_session().endpoint.as_ref()
+        self.active_env_session()?.endpoint.as_ref()
     }
 
     /// The connected server's HTTP origin, for its routes and signed asset URLs.
@@ -251,10 +253,18 @@ impl Workspace {
         let primary = self.primary_environment() == Some(&environment_id);
         let Some(session) = self.session_mut(&environment_id) else { return };
         let Some(client) = session.client.clone() else { return };
+        // A new socket starts from the last answer, as the web keeps a refreshing grant.
+        client.set_grants(session.grants.rpc_grants());
         session.shell_retried = false;
+        // A reconnect keeps the last config; only a first connection waits for one.
+        let config_known = !session.server_info.config.is_null();
+        session.shell_waits_for_config = !config_known;
         self.resume_file_saves(&environment_id, cx);
-        let config = client.stream("subscribeServerConfig", json!({"workspaceSnapshotsOnDemand": true}));
+        self.retry_failed_embeds(&environment_id, window, cx);
+        let config = client
+            .stream("subscribeServerConfig", json!({"workspaceSnapshotsOnDemand": true, "environmentThemes": true}));
         let id = environment_id.clone();
+        let config_id = environment_id.clone();
         let config_task = Self::pump(
             config,
             window,
@@ -270,10 +280,19 @@ impl Workspace {
                 }
             },
             move |this, window, cx| {
+                // Whether it answers checks may have changed.
+                this.publish_pull_request_routing(cx);
+                if let Some(session) = this.session_mut(&config_id)
+                    && mem::take(&mut session.shell_waits_for_config)
+                {
+                    this.subscribe_shell(config_id.clone(), window, cx);
+                }
                 if primary {
                     this.sync_keymap(cx);
                     this.show_reload_toast(window, cx);
                     this.check_chatgpt_welcome(window, cx);
+                    // The first-run gate waits on the primary's config too.
+                    this.land(window, cx);
                 }
                 // Its thread tag filter may have changed.
                 this.retract_hidden_alerts(window, cx);
@@ -282,6 +301,8 @@ impl Workspace {
                 this.notify_sidebar(cx);
                 // Skills arrive with provider updates.
                 this.refresh_menu_items(cx);
+                this.sync_theme_feed(window, cx);
+                this.chip_lists_changed(cx);
             },
         );
         let mut streams = vec![
@@ -289,16 +310,28 @@ impl Workspace {
             self.subscribe_terminal_metadata(environment_id.clone(), &client, window, cx),
             self.subscribe_previews(&environment_id, &client, window, cx),
             self.subscribe_device_state(environment_id.clone(), &client, window, cx),
+            self.subscribe_project_clones(environment_id.clone(), &client, window, cx),
         ];
+        if !config_known {
+            streams.push(self.subscribe_shell_without_config(environment_id.clone(), window, cx));
+        }
+        if primary {
+            streams.push(self.subscribe_lifecycle(&client, window, cx));
+        }
         if let Some(endpoint) = self.session(&environment_id).and_then(|s| s.endpoint.clone()) {
             let id = environment_id.clone();
             streams.push(check_session(endpoint, cx, move |this, grants, cx| {
                 let before = this.env_grant(&id, super::git::SOURCE_CONTROL_WRITE);
                 if let Some(session) = this.session_mut(&id) {
+                    if let Some(client) = &session.client {
+                        client.set_grants(grants.rpc_grants());
+                    }
                     session.grants = grants;
                 }
                 this.apply_pr_write_grant(&id, before, cx);
+                this.drop_unoperable_renames();
                 this.notify_sidebar(cx);
+                cx.notify();
             }));
         }
         let Some(session) = self.session_mut(&environment_id) else { return };
@@ -311,8 +344,31 @@ impl Workspace {
             self.sync_worktree_setup(cx);
             self.sync_details(cx);
         }
-        self.subscribe_shell(environment_id, window, cx);
+        if config_known {
+            self.subscribe_shell(environment_id, window, cx);
+        }
         self.sync_pull_request_refreshes(cx);
+        self.rerun_searches_on_reconnect(cx);
+    }
+
+    /// A config that never comes must not keep the thread list away: the shell subscribes
+    /// without it after a while, keeping every settled thread.
+    fn subscribe_shell_without_config(
+        &mut self,
+        environment_id: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(SHELL_CONFIG_WAIT).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if let Some(session) = this.session_mut(&environment_id)
+                    && mem::take(&mut session.shell_waits_for_config)
+                {
+                    this.subscribe_shell(environment_id, window, cx);
+                }
+            });
+        })
     }
 
     /// Ends the open target's own streams (thread, worktree setup, tool output, side chat)
@@ -324,13 +380,22 @@ impl Workspace {
         self.setup.disconnect();
         self.details = super::inspector::Details::default();
         self.side_chat.disconnect();
+        self.prompt_suggestions.disconnect();
     }
 
     fn subscribe_shell(&mut self, environment_id: SharedString, window: &mut Window, cx: &mut Context<Self>) {
         let Some(client) = self.env_client(&environment_id) else { return };
         let mut input = json!({"requestCompletionMarker": true});
+        // Older settled threads load on demand (the Settled shelf's pages, search, families).
+        let omit_older_settled = self
+            .session(&environment_id)
+            .is_some_and(|s| s.server_info.config.get("shellOlderSettled").and_then(Value::as_bool) == Some(true));
+        if omit_older_settled {
+            input["omitOlderSettled"] = true.into();
+        }
         let sequence = self.shell.sequence(&environment_id);
-        if sequence > 0 {
+        // Rows held under other omissions would resume incomplete or stale, so they reload.
+        if sequence > 0 && self.shell.older_settled(&environment_id).is_some() == omit_older_settled {
             input["afterSequence"] = sequence.into();
         }
         let stream = client.stream("orchestration.subscribeShell", input);
@@ -362,6 +427,7 @@ impl Workspace {
                 } else if sequence > 0 {
                     session.shell_retried = false;
                 }
+                this.verify_restored_drafts(cx);
                 this.land(window, cx);
                 this.open_pending_links(window, cx);
                 this.keep_running_threads(cx);
@@ -371,7 +437,10 @@ impl Workspace {
                 this.track_visit(cx);
                 this.sync_now(cx);
                 this.sync_child_approvals(cx);
+                this.sync_draft_workspace(cx);
                 this.sync_lineage_titles(cx);
+                this.sync_older_settled_counts(&batch_id, cx);
+                this.rerun_message_searches(cx);
             },
         );
         if let Some(session) = self.session_mut(&environment_id) {
@@ -390,10 +459,10 @@ impl Workspace {
                 continue;
             }
             let id: SharedString = environment.environment_id.clone().into();
-            let socket =
-                saved.session(&environment.environment_id).and_then(|s| Some((s.client.clone()?, s.generation)));
+            let session = saved.session(&environment.environment_id);
+            let socket = session.and_then(|s| Some((s.client.clone()?, s.generation)));
             listed.push(id.clone());
-            connections.push((id, socket, environment.endpoint()));
+            connections.push((id, socket, session.and_then(|s| s.endpoint.clone())));
         }
         let mut started = Vec::new();
         let mut closed = false;
@@ -443,7 +512,12 @@ impl Workspace {
         if !removed.is_empty() {
             self.retract_hidden_alerts(window, cx);
             self.notify_sidebar(cx);
+            self.sync_theme_feed(window, cx);
         }
+        // Connections and grants both change here.
+        self.publish_pull_request_routing(cx);
+        // A launch that waited on the paired computers decides now.
+        self.land(window, cx);
         cx.notify();
     }
 
@@ -459,10 +533,11 @@ impl Workspace {
         }
         self.saved_environments.update(cx, |saved, cx| saved.set_primary(&environment_id, cx));
         self.sessions[PRIMARY].id = Some(environment_id);
+        self.publish_pull_request_routing(cx);
     }
 
     /// The primary session's socket opened or closed.
-    pub(super) fn set_primary_connection(&mut self, client: Option<RpcClient>, endpoint: Option<Endpoint>) {
+    pub(super) fn set_primary_connection(&mut self, client: Option<RpcClient>, endpoint: Option<Endpoint>, cx: &App) {
         let session = &mut self.sessions[PRIMARY];
         match client {
             Some(client) => {
@@ -471,6 +546,7 @@ impl Workspace {
             }
             None => session.disconnect(),
         }
+        self.publish_pull_request_routing(cx);
     }
 
     /// Each connected environment's "No project" workspace, for project grouping.
@@ -495,10 +571,21 @@ impl Workspace {
         scratch_environment_of(&self.sessions, fallback)
     }
 
-    /// `allEnvironmentShellsBootstrappedAtom`: every environment has its shell snapshot or is
-    /// offline; the primary counts only once its id is known.
-    pub(super) fn shells_bootstrapped(&self) -> bool {
-        self.sessions.iter().all(|s| s.id.as_deref().is_some_and(|id| self.shell.has_snapshot(id) || !s.is_connected()))
+    /// `allEnvironmentShellsBootstrappedAtom`: the saved environments are read and every
+    /// environment has its shell snapshot or is offline; the primary counts only once its id is
+    /// known, and not at all while the local environment is off.
+    pub(super) fn shells_bootstrapped(&self, cx: &App) -> bool {
+        let saved = self.saved_environments.read(cx);
+        let primary = &self.sessions[PRIMARY];
+        let primary_settled = matches!(self.connection, super::Connection::Off)
+            || primary.id.as_deref().is_some_and(|id| self.shell.has_snapshot(id) || !primary.is_connected());
+        let saved_settled = |session: &EnvironmentSession| {
+            session.id.as_deref().is_some_and(|id| {
+                let state = saved.session(id).map(|s| &s.state);
+                saved_shell_settled(self.shell.has_snapshot(id), state.unwrap_or(&ConnectionState::default()))
+            })
+        };
+        !saved.loading() && primary_settled && self.sessions[PRIMARY + 1..].iter().all(saved_settled)
     }
 
     /// [`Self::scratch_roots`] equals `cached`, compared without collecting them.
@@ -518,14 +605,23 @@ impl Workspace {
         }
     }
 
-    /// A project's draft as a target, on the project's environment.
-    pub(super) fn draft_target(&self, project_id: &str) -> Option<Target> {
-        Some(Target::Draft { env: self.project_environment(project_id)?, project_id: project_id.to_owned() })
+    /// Whether `key` is the open thread, on its environment.
+    pub(super) fn is_open_thread(&self, key: &ScopedId) -> bool {
+        matches!(&self.target, Some(Target::Thread { env, id }) if *env == key.env && *id == key.id)
     }
 
-    /// A listed thread as a target, on its environment.
-    pub(super) fn thread_target(&self, thread_id: &str) -> Option<Target> {
-        Some(Target::Thread { env: self.thread_environment(thread_id)?, id: thread_id.to_owned() })
+    /// A removed project's drafts go with it, the open one too.
+    pub(super) fn forget_scoped_project_drafts(&mut self, project: &ScopedId, cx: &mut Context<Self>) {
+        let of_project = |target: &Target| match target {
+            Target::Draft { env, project_id, .. } => *env == project.env && *project_id == project.id,
+            Target::Thread { .. } => false,
+        };
+        self.composer_drafts.retain(|target, _| !of_project(target));
+        if self.target.as_ref().is_some_and(of_project) {
+            self.target = None;
+        }
+        self.drafts.forget_project(project);
+        self.drafts_changed(cx);
     }
 
     /// The session a settings page reads and its environment-wide controls act on: the
@@ -547,7 +643,7 @@ impl Workspace {
 
     /// Sharing & access shows the primary, the one server this app may have started.
     pub(super) fn access_is_primary(&self) -> bool {
-        self.access_session_index() == PRIMARY
+        !matches!(self.connection, super::Connection::Off) && self.access_session_index() == PRIMARY
     }
 
     /// The scope's server config, or an empty one (the contract's defaults, no providers)
@@ -569,11 +665,44 @@ impl Workspace {
     pub(super) fn settings_environment(&self) -> Option<SharedString> {
         self.settings_session()?.id.clone()
     }
+
+    /// This client's session on the environment Settings reads, rechecked on each connection.
+    pub(super) fn settings_auth(&self) -> Option<&SessionLoad> {
+        Some(&self.settings_session()?.grants)
+    }
 }
 
-/// `resolveAccessEnvironmentId`: the picked environment while it is listed, else the primary.
-fn access_session_index(sessions: &[EnvironmentSession], selected: Option<&str>) -> usize {
-    selected.and_then(|id| sessions.iter().position(|session| session.is(id))).unwrap_or(PRIMARY)
+/// The open target's session: its environment's, none once that one is gone (never another
+/// environment's same-id thread); the primary only when nothing is open.
+fn target_session_index(sessions: &[EnvironmentSession], target: Option<&str>) -> Option<usize> {
+    match target {
+        None => Some(PRIMARY),
+        Some(environment) => sessions.iter().position(|session| session.is(environment)),
+    }
+}
+
+/// `resolveAccessEnvironmentId`: the picked environment while it is listed, else the primary,
+/// else (the local environment off) the first connected saved one, else the first.
+pub(super) fn access_session_index(sessions: &[EnvironmentSession], selected: Option<&str>) -> usize {
+    let listed = |id: &str| sessions.iter().position(|session| session.is(id));
+    let saved = || sessions.iter().enumerate().skip(PRIMARY + 1);
+    selected
+        .and_then(listed)
+        .or_else(|| sessions[PRIMARY].id.as_ref().map(|_| PRIMARY))
+        .or_else(|| saved().find(|(_, session)| session.is_connected()).map(|(index, _)| index))
+        .or_else(|| saved().next().map(|(index, _)| index))
+        .unwrap_or(PRIMARY)
+}
+
+/// `allEnvironmentShellsBootstrappedAtom` for one saved environment: it has its snapshot, or is
+/// disconnected and past the first retries, which may still bring it in.
+fn saved_shell_settled(has_snapshot: bool, state: &ConnectionState) -> bool {
+    has_snapshot
+        || match state.phase {
+            Phase::Connecting | Phase::Connected => false,
+            Phase::Backoff => state.attempt > 2,
+            Phase::Available | Phase::Blocked => true,
+        }
 }
 
 /// Device pages read the primary; every other page reads only `scoped`'s session.
@@ -638,6 +767,15 @@ mod tests {
     }
 
     #[test]
+    fn a_target_whose_session_left_resolves_to_no_session() {
+        let sessions = [EnvironmentSession::saved("primary".into()), EnvironmentSession::saved("remote".into())];
+        assert_eq!(target_session_index(&sessions, None), Some(PRIMARY));
+        assert_eq!(target_session_index(&sessions, Some("remote")), Some(1));
+        assert_eq!(target_session_index(&sessions, Some("primary")), Some(PRIMARY));
+        assert_eq!(target_session_index(&sessions, Some("removed")), None);
+    }
+
+    #[test]
     fn scoped_settings_never_fall_back_to_the_primary() {
         let sessions = [EnvironmentSession::saved("primary".into()), EnvironmentSession::saved("remote".into())];
         assert_eq!(settings_session_index(&sessions, false, Some("remote")), Some(1));
@@ -649,5 +787,28 @@ mod tests {
         assert_eq!(access_session_index(&sessions, Some("remote")), 1);
         assert_eq!(access_session_index(&sessions, Some("removed")), PRIMARY);
         assert_eq!(access_session_index(&sessions, None), PRIMARY);
+
+        // With the local environment off there is no primary: the first connected machine, else the first.
+        let connected = |id: &str| EnvironmentSession {
+            client: Some(RpcClient::unopened()),
+            ..EnvironmentSession::saved(id.into())
+        };
+        let sessions = [EnvironmentSession::default(), EnvironmentSession::saved("a".into()), connected("b")];
+        assert_eq!(access_session_index(&sessions, None), 2);
+        assert_eq!(access_session_index(&sessions, Some("a")), 1);
+        assert_eq!(access_session_index(&sessions[..2], None), 1);
+        assert_eq!(access_session_index(&sessions[..1], None), PRIMARY);
+    }
+
+    #[test]
+    fn a_saved_shell_settles_once_it_has_a_snapshot_or_is_offline_past_its_first_retries() {
+        let state = |phase, attempt| ConnectionState { phase, attempt, ..ConnectionState::default() };
+        assert!(saved_shell_settled(true, &state(Phase::Connecting, 0)));
+        assert!(!saved_shell_settled(false, &state(Phase::Connecting, 0)), "still connecting");
+        assert!(!saved_shell_settled(false, &state(Phase::Connected, 1)), "connected, snapshot pending");
+        assert!(!saved_shell_settled(false, &state(Phase::Backoff, 2)), "an early retry may still connect");
+        assert!(saved_shell_settled(false, &state(Phase::Backoff, 3)));
+        assert!(saved_shell_settled(false, &state(Phase::Blocked, 1)));
+        assert!(saved_shell_settled(false, &state(Phase::Available, 0)));
     }
 }

@@ -213,6 +213,47 @@ pub fn parse_stored_list(value: &Value) -> Vec<ThemeDefinition> {
     themes
 }
 
+/// `publishedThemeDefinitions`: the palettes an environment publishes (`EnvironmentTheme[]`)
+/// that this client can render. Reserved ids are dropped rather than rendered: a published
+/// `t3-iris` would show its palette on the card while Use resolved the built-in.
+pub fn published_definitions(themes: &Value) -> Vec<ThemeDefinition> {
+    themes.as_array().into_iter().flatten().filter_map(published_definition).collect()
+}
+
+/// `environmentThemeDefinition`: canvas and accent seed the theme's own appearance; a variant
+/// builds on its appearance's stock defaults, since dark seeds would give a light variant
+/// unreadable colors. Explicit colors go over either.
+fn published_definition(theme: &Value) -> Option<ThemeDefinition> {
+    let id = theme.get("id")?.as_str().filter(|id| is_theme_id(id) && !themes::is_reserved(id))?;
+    let label = theme_label(theme.get("name")?)?;
+    let dark = appearance(theme.get("appearance")?)?;
+    let seed = |key| theme.get(key).and_then(Value::as_str);
+    let seeds = seed("canvas").zip(seed("accent"));
+    let colors = theme.get("colors").and_then(Value::as_object);
+    let other = theme.pointer(if dark { "/variants/light" } else { "/variants/dark" }).and_then(Value::as_object);
+    let has_colors = |colors: Option<&Map<String, Value>>| {
+        colors.into_iter().flatten().any(|(role, color)| {
+            themes::role_names().iter().any(|name| name == role)
+                && color.as_str().and_then(theme_color::canonical).is_some()
+        })
+    };
+    if seeds.is_none() && !has_colors(colors) && !has_colors(other) {
+        return None;
+    }
+    let base = match seeds {
+        Some((canvas, accent)) => theme_color::vivid(dark, canvas, accent),
+        None => themes::default_roles(dark).clone(),
+    };
+    let empty = Map::new();
+    let roles = Roles::layered(&base, colors.unwrap_or(&empty));
+    let variant = other.map(|colors| Roles::layered(themes::default_roles(!dark), colors));
+    let mut definition = ThemeDefinition::new(id.to_owned(), label.to_owned(), dark, roles, variant)?;
+    // Only the pure seeded form is guided-editor output; the guided editor would regenerate
+    // over hand-tuned colors, so Duplicate of those opens the advanced one.
+    definition.managed = seeds.is_some() && theme.get("colors").is_none() && theme.get("variants").is_none();
+    Some(definition)
+}
+
 /// A theme file for `theme` under another name (the import dialog's `versionedCopy` and the
 /// VS Code import's renames): a new id from the name, no collection.
 pub fn renamed(theme: &ThemeDefinition, name: &str) -> Result<ThemeDefinition, String> {
@@ -286,5 +327,39 @@ mod tests {
             parse_stored_list(&json!([theme("a", "One"), theme("a", "Two"), theme("Bad!", "x"), 5, theme("b", "B")]));
         let labels: Vec<_> = list.iter().map(|theme| theme.label.as_str()).collect();
         assert_eq!(labels, ["One", "B"]);
+    }
+
+    #[test]
+    fn published_themes_seed_their_appearance_and_drop_what_cannot_render() {
+        let published = published_definitions(&json!([
+            { "id": "seeded", "name": " Seeded ", "appearance": "dark", "canvas": "#101820", "accent": "#e0457b" },
+            {
+                "id": "tuned", "name": "Tuned", "appearance": "dark", "canvas": "#101820", "accent": "#e0457b",
+                "colors": { "text": "#ffffff", "unknownRole": "#000000" },
+                "variants": { "light": { "canvas": "#fafafa" }, "dark": { "canvas": "#ff0000" } },
+            },
+            { "id": "plain", "name": "Plain", "appearance": "light", "colors": { "canvas": "#fefefe" } },
+            { "id": "t3-iris", "name": "Iris", "appearance": "dark", "canvas": "#000", "accent": "#fff" },
+            { "id": "dark", "name": "Dark", "appearance": "dark", "canvas": "#000", "accent": "#fff" },
+            { "id": "empty", "name": "Empty", "appearance": "dark", "colors": { "nope": "#fff", "text": "var(--x)" } },
+            { "id": "half", "name": "Half", "appearance": "dark", "canvas": "#000" },
+        ]));
+        let ids: Vec<_> = published.iter().map(|theme| theme.id.as_str()).collect();
+        assert_eq!(ids, ["seeded", "tuned", "plain"], "reserved ids and colorless themes are dropped");
+
+        let [seeded, tuned, plain] = [0, 1, 2].map(|index| &published[index]);
+        assert_eq!(seeded.label, "Seeded");
+        assert_eq!(seeded.roles, theme_color::vivid(true, "#101820", "#e0457b"));
+        assert!(seeded.managed && seeded.single_appearance() == Some(true));
+
+        assert!(!tuned.managed, "explicit colors open Duplicate in the advanced editor");
+        assert_eq!(tuned.roles.get("text"), theme_color::canonical("#ffffff").unwrap());
+        assert_eq!(tuned.roles.get("canvas"), seeded.roles.get("canvas"), "a variant never repeats the base");
+        let light = tuned.variant_roles.as_ref().unwrap();
+        assert_eq!(light.get("canvas"), theme_color::canonical("#fafafa").unwrap());
+        assert_eq!(light.get("text"), themes::default_roles(false).get("text"), "variants build on the defaults");
+
+        assert!(!plain.managed && !plain.dark);
+        assert_eq!(plain.roles.get("text"), themes::default_roles(false).get("text"));
     }
 }

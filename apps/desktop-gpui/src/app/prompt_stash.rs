@@ -315,7 +315,8 @@ impl Store {
 
 /// `stashEntrySnippet`: the prompt on one line, or what it carried.
 fn snippet(entry: &StashEntry) -> String {
-    let collapsed = entry.prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    let prompt = crate::assistant_citations::to_plain_text(&entry.prompt);
+    let collapsed = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
     if !collapsed.is_empty() {
         return match collapsed.char_indices().nth(SNIPPET_MAX_CHARS) {
             Some((at, _)) => format!("{}…", &collapsed[..at]),
@@ -392,7 +393,7 @@ impl Workspace {
         if self.palette.is_some() || self.page.is_some() || self.settings.is_some() {
             return;
         }
-        if self.thread.as_ref().is_some_and(|t| self.rewinding.contains(&t.id)) {
+        if self.target_rewinding() {
             return;
         }
         if self.question.is_some() {
@@ -422,13 +423,13 @@ impl Workspace {
             return;
         }
         let created_at = crate::timestamp::iso(crate::timestamp::now_ms()).unwrap_or_default();
-        let records = self.terminal_context_records(&prompt);
+        let records = self.context.records.referenced(&prompt);
         let pending = match self.prompt_stash.store.prepare(prompt, &self.attachments, records, created_at) {
             Ok(pending) => pending,
             Err(error) => return stash_failed(&error, window, cx),
         };
         self.prompt_stash.busy = true;
-        let origin = self.target.clone();
+        let origin = self.editor_draft();
         let local_ids: Vec<String> = self.attachments.iter().map(|a| a.local_id().to_owned()).collect();
         cx.spawn_in(window, async move |this, cx| {
             let (pending, written) = cx
@@ -443,7 +444,7 @@ impl Workspace {
                 let prompt = pending.prompt().to_owned();
                 match this.prompt_stash.store.commit(pending, written) {
                     Ok(evicted) => {
-                        if this.target == origin {
+                        if this.editor_draft() == origin {
                             this.clear_stashed_prompt(&prompt, &local_ids, window, cx);
                         }
                         if evicted.is_some() {
@@ -500,7 +501,7 @@ impl Workspace {
     /// `restoreStashEntry`: the prompt goes after the composer's text, its attachments
     /// after the composer's, up to the attachment limit.
     fn restore_stash_entry(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if self.target.is_none() || self.thread.as_ref().is_some_and(|t| self.rewinding.contains(&t.id)) {
+        if self.target.is_none() || self.target_rewinding() {
             return;
         }
         if self.prompt_stash.busy {
@@ -513,13 +514,14 @@ impl Workspace {
         }
         self.prompt_stash.busy = true;
         cx.notify();
-        let (id, origin) = (id.to_owned(), self.target.clone());
+        // The composer's draft, down to a queued message's edit: the restore lands only there.
+        let (id, origin) = (id.to_owned(), self.editor_draft());
         cx.spawn_in(window, async move |this, cx| {
             let bytes = cx.background_executor().spawn(async move { read_blobs(paths) }).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.prompt_stash.busy = false;
                 // Moved on meanwhile: the entry stays in the stash.
-                if this.target == origin {
+                if this.editor_draft() == origin {
                     this.finish_restore(&id, bytes, window, cx);
                 }
                 cx.notify();
@@ -534,10 +536,10 @@ impl Workspace {
             let message = "The stash file could not be updated, so this entry could still be there after a restart.";
             toast(window, cx, Notification::warning(message).title("Restored prompt may reappear in the stash"));
         }
-        for record in &entry.records {
-            if let Some(id) = record["contextId"].as_str().filter(|_| record["kind"] == "terminal") {
-                self.terminals.contexts.entry(id.to_owned()).or_insert_with(|| record.clone());
-            }
+        // An open question holds the composer; the records wait with the prompt.
+        match &mut self.question {
+            Some(question) => question.prompt_records.extend(entry.records.iter().cloned()),
+            None => self.context.records.extend(entry.records.iter().cloned()),
         }
         let mut unreadable = Vec::new();
         let mut over_limit = Vec::new();
@@ -546,14 +548,19 @@ impl Workspace {
                 unreadable.push(attachment.name);
                 continue;
             };
-            if self.attachments.len() >= MAX_ATTACHMENTS {
+            // An open question holds the composer; the prompt's attachments wait with the prompt.
+            let list = match &mut self.question {
+                Some(question) => &mut question.prompt_attachments,
+                None => &mut self.attachments,
+            };
+            if list.len() >= MAX_ATTACHMENTS {
                 over_limit.push(attachment.name);
                 continue;
             }
             let restored =
                 Attachment::restored_as(attachment.local_id, &attachment.kind, attachment.name, attachment.mime, bytes);
             let local_id = restored.local_id().to_owned();
-            self.attachments.push(restored);
+            list.push(restored);
             self.upload(local_id, cx);
         }
         match &mut self.question {
@@ -584,6 +591,7 @@ impl Workspace {
         if !reasons.is_empty() {
             toast(window, cx, Notification::warning(reasons.join(" ")).title("Some attachments were not restored"));
         }
+        self.drafts_changed(cx);
         cx.notify();
     }
 
@@ -680,7 +688,7 @@ impl Workspace {
                 .rounded_t(px(16.))
                 .border_1()
                 .border_color(banner_outline(t))
-                .bg(t.card.opacity(t.glass))
+                .bg(t.composer_glass().opacity(t.glass))
                 .text_xs()
                 .line_height(px(16.))
                 .child(row)
@@ -752,7 +760,7 @@ impl Workspace {
                         .rounded_t(px(16.))
                         .border_1()
                         .border_color(banner_outline(t))
-                        .bg(t.background.blend(t.card.opacity(t.glass)))
+                        .bg(t.background.blend(t.composer_glass().opacity(t.glass)))
                         .text_xs()
                         .line_height(px(16.))
                         .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_stash_menu(cx)))
@@ -856,7 +864,7 @@ impl Workspace {
 }
 
 fn banner_outline(t: &Tokens) -> gpui_kit::Hsla {
-    if t.dark { gpui_kit::hsla(0., 0., 1., 0.05) } else { gpui_kit::hsla(0., 0., 0., 0.08) }
+    t.composer_outline()
 }
 
 /// The banner row's 24px icon column.

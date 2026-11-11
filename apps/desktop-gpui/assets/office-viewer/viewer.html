@@ -1,0 +1,22 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self' blob: data:; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'none'; form-action 'none'"
+    />
+    <style id="theme">
+      {{theme}}
+    </style>
+    <link rel="stylesheet" href="/viewer.css" />
+    <script type="application/json" id="state">
+      {{state}}
+    </script>
+    <script type="module" src="/viewer.mjs"></script>
+  </head>
+  <body>
+    <main class="surface" id="root"></main>
+    <div class="tooltip" id="tooltip" role="tooltip" hidden></div>
+  </body>
+</html>

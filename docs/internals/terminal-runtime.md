@@ -29,13 +29,15 @@ bound during startup.
 
 ## Renderer ownership
 
-Android and web use the same `libghostty-vt` C ABI for terminal behavior. Platform
-adapters own drawing and input integration, and React stays out of terminal frames.
+Android, web and the GPUI desktop client use `libghostty-vt` for terminal behavior.
+Platform adapters own drawing and input integration, and React stays out of terminal frames.
 The web adapter shares one WebAssembly instance per browser tab while each terminal
-owns and frees its own handles. The canonical upstream pin is
+owns and frees its own handles. The canonical upstream pin for Android and web is
 [`native/libghostty-vt/VERSION`](../../native/libghostty-vt/VERSION); both native and
 web artifacts must be rebuilt when it changes. Web embeds the revision in its build
-info so the ABI check can detect drift without a second pin.
+info so the ABI check can detect drift without a second pin. The GPUI client links the
+`libghostty-vt` Rust crate, which builds Ghostty at its own pin, so it moves with the
+crate version rather than with `VERSION`.
 
 Restoring scrollback must not send terminal replies to the current shell. Historical
 device queries can otherwise provoke fresh replies that appear as junk at the

@@ -11,13 +11,14 @@ use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{Disableable as _, Icon, Selectable as _, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{Disableable as _, Icon, Selectable as _, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
-    Anchor, AnyElement, AppContext as _, Context, ElementId, Entity, FocusHandle, Focusable as _, FontWeight, Hsla,
-    InteractiveElement as _, IntoElement, Keystroke, ParentElement as _, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Window, div, prelude::FluentBuilder as _, px, svg,
+    Anchor, AnyElement, AppContext as _, ClickEvent, Context, ElementId, Entity, FocusHandle, Focusable as _,
+    FontWeight, Hsla, InteractiveElement as _, IntoElement, Keystroke, ParentElement as _, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, prelude::FluentBuilder as _, px, svg,
 };
 use serde_json::{Value, json};
 
@@ -44,8 +45,19 @@ pub(in crate::app) struct PickHost {
     /// The environment whose providers and model preferences it lists; `None` is the open chat's.
     pub environment: Option<SharedString>,
     pub current: Option<ModelSelection>,
-    pub include: fn(&Provider) -> bool,
+    pub include: Rc<dyn Fn(&Provider) -> bool>,
+    /// `Some` for a settings writing picker: the enabled text generators it offers after the
+    /// environment's providers, in place of every instance a generator owns.
+    pub extra: Option<Rc<[Provider]>>,
     pub on_pick: OnPick,
+}
+
+/// Whether a writing picker drops coding agent `provider`: a text generator owns its id when it
+/// is configured in `configured` (the environment's `textGenerators`), even disabled, or offered
+/// in `extra` (`useTextGenerationTargets`; the server routes that id to the generator).
+pub(in crate::app) fn generator_owns(provider: &Provider, configured: &Value, extra: &[Provider]) -> bool {
+    let id = provider.instance_id.as_str();
+    configured.get(id).is_some() || extra.iter().any(|g| g.instance_id == id)
 }
 
 /// The providers a started thread may continue on when its provider cannot hand off
@@ -93,14 +105,16 @@ pub(super) struct TriggerText {
     /// [`model_label::speed_label`].
     speed: Option<&'static str>,
     ultracode: bool,
-    logo: bool,
+    /// The 16px logos drawn, overlapping by 4px when several models are picked.
+    logos: usize,
 }
 
 impl TriggerText {
     /// The trigger's width with nothing truncated (`providerModelPickerNaturalWidth`), from the
-    /// layout below: 8px sides and a 1px border, a 16px logo, 6px gaps, the suffix 2px closer.
+    /// layout below: 8px sides and a 1px border, the logos, 6px gaps, the suffix 2px closer.
     pub(super) fn natural_width(&self, measure: impl Fn(&str) -> f32) -> f32 {
-        let logo = if self.logo { 16. + 6. } else { 0. };
+        #[expect(clippy::cast_precision_loss, reason = "at most four logos")]
+        let logo = if self.logos == 0 { 0. } else { 16. + 12. * (self.logos - 1) as f32 + 6. };
         let parts: Vec<f32> = self
             .effort
             .as_deref()
@@ -146,7 +160,33 @@ pub(super) struct PickerState {
     show_legacy: bool,
     /// Options last picked per `(instance, model)`, restored when switching back.
     remembered: HashMap<(String, String), Vec<Value>>,
+    saves: PickSaves,
     _search_changes: Option<Subscription>,
+}
+
+/// The newest model save sent per target, so an older reply cannot release a newer pick of the
+/// same model (the web compares the pick by identity).
+#[derive(Default)]
+struct PickSaves {
+    serial: u64,
+    latest: HashMap<super::Target, u64>,
+}
+
+impl PickSaves {
+    fn begin(&mut self, target: &super::Target) -> u64 {
+        self.serial += 1;
+        self.latest.insert(target.clone(), self.serial);
+        self.serial
+    }
+
+    /// Whether `serial` is still the target's newest save; it is settled either way.
+    fn settle(&mut self, target: &super::Target, serial: u64) -> bool {
+        let latest = self.latest.get(target) == Some(&serial);
+        if latest {
+            self.latest.remove(target);
+        }
+        latest
+    }
 }
 
 /// One row of the list, resolved once per render while the picker is open.
@@ -167,6 +207,16 @@ impl PickerState {
         self.open = None;
         self.host = None;
     }
+
+    /// Hands picker `id`, while open, its host's latest extra providers: generator models
+    /// arrive after it opens.
+    fn refresh_extra(&mut self, id: &str, extra: &Rc<[Provider]>) {
+        if self.open.as_deref() == Some(id)
+            && let Some(host) = &mut self.host
+        {
+            host.extra = Some(extra.clone());
+        }
+    }
 }
 
 impl Workspace {
@@ -176,6 +226,11 @@ impl Workspace {
 
     pub(super) fn composer_picker_open(&self) -> bool {
         self.picker.open.as_deref() == Some(COMPOSER)
+    }
+
+    /// [`PickerState::refresh_extra`], for each render that rebuilds `id`'s extra providers.
+    pub(in crate::app) fn refresh_picker_extra(&mut self, id: &str, extra: &Rc<[Provider]>) {
+        self.picker.refresh_extra(id, extra);
     }
 
     pub(super) fn open_model_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -238,12 +293,6 @@ impl Workspace {
         cx.notify();
     }
 
-    /// The driver of `current`'s provider in the open picker's environment.
-    fn picker_driver(&self, current: Option<&ModelSelection>) -> &str {
-        let provider = current.and_then(|s| self.picker_info()?.provider(&s.instance_id));
-        provider.map_or("", |p| p.driver.as_str())
-    }
-
     /// The selection the open picker marks: its host's, else the composer's.
     fn picker_current(&self) -> Option<ModelSelection> {
         match &self.picker.host {
@@ -268,6 +317,21 @@ impl Workspace {
         }
     }
 
+    /// The open picker's environment's providers, with its host's extra ones in place of
+    /// instances a text generator owns.
+    fn picker_providers(&self) -> impl Iterator<Item = &Provider> {
+        let extra = self.picker.host.as_ref().and_then(|host| host.extra.as_deref());
+        let listed = self.picker_info().into_iter().flat_map(move |info| {
+            let configured = info.settings.get("textGenerators");
+            info.providers.iter().filter(move |p| extra.is_none_or(|extra| !generator_owns(p, configured, extra)))
+        });
+        listed.chain(extra.into_iter().flatten())
+    }
+
+    fn picker_provider(&self, instance_id: &str) -> Option<&Provider> {
+        self.picker_providers().find(|p| p.instance_id == instance_id)
+    }
+
     /// The providers the open picker offers: its host's, else those the open thread may continue on.
     fn picker_includes(&self, provider: &Provider) -> bool {
         match &self.picker.host {
@@ -284,11 +348,13 @@ impl Workspace {
     }
 
     /// The docked picker keeps its popup open and moves to the new model's levels; any other
-    /// closes and hands the model to its host.
-    fn pick_row(&mut self, selection: ModelSelection, window: &mut Window, cx: &mut Context<Self>) {
+    /// closes and hands the model to its host. `additive` (Shift) toggles one of a draft's models.
+    fn pick_row(&mut self, selection: ModelSelection, additive: bool, window: &mut Window, cx: &mut Context<Self>) {
         match self.picker.host.as_ref().map(|host| host.on_pick.clone()) {
+            None if additive && self.fanout_supported() => self.toggle_fanout_model(selection, window, cx),
             None => {
-                self.pick_model(selection, cx);
+                self.clear_fanout();
+                self.pick_model(selection, window, cx);
                 self.focus_effort(false, window, cx);
             }
             Some(on_pick) => {
@@ -298,28 +364,90 @@ impl Workspace {
         }
     }
 
-    pub(super) fn pick_model(&mut self, selection: ModelSelection, cx: &mut Context<Self>) {
+    pub(super) fn pick_model(&mut self, selection: ModelSelection, window: &mut Window, cx: &mut Context<Self>) {
         let key = (selection.instance_id.clone(), selection.model.clone());
         let options = self.picker.remembered.get(&key).cloned();
         self.model_override = Some(ModelSelection { options, ..selection });
         self.model_explicit = true;
         self.sticky_model.clone_from(&self.model_override);
+        self.drafts_changed(cx);
         self.refresh_menu_items(cx);
+        // Another provider brings its own skills.
+        self.chip_lists_changed(cx);
         // A pick on another harness shows its pending handoff at the timeline's end.
         self.refresh_rows(cx);
+        self.apply_thread_model_pick(window, cx);
+        cx.notify();
+    }
+
+    /// `useApplyThreadModelPick`: an open thread's pick goes on the thread at once, so the next
+    /// turn runs on it wherever it starts. Once the server has it, the thread's model shows again.
+    fn apply_thread_model_pick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(target) = self.target.clone() else { return };
+        let super::Target::Thread { env, id } = &target else { return };
+        let projection = self
+            .thread
+            .as_ref()
+            .filter(|thread| &thread.id == id)
+            .and_then(|thread| thread.state.projection.as_ref())
+            .and_then(|projection| projection.thread.model_selection.as_ref());
+        let thread_model = thread_model(&self.shell.threads, env, id, projection);
+        let Some(pick) = thread_pick(self.model_override.as_ref(), self.model_explicit, thread_model) else { return };
+        if !self.can_operate(env) {
+            pick_failed(window, cx, "This connection cannot change threads or projects.");
+            return;
+        }
+        let command = json!({"type": "thread.model-selection.set", "commandId": super::new_id(), "threadId": id,
+            "modelSelection": pick.to_json()});
+        let Some(client) = self.env_client(env) else { return };
+        let serial = self.picker.saves.begin(&target);
+        cx.spawn_in(window, async move |this, cx| {
+            let result = client.request("orchestration.dispatchCommand", command).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                let latest = this.picker.saves.settle(&target, serial);
+                match result {
+                    Ok(_) if latest => this.release_model_pick(&target, &pick, cx),
+                    Ok(_) => {}
+                    Err(error) => pick_failed(window, cx, &error.message()),
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// `releaseModelSelection`: the thread took `pick`, the target's newest save, so its composer
+    /// stops holding it.
+    fn release_model_pick(&mut self, target: &super::Target, pick: &ModelSelection, cx: &mut Context<Self>) {
+        if self.target.as_ref() == Some(target) {
+            if self.model_override.as_ref() != Some(pick) {
+                return;
+            }
+            // Shown at once; the thread's own update carries the same selection.
+            if let Some(projection) = self.thread.as_mut().and_then(|thread| thread.state.projection.as_mut()) {
+                projection.thread.model_selection = Some(pick.clone());
+            }
+            self.model_override = None;
+            self.model_explicit = false;
+            self.drafts_changed(cx);
+        } else if let Some(saved) = self.composer_selections.get_mut(target)
+            && saved.model.as_ref() == Some(pick)
+        {
+            if saved.runtime_mode.is_none() {
+                self.composer_selections.remove(target);
+            } else {
+                saved.model = None;
+                saved.explicit = false;
+            }
+            self.drafts_changed(cx);
+        }
         cx.notify();
     }
 
     /// The composer model's effort-column stops.
     fn picker_effort_stops(&self) -> Vec<EffortStop> {
         let Some(current) = self.composer_model() else { return Vec::new() };
-        let descriptors = self
-            .server_info()
-            .model(&current)
-            .and_then(|m| m.capabilities.as_ref())
-            .map(|c| c.option_descriptors.as_slice())
-            .unwrap_or_default();
-        let controls = effort_controls(descriptors, self.picker_driver(Some(&current)), self.composer_ultrathink);
+        let descriptors = self.composer_descriptors(&current);
+        let controls = effort_controls(&descriptors, self.composer_ultrathink);
         effort_stops(&controls, &current)
     }
 
@@ -350,9 +478,9 @@ impl Workspace {
                 if owned {
                     self.strip_ultrathink_prefix(window, cx);
                 }
-                self.set_model_option(&id, value, cx);
+                self.set_model_option(&id, value, window, cx);
             }
-            EffortStop::Toggle { id, on } => self.set_model_option(&id, Value::Bool(!on), cx),
+            EffortStop::Toggle { id, on } => self.set_model_option(&id, Value::Bool(!on), window, cx),
         }
     }
 
@@ -389,7 +517,7 @@ impl Workspace {
         })
     }
 
-    fn set_model_option(&mut self, id: &str, value: Value, cx: &mut Context<Self>) {
+    fn set_model_option(&mut self, id: &str, value: Value, window: &mut Window, cx: &mut Context<Self>) {
         let Some(current) = self.composer_model() else { return };
         let next = model_label::with_option(&current, id, value);
         let key = (next.instance_id.clone(), next.model.clone());
@@ -397,6 +525,8 @@ impl Workspace {
         self.sticky_model = Some(next.clone());
         self.model_override = Some(next);
         self.model_explicit = true;
+        self.drafts_changed(cx);
+        self.apply_thread_model_pick(window, cx);
         cx.notify();
     }
 
@@ -436,7 +566,7 @@ impl Workspace {
     }
 
     /// `providerModelPreferences[id].hiddenModels`, never hiding custom models.
-    fn model_hidden(info: &ServerInfo, provider: &Provider, model: &ProviderModel) -> bool {
+    pub(super) fn model_hidden(info: &ServerInfo, provider: &Provider, model: &ProviderModel) -> bool {
         !model.is_custom
             && info.settings.get("providerModelPreferences")[provider.instance_id.as_str()]["hiddenModels"]
                 .as_array()
@@ -451,12 +581,18 @@ impl Workspace {
         let is_favorite = |p: &Provider, m: &ProviderModel| {
             favorites.iter().any(|(instance_id, slug)| *instance_id == p.instance_id && *slug == m.slug)
         };
+        // A draft starting several models marks each of them.
+        let fanout = self.picker.host.is_none().then(|| self.model_fanout()).flatten();
+        let selected = move |p: &Provider, m: &ProviderModel| match fanout {
+            Some(list) => list.iter().any(|s| s.instance_id == p.instance_id && s.model == m.slug),
+            None => current.is_some_and(|c| c.instance_id == p.instance_id && c.model == m.slug),
+        };
         let row = |p: &Provider, m: &ProviderModel| Row {
             selection: ModelSelection { instance_id: p.instance_id.clone(), model: m.slug.clone(), options: None },
             name: model_label::display_model_name(m),
             sub_provider: m.sub_provider.clone(),
             icon: crate::assets::provider_icon(&p.driver),
-            selected: current.is_some_and(|c| c.instance_id == p.instance_id && c.model == m.slug),
+            selected: selected(p, m),
             favorite: is_favorite(p, m),
             new: m.badge.as_deref() == Some("new"),
             legacy: m.is_legacy,
@@ -476,7 +612,7 @@ impl Workspace {
                 .filter(move |m| !Self::model_hidden(info, p, m) && (ready || kept_unavailable(p, m)))
                 .map(move |m| (p, m))
         };
-        let providers = info.providers.iter().filter(|p| self.picker_includes(p));
+        let providers = self.picker_providers().filter(|p| self.picker_includes(p));
         if !self.picker.query.is_empty() {
             let mut scored: Vec<(i64, bool, usize, Row)> = providers
                 .flat_map(models)
@@ -523,14 +659,37 @@ impl Workspace {
         }
     }
 
-    /// Up/Down/Enter/Escape while the picker is open, Right into the docked effort column;
-    /// Ctrl+1-9 are `modelPicker.jump.N`.
+    /// Up/Down/Enter/Escape while the picker's search has focus, Right into the docked effort
+    /// column; Ctrl+1-9 are `modelPicker.jump.N`. Escape closes from anywhere in the popover.
     pub(super) fn picker_key(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if keystroke.modifiers.modified() {
+        let m = keystroke.modifiers;
+        // Shift+Enter adds the highlighted model to the ones a draft starts.
+        let additive = keystroke.key == "enter" && m.shift && !(m.control || m.alt || m.platform || m.function);
+        if m.modified() && !additive {
             return false;
         }
-        if let Some(index) = self.picker.effort_focus {
-            return self.effort_key(index, keystroke, window, cx);
+        let effort_focused = self.picker.effort_handle.as_ref().is_some_and(|handle| handle.is_focused(window));
+        let search_focused = self
+            .picker
+            .search
+            .as_ref()
+            .is_some_and(|search| gpui_kit::Focusable::focus_handle(search.read(cx), cx).is_focused(window));
+        match picker_keys(self.picker.effort_focus, effort_focused, search_focused, additive) {
+            PickerKeys::Effort(index) => return self.effort_key(index, keystroke, window, cx),
+            PickerKeys::Search => {}
+            PickerKeys::Add => {
+                let current = self.picker_current();
+                let (rows, _) = self.picker_rows(current.as_ref());
+                if let Some(row) = self.picker.highlighted.and_then(|i| rows.into_iter().nth(i)) {
+                    self.pick_row(row.selection, true, window, cx);
+                }
+                return true;
+            }
+            PickerKeys::Elsewhere if keystroke.key == "escape" => {
+                self.close_model_picker(window, cx);
+                return true;
+            }
+            PickerKeys::Elsewhere => return false,
         }
         let current = self.picker_current();
         let (rows, _) = self.picker_rows(current.as_ref());
@@ -548,14 +707,19 @@ impl Workspace {
             }
             "enter" => {
                 if let Some(row) = self.picker.highlighted.and_then(|i| rows.into_iter().nth(i)) {
-                    self.pick_row(row.selection, window, cx);
+                    self.pick_row(row.selection, false, window, cx);
                 }
             }
-            // The column shows the selected model's levels, so a highlighted model is picked first.
+            // The column shows the composer model's levels, so a highlighted model is picked first.
             "right" if self.picker.host.is_none() && self.picker_search_caret_at_end(cx) => {
                 let highlighted = self.picker.highlighted.and_then(|i| rows.into_iter().nth(i));
-                match highlighted.filter(|row| !row.selected) {
-                    Some(row) => self.pick_row(row.selection, window, cx),
+                let is_current = |row: &Row| {
+                    current
+                        .as_ref()
+                        .is_some_and(|c| c.instance_id == row.selection.instance_id && c.model == row.selection.model)
+                };
+                match highlighted.filter(|row| !is_current(row)) {
+                    Some(row) => self.pick_row(row.selection, false, window, cx),
                     None => {
                         self.focus_effort(true, window, cx);
                     }
@@ -580,9 +744,7 @@ impl Workspace {
         let tab = self.picker_tab(current.as_ref());
         let tabs: Vec<Tab> = std::iter::once(Tab::Favorites)
             .chain(
-                self.picker_info()
-                    .into_iter()
-                    .flat_map(|info| info.providers.iter())
+                self.picker_providers()
                     .filter(|p| p.enabled && self.picker_includes(p))
                     .filter(|p| p.availability.as_deref() != Some("unavailable") && p.status == "ready")
                     .map(|p| Tab::Provider(p.instance_id.clone())),
@@ -605,7 +767,7 @@ impl Workspace {
         let current = self.picker_current();
         let (rows, _) = self.picker_rows(current.as_ref());
         if let Some(row) = rows.into_iter().nth(index) {
-            self.pick_row(row.selection, window, cx);
+            self.pick_row(row.selection, false, window, cx);
         }
         true
     }
@@ -621,8 +783,8 @@ impl Workspace {
             (Some(selection), None) => selection.model.clone().into(),
             (None, None) => "Choose model".into(),
         };
-        let descriptors =
-            model.and_then(|m| m.capabilities.as_ref()).map(|c| c.option_descriptors.as_slice()).unwrap_or_default();
+        let descriptors = current.as_ref().map(|s| self.composer_descriptors(s)).unwrap_or_default();
+        let descriptors = descriptors.as_ref();
         let ultrathink = model_label::ultrathink_select(descriptors, self.composer_ultrathink)
             .is_some_and(|primary| model_label::reasoning(descriptors).is_some_and(|r| r.id == primary.id));
         let effort = if ultrathink {
@@ -630,31 +792,83 @@ impl Workspace {
         } else {
             current.as_ref().and_then(|s| model_label::effort_label(descriptors, s))
         };
-        let speed = current.as_ref().and_then(|s| model_label::speed_label(descriptors, driver, s));
+        let speed = current.as_ref().and_then(|s| model_label::speed_label(descriptors, s));
         let ultracode = current.as_ref().is_some_and(|s| model_label::toggle_on(descriptors, "ultracode", s));
         (name, effort, speed, ultracode)
+    }
+
+    /// The logos of a draft's models: the first three, and how many more there are.
+    fn fanout_icons(&self, selections: &[ModelSelection]) -> (Vec<(&'static str, Option<Hsla>)>, usize) {
+        let icons = selections
+            .iter()
+            .take(3)
+            .filter_map(|s| crate::assets::provider_icon(&self.server_info().provider(&s.instance_id)?.driver))
+            .collect();
+        (icons, selections.len().saturating_sub(3))
     }
 
     /// What the composer trigger shows, for measuring it.
     pub(super) fn model_trigger_text(&self) -> TriggerText {
         let (name, effort, speed, ultracode) = self.trigger_labels();
-        let logo = self
-            .composer_model()
-            .and_then(|s| self.server_info().provider(&s.instance_id))
-            .and_then(|p| crate::assets::provider_icon(&p.driver))
-            .is_some();
-        TriggerText { name, effort, speed, ultracode, logo }
+        let (name, logos) = match self.model_fanout() {
+            Some(selections) => {
+                let (icons, more) = self.fanout_icons(selections);
+                (self.fanout_label(selections).into(), icons.len() + usize::from(more > 0))
+            }
+            None => {
+                let logo = self
+                    .composer_model()
+                    .and_then(|s| self.server_info().provider(&s.instance_id))
+                    .and_then(|p| crate::assets::provider_icon(&p.driver));
+                (name, usize::from(logo.is_some()))
+            }
+        };
+        TriggerText { name, effort, speed, ultracode, logos }
     }
 
     /// The trigger and, while open, the popover.
     pub(super) fn render_model_picker(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let current = self.composer_model();
         let provider = current.as_ref().and_then(|s| self.server_info().provider(&s.instance_id));
-        let model = current.as_ref().and_then(|s| self.server_info().model(s));
-        let descriptors =
-            model.and_then(|m| m.capabilities.as_ref()).map(|c| c.option_descriptors.as_slice()).unwrap_or_default();
+        let descriptors = current.as_ref().map(|s| self.composer_descriptors(s)).unwrap_or_default();
         let (name, effort, speed, ultracode) = self.trigger_labels();
+        let fanout = self.model_fanout();
+        let label: SharedString =
+            fanout.map_or_else(|| name.clone(), |selections| self.fanout_label(selections).into());
         let icon = provider.and_then(|p| crate::assets::provider_icon(&p.driver));
+        // Several models stack their logos in rings of the composer's fill (`-space-x-1`, `ring-2`).
+        let surface = t.background.blend(t.card.opacity(t.glass));
+        let logos = fanout.and_then(|selections| {
+            let (icons, more) = self.fanout_icons(selections);
+            if icons.is_empty() && more == 0 {
+                return None;
+            }
+            // A 16px logo with its 2px ring outside it: 20px drawn, 16px laid out, each 4px over the last.
+            let circle = |first: bool| {
+                div()
+                    .size(px(20.))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .my(px(-2.))
+                    .ml(px(if first { -2. } else { -6. }))
+                    .mr(px(-2.))
+                    .rounded_full()
+                    .bg(surface)
+                    .border_2()
+                    .border_color(surface)
+            };
+            let has_icons = !icons.is_empty();
+            let stack = h_flex()
+                .flex_none()
+                .children(icons.into_iter().enumerate().map(|(index, (path, tint))| {
+                    circle(index == 0)
+                        .child(svg().path(path).size(px(16.)).text_color(tint.unwrap_or(t.muted_foreground)))
+                }))
+                .when(more > 0, |el| el.child(circle(!has_icons).text_size(px(8.)).child(format!("+{more}"))));
+            Some(stack)
+        });
         let open = self.composer_picker_open();
         let disabled = self.target.is_none() || self.server_info().model_choices().is_empty();
         let suffix_color = if open { t.foreground } else { t.muted_foreground };
@@ -671,16 +885,19 @@ impl Workspace {
                     .flex_1()
                     .gap(px(6.))
                     // `[&_svg:not([class*='text-'])]:text-muted-foreground`: a logo without its own colour.
-                    .children(icon.map(|(path, tint)| {
-                        svg().path(path).size(px(16.)).flex_none().text_color(tint.unwrap_or(t.muted_foreground))
-                    }))
+                    .map(|el| match fanout {
+                        Some(_) => el.children(logos),
+                        None => el.children(icon.map(|(path, tint)| {
+                            svg().path(path).size(px(16.)).flex_none().text_color(tint.unwrap_or(t.muted_foreground))
+                        })),
+                    })
                     .child(
                         div()
                             .min_w_0()
                             .max_w(px(224.))
                             .truncate()
                             .text_color(if open { t.foreground } else { t.foreground.opacity(0.8) })
-                            .child(name.clone()),
+                            .child(label),
                     )
                     .when(effort.is_some() || speed.is_some() || ultracode, |el| {
                         el.child(
@@ -695,15 +912,16 @@ impl Workspace {
                         )
                     }),
             );
-        let body = open.then(|| self.render_picker_body(current.as_ref(), &name, Some(descriptors), t, cx));
+        let body = open.then(|| self.render_picker_body(current.as_ref(), &name, Some(&descriptors), t, cx));
         self.picker_popover(COMPOSER.into(), trigger, Anchor::BottomRight, None, body, cx)
     }
 
     /// `showProviderUnavailable`: no provider the composer may use is enabled and available, so
     /// the controls give way to provider setup, or say there is none.
     pub(super) fn render_provider_unavailable(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
-        // `providerCatalogPending`: until the server's config arrives, the picker stays.
-        if self.client().is_none() || self.server_info().config.is_null() {
+        // `providerCatalogPending`: until the server's config arrives, the picker stays. A draft
+        // starting several models keeps it too.
+        if self.client().is_none() || self.server_info().config.is_null() || self.model_fanout().is_some() {
             return None;
         }
         let lock = self.composer_provider_lock();
@@ -919,7 +1137,8 @@ impl Workspace {
                 })),
         );
         // Inside the docked picker's fixed height, so a ChatGPT plan never resizes it.
-        let sharing = self.render_chatgpt_sharing(current, t);
+        let several = self.picker.host.is_none() && self.model_fanout().is_some();
+        let sharing = if several { None } else { self.render_chatgpt_sharing(current, t) };
         let (list_footer, footer) = if docked.is_some() { (sharing, None) } else { (None, sharing) };
         let column = v_flex()
             .w(px(if searching { LIST + RAIL } else { LIST }))
@@ -952,7 +1171,7 @@ impl Workspace {
 
     /// `ChatGptSharingControl`: why a managed ChatGPT connection has no Fast or Ultrafast.
     fn render_chatgpt_sharing(&self, current: Option<&ModelSelection>, t: &Tokens) -> Option<AnyElement> {
-        let provider = current.and_then(|s| self.picker_info()?.provider(&s.instance_id))?;
+        let provider = current.and_then(|s| self.picker_provider(&s.instance_id))?;
         if !super::pages::settings::uses_chatgpt_sharing(&provider.auth) {
             return None;
         }
@@ -1005,8 +1224,7 @@ impl Workspace {
                 this.picker.highlighted = None;
                 cx.notify();
             }));
-        let listed = self.picker_info().into_iter().flat_map(|info| info.providers.iter());
-        let providers = listed.filter(|p| p.enabled && self.picker_includes(p)).map(|p| {
+        let providers = self.picker_providers().filter(|p| p.enabled && self.picker_includes(p)).map(|p| {
             let ready = p.availability.as_deref() != Some("unavailable") && p.status == "ready";
             // A provider needing setup opens its tab, which offers the setup.
             let selectable = ready || (self.picker.host.is_none() && offers_setup(p));
@@ -1092,7 +1310,9 @@ impl Workspace {
                     cx.notify();
                 }
             }))
-            .on_click(cx.listener(move |this, _, window, cx| this.pick_row(selection.clone(), window, cx)))
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                this.pick_row(selection.clone(), event.modifiers().shift, window, cx);
+            }))
             .child(
                 div().size(px(16.)).flex_none().flex().items_center().justify_center().children(
                     row.icon.map(|(path, tint)| {
@@ -1121,12 +1341,14 @@ impl Workspace {
                                 .py(px(1.))
                                 .rounded(px(4.))
                                 .border_1()
-                                .border_color(t.primary.opacity(0.35))
-                                .bg(t.primary.opacity(0.15))
+                                .border_color(t.update.opacity(0.35))
+                                .bg(t.update.opacity(0.15))
                                 .text_size(px(10.))
                                 .line_height(px(10.))
                                 .font_weight(FontWeight::BOLD)
-                                .text_color(t.info_foreground)
+                                .text_color(t.update_foreground)
+                                .relative()
+                                .children(super::theme_inspect::probe(&["update", "updateForeground"], cx))
                                 .child("NEW"),
                         )
                     }),
@@ -1175,8 +1397,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let rule = t.foreground.opacity(0.056);
-        let EffortControls { effort, others, owned, locked } =
-            effort_controls(descriptors, self.picker_driver(current), self.composer_ultrathink);
+        let EffortControls { effort, others, owned, locked } = effort_controls(descriptors, self.composer_ultrathink);
         let focus = self.picker.effort_focus;
         let focused_bg = t.foreground.opacity(0.09);
         // Stops count the levels first, then the switches (`effort_stops`).
@@ -1268,9 +1489,9 @@ impl Workspace {
                                     .child(div().flex_1().child(if on { "On" } else { "Off" }))
                                     .child(switch(on, t)),
                             )
-                            .on_click(
-                                cx.listener(move |this, _, _, cx| this.set_model_option(&id, Value::Bool(!on), cx)),
-                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.set_model_option(&id, Value::Bool(!on), window, cx);
+                            }))
                             .into_any_element()
                     } else {
                         let label = descriptor
@@ -1308,8 +1529,8 @@ impl Workspace {
                                     menu = menu.item(
                                         PopupMenuItem::new(text)
                                             .checked(current.as_deref() == Some(option.as_str()))
-                                            .on_click(window.listener_for(&view, move |this, _, _, cx| {
-                                                this.set_model_option(&id, Value::String(option.clone()), cx);
+                                            .on_click(window.listener_for(&view, move |this, _, window, cx| {
+                                                this.set_model_option(&id, Value::String(option.clone()), window, cx);
                                             })),
                                     );
                                 }
@@ -1382,8 +1603,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let rule = t.foreground.opacity(0.056);
-        // `SpeedControl`: Codex's service tiers, else Standard and Fast for a `fastMode` toggle.
-        let tier = model_label::speed_select(descriptors, self.picker_driver(current));
+        // `SpeedControl`: a service tier's segments, else Standard and Fast for a `fastMode` toggle.
+        let tier = model_label::speed_select(descriptors);
         let fast = descriptors.iter().find(|d| d.id == "fastMode" && d.kind == "boolean");
         let segments: Vec<(String, bool, &'static str, Value, Option<String>)> = match (tier, fast, current) {
             (Some(tier), _, Some(selection)) => {
@@ -1410,10 +1631,8 @@ impl Workspace {
             h_flex().p(px(2.)).rounded(px(8.)).bg(t.foreground.opacity(0.044)).children(segments.into_iter().map(
                 |(label, checked, option, value, description)| {
                     let bolt = matches!(label.as_str(), "Fast" | "Ultrafast").then(|| fast_bolt(label == "Ultrafast"));
-                    h_flex()
-                        .id(ElementId::Name(format!("speed-{label}").into()))
+                    footer_segment(h_flex().id(ElementId::Name(format!("speed-{label}").into())), t.ring)
                         .h(px(24.))
-                        .px(px(8.))
                         .gap(px(4.))
                         .rounded(px(6.))
                         .text_xs()
@@ -1426,7 +1645,9 @@ impl Workspace {
                         .when_some(description.filter(|d| !d.is_empty()), |el, description| {
                             el.tooltip(move |window, cx| Tooltip::new(description.clone()).build(window, cx))
                         })
-                        .on_click(cx.listener(move |this, _, _, cx| this.set_model_option(option, value.clone(), cx)))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.set_model_option(option, value.clone(), window, cx);
+                        }))
                 },
             ))
         });
@@ -1435,10 +1656,8 @@ impl Workspace {
         let ultracode = ultracode.zip(current).map(|(descriptor, selection)| {
             let on = model_label::current_value(descriptor, selection) == Some(Value::Bool(true));
             h_flex().p(px(2.)).rounded(px(8.)).bg(t.foreground.opacity(0.044)).child(
-                h_flex()
-                    .id("ultracode")
+                footer_segment(h_flex().id("ultracode"), t.ring)
                     .h(px(24.))
-                    .px(px(8.))
                     .gap(px(4.))
                     .rounded(px(6.))
                     .text_xs()
@@ -1447,9 +1666,9 @@ impl Workspace {
                     .when(on, |el| el.bg(t.foreground.opacity(0.079)))
                     .child(Icon::new(Lucide::Workflow).with_size(px(12.)))
                     .child(descriptor.label.clone())
-                    .on_click(
-                        cx.listener(move |this, _, _, cx| this.set_model_option("ultracode", Value::Bool(!on), cx)),
-                    ),
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.set_model_option("ultracode", Value::Bool(!on), window, cx);
+                    })),
             )
         });
         let mode = self.runtime_mode();
@@ -1478,6 +1697,17 @@ impl Workspace {
 }
 
 /// `FastBolt`: one bolt for Fast, two overlapping for Ultrafast.
+/// `FOOTER_SEGMENT`'s keyboard half: a tab stop that Enter and Space press, with
+/// `focus-visible:ring-2 ring-inset` on an edge taken from its `px-2`, so nothing moves.
+fn footer_segment(element: gpui_kit::Stateful<gpui_kit::Div>, ring: Hsla) -> gpui_kit::Stateful<gpui_kit::Div> {
+    element
+        .tab_index(0)
+        .px(px(6.))
+        .border_2()
+        .border_color(gpui_kit::transparent_black())
+        .focus_visible(move |style| style.border_color(ring))
+}
+
 fn fast_bolt(ultra: bool) -> AnyElement {
     if !ultra {
         return Icon::new(Lucide::Zap).with_size(px(12.)).into_any_element();
@@ -1526,12 +1756,8 @@ struct EffortControls<'a> {
     locked: bool,
 }
 
-fn effort_controls<'a>(
-    descriptors: &'a [OptionDescriptor],
-    driver: &str,
-    ultrathink: model_label::Ultrathink,
-) -> EffortControls<'a> {
-    let speed = model_label::speed_select(descriptors, driver);
+fn effort_controls(descriptors: &[OptionDescriptor], ultrathink: model_label::Ultrathink) -> EffortControls<'_> {
+    let speed = model_label::speed_select(descriptors);
     let effort = model_label::reasoning(descriptors).filter(|d| d.id != "fastMode");
     let others = descriptors
         .iter()
@@ -1579,6 +1805,26 @@ fn effort_stops(controls: &EffortControls, selection: &ModelSelection) -> Vec<Ef
         on: model_label::current_value(descriptor, selection) == Some(Value::Bool(true)),
     });
     levels.chain(toggles).collect()
+}
+
+/// What takes a key in the open picker: the effort column or the search, each only while it
+/// has focus, so a focused footer segment keeps its own Enter and Space.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PickerKeys {
+    Effort(usize),
+    Search,
+    /// Shift+Enter: the highlighted model joins the ones a draft starts.
+    Add,
+    Elsewhere,
+}
+
+fn picker_keys(effort_focus: Option<usize>, effort_focused: bool, search_focused: bool, additive: bool) -> PickerKeys {
+    match effort_focus {
+        _ if additive && (effort_focused || search_focused) => PickerKeys::Add,
+        Some(index) if effort_focused => PickerKeys::Effort(index),
+        _ if search_focused => PickerKeys::Search,
+        _ => PickerKeys::Elsewhere,
+    }
 }
 
 /// `focusEffort`: the selected level, else the first level; with `any`, else the first stop.
@@ -1654,9 +1900,83 @@ fn set_favorite(info: &mut ServerInfo, key: &(String, String), favorite: bool) {
     }
 }
 
+/// The composer pick an open thread takes now. One on another instance replaces the live
+/// session, which may hold an open question, so it still waits for a sent message.
+fn thread_pick(
+    pick: Option<&ModelSelection>,
+    explicit: bool,
+    thread_model: Option<&ModelSelection>,
+) -> Option<ModelSelection> {
+    let (pick, thread_model) = (pick.filter(|_| explicit)?, thread_model?);
+    (pick.instance_id == thread_model.instance_id).then(|| pick.clone())
+}
+
+/// The model `env`'s thread `id` runs on, from its shell as the web reads it (`threadShellAtom`),
+/// so a pick made before the thread's projection loads is saved too; else the projection's.
+fn thread_model<'a>(
+    shells: &'a [crate::model::ThreadShell],
+    env: &str,
+    id: &str,
+    projection: Option<&'a ModelSelection>,
+) -> Option<&'a ModelSelection> {
+    let shell = shells.iter().find(|thread| thread.environment_id == env && thread.id == id);
+    shell.and_then(|thread| thread.model_selection.as_ref()).or(projection)
+}
+
+fn pick_failed(window: &mut Window, cx: &mut gpui_kit::App, reason: &str) {
+    let message = format!("This model pick was not saved. {reason}");
+    window.push_notification(Notification::error(message).title("Could not apply model selection"), cx);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_open_threads_pick_on_its_own_instance_is_saved_at_once() {
+        let selection = |instance: &str, model: &str| ModelSelection {
+            instance_id: instance.into(),
+            model: model.into(),
+            options: None,
+        };
+        let thread = selection("codex", "gpt-5");
+        let same = selection("codex", "gpt-5-mini");
+        assert_eq!(thread_pick(Some(&same), true, Some(&thread)), Some(same.clone()));
+        assert_eq!(thread_pick(Some(&selection("claude", "opus")), true, Some(&thread)), None, "waits for a send");
+        assert_eq!(thread_pick(Some(&same), false, Some(&thread)), None, "an inherited model is not a pick");
+        assert_eq!(thread_pick(Some(&same), true, None), None, "the thread is unknown");
+        assert_eq!(thread_pick(None, true, Some(&thread)), None);
+
+        // Before an uncached thread's projection loads, its shell names its model (`threadShellAtom`).
+        let mut shells: Vec<crate::model::ThreadShell> = serde_json::from_value(json!([
+            {"id": "t", "projectId": "p", "title": "T", "status": "idle", "updatedAt": "2026-01-01T00:00:00Z",
+                "modelSelection": {"instanceId": "codex", "model": "gpt-5"}},
+            {"id": "t", "projectId": "p", "title": "T", "status": "idle", "updatedAt": "2026-01-01T00:00:00Z",
+                "modelSelection": {"instanceId": "claude", "model": "opus"}},
+        ]))
+        .unwrap();
+        (shells[0].environment_id, shells[1].environment_id) = ("e1".into(), "e2".into());
+        let unloaded = thread_model(&shells, "e1", "t", None);
+        assert_eq!(thread_pick(Some(&same), true, unloaded), Some(same.clone()), "no projection yet");
+        let elsewhere = thread_model(&shells, "e2", "t", None);
+        assert_eq!(thread_pick(Some(&same), true, elsewhere), None, "another environment's thread t");
+        let moved = selection("claude", "opus");
+        assert_eq!(thread_model(&shells, "e3", "t", Some(&moved)), Some(&moved), "no shell: the projection's");
+    }
+
+    #[test]
+    fn only_a_targets_newest_model_save_releases_its_pick() {
+        let thread = |env: &str| super::super::Target::Thread { env: env.into(), id: "t".into() };
+        let mut saves = PickSaves::default();
+        // Pick A, B, then A again before any reply: the first A's success must not clear the last.
+        let (first, second, third) = (saves.begin(&thread("a")), saves.begin(&thread("a")), saves.begin(&thread("a")));
+        let other = saves.begin(&thread("b"));
+        assert!(!saves.settle(&thread("a"), first));
+        assert!(!saves.settle(&thread("a"), second));
+        assert!(saves.settle(&thread("a"), third));
+        assert!(!saves.settle(&thread("a"), third), "settles once");
+        assert!(saves.settle(&thread("b"), other), "another environment's thread t is its own target");
+    }
 
     #[test]
     fn a_thread_that_cannot_hand_off_keeps_its_provider_and_continuation_group() {
@@ -1715,7 +2035,7 @@ mod tests {
         .unwrap();
         let selection = ModelSelection { instance_id: "c".into(), model: "m".into(), options: None };
         let stops = |descriptors: &[OptionDescriptor]| {
-            effort_stops(&effort_controls(descriptors, "claudeAgent", model_label::Ultrathink::None), &selection)
+            effort_stops(&effort_controls(descriptors, model_label::Ultrathink::None), &selection)
         };
         let all = stops(&descriptors);
         assert_eq!(all.len(), 3, "two levels and the switch; the menu row opens by pointer");
@@ -1725,6 +2045,48 @@ mod tests {
         assert_eq!(effort_entry(&switches, false), None, "a pick lands only on levels");
         assert_eq!(effort_entry(&switches, true), Some(0), "ArrowRight takes any stop");
         assert_eq!(effort_entry(&[], true), None);
+        assert_eq!(picker_keys(Some(1), true, false, false), PickerKeys::Effort(1));
+        assert_eq!(
+            picker_keys(Some(1), false, false, false),
+            PickerKeys::Elsewhere,
+            "Tab left the column for a footer segment"
+        );
+        assert_eq!(
+            picker_keys(None, false, false, false),
+            PickerKeys::Elsewhere,
+            "Tab left the search for a footer segment"
+        );
+        assert_eq!(picker_keys(Some(1), false, true, false), PickerKeys::Search);
+        // Shift+Enter adds the highlighted model from the search or the effort column.
+        assert_eq!(picker_keys(Some(1), true, false, true), PickerKeys::Add);
+        assert_eq!(picker_keys(None, false, true, true), PickerKeys::Add);
+        assert_eq!(picker_keys(None, false, false, true), PickerKeys::Elsewhere, "a footer segment keeps it");
+    }
+
+    #[test]
+    fn an_open_picker_takes_its_hosts_latest_extra_providers() {
+        let generator = |models: Value| -> Rc<[Provider]> {
+            let provider = json!({"instanceId": "g", "driver": "openai", "models": models});
+            Rc::from([serde_json::from_value::<Provider>(provider).unwrap()])
+        };
+        let loading = generator(json!([]));
+        let loaded = generator(json!([{"slug": "m"}]));
+        let host = PickHost {
+            environment: None,
+            current: None,
+            include: Rc::new(|_: &Provider| true),
+            extra: Some(loading.clone()),
+            on_pick: Rc::new(|_, _, _, _| {}),
+        };
+        let mut state = PickerState { open: Some("writer".into()), host: Some(host), ..PickerState::default() };
+        let models = |state: &PickerState| state.host.as_ref().unwrap().extra.as_ref().unwrap()[0].models.len();
+        state.refresh_extra("other", &loaded);
+        assert_eq!(models(&state), 0, "another picker's render leaves it alone");
+        state.refresh_extra("writer", &loaded);
+        assert_eq!(models(&state), 1, "models discovered after opening are listed");
+        state.dismiss();
+        state.refresh_extra("writer", &loading);
+        assert!(state.host.is_none(), "a closed picker gets no host back");
     }
 
     #[test]

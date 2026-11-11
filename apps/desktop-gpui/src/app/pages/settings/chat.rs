@@ -25,6 +25,10 @@ const SEND_SHORTCUTS: &[(&str, &str)] = &[
 
 const FOLLOW_UPS: &[(&str, &str)] = &[("queue", "Queue"), ("steer", "Steer")];
 
+/// `TOOL_CALL_VISIBILITY_LABELS`.
+const TOOL_CALL_VISIBILITIES: &[(&str, &str)] =
+    &[("showAll", "Show all"), ("hideSuccessful", "Hide successful"), ("hideAll", "Hide all"), ("zen", "Zen")];
+
 /// The follow-up row says how to do the opposite for one message under the current send shortcut.
 fn follow_up_description(send_shortcut: &str) -> String {
     let opposite = match send_shortcut {
@@ -75,10 +79,18 @@ impl Workspace {
                 .setting("followUpBehavior")
                 .select(FOLLOW_UPS, 0.),
         )];
+        let activity = [row(
+            self,
+            SettingRow::new("tool-call-visibility")
+                .description("Hide the commands, edits, and searches agents run. Hide successful keeps failures. Zen shows only final answers. Approvals, questions, and errors always show.")
+                .setting("toolCallVisibility")
+                .select(TOOL_CALL_VISIBILITIES, 160.),
+        )];
         let composer = [rich_text, send_shortcut, self.advanced_fold("chat", [skills], cx)];
         let sections = [
             settings_section("composer", "Composer", composer, &t),
             settings_section("follow-ups", "Follow-ups", follow_ups, &t),
+            settings_section("activity", "Activity", activity, &t),
         ];
         self.settings_page("chat", view, sections, cx)
     }

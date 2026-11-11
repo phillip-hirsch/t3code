@@ -4,6 +4,7 @@
 
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::popover::Popover;
+use gpui_kit::{KeyDownEvent, Render, WeakEntity};
 
 use super::*;
 use crate::app::palette::LinkedThread;
@@ -38,13 +39,13 @@ pub(in crate::app::pages) fn checks_body(
                 .child(div().flex_1().min_w_0().truncate().child(check.name.clone()))
                 .child(div().flex_none().text_color(t.muted_foreground).child(logic::check_status_label(check)))
                 .children(url.map(|url| {
-                    div()
-                        .id(ElementId::Name(format!("pr-check-details-{index}-{}", check.name).into()))
+                    // A focusable link, so Tab and Enter open it too.
+                    Button::new(ElementId::Name(format!("pr-check-details-{index}-{}", check.name).into()))
+                        .link()
+                        .xsmall()
                         .flex_none()
-                        .cursor_pointer()
-                        .text_color(t.primary)
-                        .hover(gpui_kit::Styled::underline)
-                        .child("Details")
+                        .text_xs()
+                        .label("Details")
                         .on_click(move |_, _, cx| cx.open_url(&url))
                 }))
         });
@@ -69,13 +70,6 @@ fn thread_key(detail: &Detail) -> Option<(String, String, u64)> {
 }
 
 impl Workspace {
-    /// The shown pull request's stack and linked threads.
-    pub(super) fn read_pr_extras(&mut self, cx: &mut Context<Self>) {
-        if let Some(key) = self.pull_requests.panel.as_ref().map(|p| p.reference.key()) {
-            self.read_pr_extras_of(&key, cx);
-        }
-    }
-
     /// `key`'s stack and linked threads, read once the detail says what the host supports.
     pub(super) fn read_pr_extras_of(&mut self, key: &str, cx: &mut Context<Self>) {
         self.follow_pr_checks(key, cx);
@@ -285,7 +279,7 @@ impl Workspace {
             return None;
         }
         let url = panel.detail.as_ref()?.url.clone();
-        let environment = self.project_environment(&panel.reference.project_id)?;
+        let environment = SharedString::from(panel.reference.environment_id.clone());
         let tip = format!(
             "Linked from {} {}. Search in the command palette.",
             linked.len(),
@@ -303,97 +297,32 @@ impl Workspace {
         )
     }
 
-    /// "Link to thread": a searchable list of active threads in this environment.
+    /// "Link to thread": the pull request's environment's active threads, searchable (`ThreadPicker`).
     pub(super) fn open_pr_thread_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(detail) = self.pull_requests.panel.as_ref().and_then(|p| p.detail.clone()) else { return };
+        let Some(panel) = self.pull_requests.panel.as_ref() else { return };
+        let Some(detail) = panel.detail.clone() else { return };
+        let environment = SharedString::from(panel.reference.environment_id.clone());
         let term = logic::terminology(&detail.provider).0;
-        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search threads or projects..."));
-        search.update(cx, |input, cx| input.focus(window, cx));
-        let refresh = cx.subscribe_in(&search, window, |_, _, event: &InputEvent, window, _| {
-            if matches!(event, InputEvent::Change) {
-                window.refresh();
-            }
-        });
-        if let Some(panel) = self.pull_requests.panel.as_mut() {
-            panel._picker_search = Some(refresh);
+        let workspace = cx.weak_entity();
+        let picker = cx.new(|cx| ThreadPicker::new(workspace, environment, detail.url.clone(), window, cx));
+        // Closing returns focus to the actions trigger the keyboard opened it from.
+        if window.last_input_was_keyboard() {
+            self.pull_requests.actions_focus.focus(window, cx);
         }
-        let projects: HashMap<String, String> =
-            self.shell.projects.iter().map(|p| (p.id.clone(), p.title.clone())).collect();
-        let mut threads: Vec<(String, String, String, String)> = self
-            .shell
-            .threads
-            .iter()
-            .filter(|t| t.archived_at.is_none())
-            .map(|t| {
-                (
-                    t.id.clone(),
-                    t.title.clone(),
-                    projects.get(&t.project_id).cloned().unwrap_or_default(),
-                    t.updated_at.clone(),
-                )
-            })
-            .collect();
-        threads.sort_by(|a, b| b.3.cmp(&a.3));
-        let view = cx.entity().downgrade();
-        window.open_dialog(cx, move |dialog, _, cx| {
-            let query = search.read(cx).value().to_lowercase();
-            let t = *theme::tokens(cx);
-            let matching: Vec<&(String, String, String, String)> = threads
-                .iter()
-                .filter(|(_, title, project, _)| format!("{title} {project}").to_lowercase().contains(&query))
-                .collect();
-            let rows: Vec<AnyElement> = if matching.is_empty() {
-                vec![
-                    div()
-                        .px(px(12.))
-                        .py(px(24.))
-                        .text_center()
-                        .text_sm()
-                        .text_color(t.muted_foreground)
-                        .child("No active threads found.")
-                        .into_any_element(),
-                ]
-            } else {
-                matching
-                    .into_iter()
-                    .map(|(id, title, project, _)| {
-                        let (id, view) = (id.clone(), view.clone());
-                        h_flex()
-                            .id(ElementId::Name(format!("pr-link-thread-{id}").into()))
-                            .gap(px(8.))
-                            .px(px(8.))
-                            .py(px(6.))
-                            .rounded(px(6.))
-                            .text_sm()
-                            .cursor_pointer()
-                            .hover(|s| s.bg(t.accent))
-                            .child(div().flex_1().min_w_0().truncate().child(title.clone()))
-                            .child(div().flex_none().text_xs().text_color(t.muted_foreground).child(project.clone()))
-                            .on_click(move |_, window, cx| {
-                                window.close_dialog(cx);
-                                let _ = view
-                                    .update(cx, |this, cx| this.change_pr_thread_link(id.clone(), true, window, cx));
-                            })
-                            .into_any_element()
-                    })
-                    .collect()
-            };
-            dialog.entrance(DialogEntrance::None).title(format!("Link {term} to a thread")).child(
-                v_flex()
-                    .gap(px(8.))
-                    .child(Input::new(&search))
-                    .child(v_flex().id("pr-link-threads").max_h(px(320.)).overflow_y_scroll().children(rows)),
-            )
+        let search = picker.read(cx).search.clone();
+        let focus = std::cell::Cell::new(true);
+        window.open_dialog(cx, move |dialog, window, cx| {
+            if focus.replace(false) {
+                search.update(cx, |input, cx| input.focus(window, cx));
+            }
+            dialog.entrance(DialogEntrance::None).title(format!("Link {term} to a thread")).child(picker.clone())
         });
     }
 
     /// The thread showing the pull request, when it lives on the pull request's environment, and
     /// whether it links it (`usePullRequestLinking().isLinked`).
-    pub(super) fn pr_current_thread(&self, project_id: &str, thread_id: &str, url: &str) -> Option<(String, bool)> {
-        let thread = self.shell.threads.iter().find(|t| t.id == thread_id)?;
-        if self.project_environment(&thread.project_id) != self.project_environment(project_id) {
-            return None;
-        }
+    pub(super) fn pr_current_thread(&self, environment_id: &str, thread_id: &str, url: &str) -> Option<(String, bool)> {
+        let thread = self.shell.threads.iter().find(|t| t.id == thread_id && t.environment_id == environment_id)?;
         Some((thread.id.clone(), crate::thread_pull_requests::links_url(&thread.pull_requests, url)))
     }
 
@@ -405,8 +334,11 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(client) = self.thread_client(&thread_id) else { return };
-        let Some(detail) = self.pull_requests.panel.as_ref().and_then(|p| p.detail.clone()) else { return };
+        // Both entry points list only threads on the pull request's environment.
+        let Some(client) = self.pull_request_client() else { return };
+        let Some(panel) = self.pull_requests.panel.as_ref() else { return };
+        let Some(detail) = panel.detail.clone() else { return };
+        let key = panel.reference.key();
         let Some((host, repository, number)) = thread_key(&detail) else { return };
         let term = logic::terminology(&detail.provider).0;
         let id = super::super::super::new_id();
@@ -424,7 +356,7 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("orchestration.dispatchCommand", command).await;
             let _ = this.update_in(cx, |this, window, cx| match result {
-                Ok(_) => this.read_pr_extras(cx),
+                Ok(_) => this.read_pr_extras_of(&key, cx),
                 Err(error) => {
                     let title = if link {
                         format!("Could not link the {term}")
@@ -441,6 +373,9 @@ impl Workspace {
     /// "Allow edits from maintainers" (`pullRequests.update` with `maintainerCanModify`).
     pub(super) fn save_pr_maintainer_edits(&mut self, value: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(client) = self.pull_request_client() else { return };
+        if !self.shown_pr_key().is_some_and(|key| self.pr_panel_permits(&key, "pullRequests.update", None)) {
+            return;
+        }
         let Some(panel) = self.pull_requests.panel.as_mut() else { return };
         if panel.maintainer_saving {
             return;
@@ -691,6 +626,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let Some(client) = self.pull_request_client() else { return };
+        if !self.shown_pr_key().is_some_and(|key| self.pr_panel_permits(&key, "pullRequests.runAction", None)) {
+            return;
+        }
         let Some(panel) = self.pull_requests.panel.as_mut() else { return };
         if panel.pending.is_some() || !panel.stack_fresh || panel.stack_failed {
             return;
@@ -744,13 +682,365 @@ impl Workspace {
                     ),
                     Ok(_) => toast_success(window, cx, "Stack rebased"),
                 }
-                this.read_pr_detail(cx);
-                this.read_pr_extras(cx);
+                this.read_pr_detail_of(&key, cx);
+                this.read_pr_extras_of(&key, cx);
                 this.read_pull_requests(false, cx);
                 cx.notify();
             });
         })
         .detach();
         cx.notify();
+    }
+}
+
+/// One row of the thread picker.
+#[derive(Debug, PartialEq)]
+struct Candidate {
+    id: String,
+    title: String,
+    project: String,
+    /// It links the pull request already, so it shows "Linked" and cannot be picked.
+    linked: bool,
+}
+
+/// `ThreadPicker`'s rows: `environment`'s active threads whose title or project name contains
+/// `query`, newest first.
+fn picker_candidates(
+    threads: &[crate::model::ThreadShell],
+    projects: &[crate::model::ProjectShell],
+    environment: &str,
+    query: &str,
+    url: &str,
+) -> Vec<Candidate> {
+    let search = query.trim().to_lowercase();
+    let project_name = |id: &str| {
+        projects.iter().find(|p| p.environment_id == environment && p.id == id).map_or("", |p| p.title.as_str())
+    };
+    let mut rows: Vec<(&str, Candidate)> = threads
+        .iter()
+        .filter(|t| t.environment_id == environment && t.archived_at.is_none())
+        .filter(|t| format!("{} {}", t.title, project_name(&t.project_id)).to_lowercase().contains(&search))
+        .map(|t| {
+            let candidate = Candidate {
+                id: t.id.clone(),
+                title: t.title.clone(),
+                project: project_name(&t.project_id).to_owned(),
+                linked: crate::thread_pull_requests::links_url(&t.pull_requests, url),
+            };
+            (t.updated_at.as_str(), candidate)
+        })
+        .collect();
+    rows.sort_by(|a, b| b.0.cmp(a.0));
+    rows.into_iter().map(|(_, candidate)| candidate).collect()
+}
+
+/// The row the arrows reach from `current` (`autoHighlight="always"`: the first pickable row
+/// until they move), skipping rows that cannot be picked and wrapping at the ends.
+fn picker_step(rows: &[Candidate], current: Option<usize>, down: bool) -> Option<usize> {
+    let pickable: Vec<usize> = rows.iter().enumerate().filter(|(_, row)| !row.linked).map(|(i, _)| i).collect();
+    let at = current.and_then(|current| pickable.iter().position(|&i| i == current));
+    let next = match (at, down) {
+        (None, _) => 0,
+        (Some(at), true) => (at + 1) % pickable.len().max(1),
+        (Some(at), false) => (at + pickable.len().max(1) - 1) % pickable.len().max(1),
+    };
+    pickable.get(next).copied()
+}
+
+/// `useThreadSearch([environment], query, { titlesOnly: true })`: an environment whose shell
+/// leaves older settled threads out finds their titles from two characters.
+fn picker_search_input(query: &str, before: Option<&str>) -> Option<Value> {
+    let query: String = query.trim().chars().take(200).collect::<String>().trim().to_owned();
+    let before = before.filter(|_| query.chars().count() >= 2)?;
+    Some(json!({"query": query, "olderSettledBefore": before, "titlesOnly": true}))
+}
+
+/// `ThreadPicker`: searches the pull request's environment's threads, loading older settled
+/// ones the shell left out, and picks one with a click or the arrows and Enter.
+struct ThreadPicker {
+    workspace: WeakEntity<Workspace>,
+    environment: SharedString,
+    url: String,
+    search: Entity<InputState>,
+    /// The thread the arrows or the pointer last highlighted.
+    highlight: Option<String>,
+    scroll: ScrollHandle,
+    _search: Option<Task<()>>,
+    /// What `_search` asked, on which socket, under which shell snapshot: a reconnect or a new
+    /// snapshot asks again, as `useThreadSearch`'s query reruns when its session changes.
+    asked: Option<(Value, crate::rpc::SocketId, u64)>,
+    /// The shell revision last drawn.
+    revision: Option<u64>,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl ThreadPicker {
+    fn new(
+        workspace: WeakEntity<Workspace>,
+        environment: SharedString,
+        url: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search threads or projects..."));
+        let typed = cx.subscribe(&search, |this: &mut Self, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.highlight = None;
+                this.scroll.scroll_to_item(0);
+                this.search_older(cx);
+                cx.notify();
+            }
+        });
+        // Threads the search loads, and any other shell change, show as they land.
+        let shell = workspace.upgrade().map(|workspace| {
+            cx.observe(&workspace, |this: &mut Self, workspace, cx| {
+                let revision = workspace.read(cx).shell.revision;
+                if this.revision.replace(revision) != Some(revision) {
+                    cx.notify();
+                }
+                this.search_older(cx);
+            })
+        });
+        Self {
+            workspace,
+            environment,
+            url,
+            search,
+            highlight: None,
+            scroll: ScrollHandle::new(),
+            _search: None,
+            asked: None,
+            revision: None,
+            _subscriptions: [Some(typed), shell].into_iter().flatten().collect(),
+        }
+    }
+
+    fn rows(&self, cx: &App) -> Vec<Candidate> {
+        let Some(workspace) = self.workspace.upgrade() else { return Vec::new() };
+        let shell = &workspace.read(cx).shell;
+        let query = self.search.read(cx).value();
+        picker_candidates(&shell.threads, &shell.projects, &self.environment, &query, &self.url)
+    }
+
+    /// The highlighted row: the last one highlighted while it can be picked, else the first.
+    fn highlighted(&self, rows: &[Candidate]) -> Option<usize> {
+        let kept = self.highlight.as_ref().and_then(|id| rows.iter().position(|r| &r.id == id && !r.linked));
+        kept.or_else(|| picker_step(rows, None, true))
+    }
+
+    /// The query's older settled threads, after the search's debounce, join the shell.
+    fn search_older(&mut self, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else { return };
+        let workspace = workspace.read(cx);
+        let before = workspace.shell.older_settled(&self.environment).map(|cut| cut.before.as_str());
+        let query = self.search.read(cx).value().to_string();
+        let (Some(input), Some(client), generation) = (
+            picker_search_input(&query, before),
+            workspace.env_client(&self.environment),
+            workspace.shell.generation(&self.environment),
+        ) else {
+            (self._search, self.asked) = (None, None);
+            return;
+        };
+        let asked = (input.clone(), client.socket_id(), generation);
+        if self.asked.as_ref() == Some(&asked) {
+            return;
+        }
+        self.asked = Some(asked);
+        let environment = self.environment.clone();
+        self._search = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(120)).await;
+            let answer = client.request("orchestration.searchThreads", input).await;
+            let rows = answer.map_err(|error| error.to_string()).and_then(|value| {
+                serde_json::from_value::<crate::model::ThreadRows>(value).map_err(|error| error.to_string())
+            });
+            let rows = match rows {
+                Ok(rows) => rows,
+                Err(error) => {
+                    log::warn!("orchestration.searchThreads: {error}");
+                    return;
+                }
+            };
+            let _ = this.update(cx, |this, cx| {
+                let Some(workspace) = this.workspace.upgrade() else { return };
+                workspace.update(cx, |workspace, cx| {
+                    if workspace.shell.mount_rows(&environment, generation, rows) {
+                        workspace.notify_sidebar(cx);
+                        cx.notify();
+                    }
+                });
+            });
+        }));
+    }
+
+    fn pick(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        window.close_dialog(cx);
+        if let Some(workspace) = self.workspace.upgrade() {
+            workspace.update(cx, |this, cx| this.change_pr_thread_link(id, true, window, cx));
+        }
+    }
+
+    /// The combobox keys: Up and Down move the highlight, Enter picks it.
+    fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if event.keystroke.modifiers.modified() {
+            return;
+        }
+        let rows = self.rows(cx);
+        match event.keystroke.key.as_str() {
+            key @ ("down" | "up") => {
+                if let Some(next) = picker_step(&rows, self.highlighted(&rows), key == "down") {
+                    self.highlight = Some(rows[next].id.clone());
+                    self.scroll.scroll_to_item(next);
+                    cx.notify();
+                }
+            }
+            "enter" => match self.highlighted(&rows) {
+                Some(index) => self.pick(rows[index].id.clone(), window, cx),
+                None => return,
+            },
+            _ => return,
+        }
+        cx.stop_propagation();
+    }
+}
+
+impl Render for ThreadPicker {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = *theme::tokens(cx);
+        let rows = self.rows(cx);
+        let highlighted = self.highlighted(&rows);
+        let list: Vec<AnyElement> = if rows.is_empty() {
+            vec![
+                div()
+                    .px(px(12.))
+                    .py(px(24.))
+                    .text_center()
+                    .text_sm()
+                    .text_color(t.muted_foreground)
+                    .child("No active threads found.")
+                    .into_any_element(),
+            ]
+        } else {
+            rows.into_iter()
+                .enumerate()
+                .map(|(index, row)| {
+                    let id = row.id.clone();
+                    let hover_id = row.id.clone();
+                    let title = if row.title.is_empty() { "Untitled thread".to_owned() } else { row.title };
+                    h_flex()
+                        .id(ElementId::Name(format!("pr-link-thread-{}", row.id).into()))
+                        .gap(px(8.))
+                        .px(px(8.))
+                        .py(px(6.))
+                        .rounded(px(6.))
+                        .text_sm()
+                        .when(highlighted == Some(index), |el| el.bg(t.accent))
+                        .child(Icon::new(Lucide::MessageSquare).with_size(px(16.)).flex_none())
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .child(div().truncate().child(title))
+                                .child(div().truncate().text_xs().text_color(t.muted_foreground).child(row.project)),
+                        )
+                        .map(|el| {
+                            if row.linked {
+                                el.opacity(0.64)
+                                    .child(Icon::new(Lucide::Check).with_size(px(14.)).flex_none())
+                                    .child(div().flex_none().text_xs().text_color(t.muted_foreground).child("Linked"))
+                            } else {
+                                el.cursor_pointer()
+                                    .on_mouse_move(cx.listener(move |this, _, _, cx| {
+                                        if this.highlight.as_ref() != Some(&hover_id) {
+                                            this.highlight = Some(hover_id.clone());
+                                            cx.notify();
+                                        }
+                                    }))
+                                    .on_click(cx.listener(move |this, _, window, cx| this.pick(id.clone(), window, cx)))
+                            }
+                        })
+                        .into_any_element()
+                })
+                .collect()
+        };
+        v_flex().gap(px(8.)).capture_key_down(cx.listener(Self::key_down)).child(Input::new(&self.search)).child(
+            v_flex()
+                .id("pr-link-threads")
+                .max_h(px(320.))
+                .overflow_y_scroll()
+                .track_scroll(&self.scroll)
+                .children(list),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Candidate, picker_candidates, picker_search_input, picker_step};
+    use crate::model::{ProjectShell, ThreadShell};
+    use serde_json::json;
+
+    const URL: &str = "https://github.com/o/r/pull/7";
+
+    fn thread(env: &str, id: &str, title: &str, updated: &str, extra: serde_json::Value) -> ThreadShell {
+        let mut value = json!({
+            "id": id, "projectId": "p", "title": title, "status": "idle",
+            "createdAt": updated, "updatedAt": updated, "lineage": {"rootThreadId": id},
+        });
+        value.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        ThreadShell { environment_id: env.to_owned().into(), ..serde_json::from_value(value).unwrap() }
+    }
+
+    fn row(id: &str, linked: bool) -> Candidate {
+        Candidate { id: id.into(), title: String::new(), project: String::new(), linked }
+    }
+
+    #[test]
+    fn the_picker_lists_its_environments_active_threads_newest_first() {
+        let link = json!({"pullRequests": [{"host": "github.com", "repository": "o/r", "number": 7, "url": URL,
+            "source": "manual", "linkedAt": "2026-11-03T00:00:00.000Z"}]});
+        let threads = [
+            thread("a", "old", "Fix login", "2026-11-01T00:00:00.000Z", json!({})),
+            thread("a", "new", "Docs", "2026-11-03T00:00:00.000Z", link),
+            thread(
+                "a",
+                "gone",
+                "Fix more",
+                "2026-11-04T00:00:00.000Z",
+                json!({"archivedAt": "2026-11-04T00:00:00.000Z"}),
+            ),
+            thread("b", "other", "Fix elsewhere", "2026-11-05T00:00:00.000Z", json!({})),
+        ];
+        let project: ProjectShell =
+            serde_json::from_value(json!({"id": "p", "title": "Webapp", "workspaceRoot": "/r"})).unwrap();
+        let projects = [ProjectShell { environment_id: "a".into(), ..project }];
+        let ids = |query: &str| -> Vec<(String, bool)> {
+            picker_candidates(&threads, &projects, "a", query, URL).into_iter().map(|c| (c.id, c.linked)).collect()
+        };
+        assert_eq!(ids(""), [("new".into(), true), ("old".into(), false)]);
+        assert_eq!(ids(" fix "), [("old".into(), false)]);
+        assert_eq!(ids("webapp").len(), 2, "the project name matches too");
+    }
+
+    #[test]
+    fn the_arrows_skip_linked_threads_and_wrap() {
+        let rows = [row("a", true), row("b", false), row("c", true), row("d", false)];
+        assert_eq!(picker_step(&rows, None, true), Some(1), "the first pickable row starts highlighted");
+        assert_eq!(picker_step(&rows, Some(1), true), Some(3));
+        assert_eq!(picker_step(&rows, Some(3), true), Some(1));
+        assert_eq!(picker_step(&rows, Some(1), false), Some(3));
+        assert_eq!(picker_step(&[row("a", true)], None, true), None);
+        assert_eq!(picker_step(&[], None, false), None);
+    }
+
+    #[test]
+    fn the_picker_searches_older_settled_titles_from_two_characters() {
+        let before = Some("2026-10-01T00:00:00.000Z");
+        assert_eq!(picker_search_input("f", before), None);
+        assert_eq!(picker_search_input("fix", None), None, "a shell with every thread needs no search");
+        assert_eq!(
+            picker_search_input(" fx ", before),
+            Some(json!({"query": "fx", "olderSettledBefore": before, "titlesOnly": true}))
+        );
     }
 }

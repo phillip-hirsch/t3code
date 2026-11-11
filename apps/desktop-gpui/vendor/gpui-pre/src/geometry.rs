@@ -2849,6 +2849,11 @@ impl Pixels {
         ScaledPixels(self.0 * factor)
     }
 
+    /// t3code: a platform length in a window whose interface scale is `ui_scale`.
+    pub(crate) fn scale_down(self, ui_scale: f32) -> Pixels {
+        Pixels(self.0 / ui_scale)
+    }
+
     /// Raises the `Pixels` value to a given power.
     ///
     /// # Arguments

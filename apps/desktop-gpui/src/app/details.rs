@@ -15,38 +15,49 @@ use gpui_kit::{
 };
 use serde_json::{Value, json};
 
-use self::lineage::{Relationships, Relative};
+use self::lineage::{Kind, MergeBack, Relationships, Relative, Workflow};
 use super::git::{self, GitRequest, QuickKind};
 use super::titlebar::{RIGHT_RESIZE_INSET, TITLEBAR_HEIGHT, icon};
 use super::{Target, Workspace, new_id};
 use crate::model::{DelegatedFrom, ProjectScript, ThreadShell, TokenUsage, UsageLimits};
+use crate::remote_open::RemoteOpenState;
 use crate::theme::{self, Tokens};
 use crate::thread_details;
 
 pub(super) mod automations;
+pub(super) mod commit_dialog;
 pub(super) mod lineage;
+mod publish_dialog;
 pub(super) mod servers;
 
 const CARD_WIDTH: f32 = 280.;
 /// `quickActionDisabledReason` without `source-control:write`.
 const NO_SOURCE_CONTROL_WRITE: &str = "This connection cannot change source control.";
+/// The guard's refusal for a PR generated from a thread this connection cannot read.
+const NO_THREAD_READ: &str = "This connection requires orchestration:read.";
+/// `threadOperationFailure` without `orchestration:operate`.
+const NOT_OPERATE: &str = "This connection cannot change threads.";
 const CARD_INSET: f32 = 12.;
-const ROW_HEIGHT: f32 = 32.;
+pub(super) const ROW_HEIGHT: f32 = 32.;
 const METER_ROW_HEIGHT: f32 = 24.;
 /// A section's 8px top and 10px bottom padding.
 const SECTION_PADDING: f32 = 18.;
-/// A section heading: 32px plus its 4px bottom margin.
-const HEADING_HEIGHT: f32 = 36.;
+/// `ThreadLineageRowList`: `max-h-[13.5rem]`, or `max-h-[min(28rem,55dvh)]` with a workflow open.
+const LINEAGE_LIST_MAX: f32 = 216.;
+const LINEAGE_WORKFLOW_LIST_MAX: f32 = 448.;
+/// Slots of the card's `sections` that scroll as they grow.
+const LINEAGE_SLOT: usize = 4;
+const SIDE_CHATS_SLOT: usize = 5;
 
 /// The card's opaque stand-ins for `dropdown-glass` (the popover at `--glass-opacity`
 /// over the canvas); GPUI has no backdrop blur.
 #[derive(Clone, Copy)]
-struct CardColors {
+pub(super) struct CardColors {
     background: Hsla,
     border: Hsla,
     divider: Hsla,
-    hover: Hsla,
-    label: Hsla,
+    pub(super) hover: Hsla,
+    pub(super) label: Hsla,
     muted: Hsla,
     track: Hsla,
     tick: Hsla,
@@ -94,6 +105,26 @@ fn resolve_density(available: f32, full: f32, compact: f32) -> Density {
     }
 }
 
+/// The card height `resolve_density` weighs at `density`: each shown section with its
+/// padding, plus the card's border. Like the web's measure it leaves out Lineage and Side
+/// chats, which scroll as they grow, so a long list cannot drop the card below full.
+fn fitting_height(sections: &[Option<Section>], density: Density) -> f32 {
+    sections
+        .iter()
+        .enumerate()
+        .filter(|(slot, _)| *slot != LINEAGE_SLOT && *slot != SIDE_CHATS_SLOT)
+        .filter_map(|(_, section)| section.as_ref())
+        .filter(|section| section.min_density <= density)
+        .map(|section| section.height + SECTION_PADDING)
+        .sum::<f32>()
+        + 2.
+}
+
+/// Whether the card shows Lineage at `density`.
+fn lineage_renders(sections: &[Option<Section>], density: Density) -> bool {
+    sections.get(LINEAGE_SLOT).and_then(Option::as_ref).is_some_and(|section| section.min_density <= density)
+}
+
 /// One label | bar | value row of the usage grid (`ThreadDetailsUsage.tsx` `UsageRow`).
 struct Meter {
     id: SharedString,
@@ -129,6 +160,17 @@ pub(super) fn editor_label(id: &str) -> &str {
         "zed" => "Zed",
         "antigravity" => "Antigravity",
         "idea" => "IntelliJ IDEA",
+        "aqua" => "Aqua",
+        "clion" => "CLion",
+        "datagrip" => "DataGrip",
+        "dataspell" => "DataSpell",
+        "goland" => "GoLand",
+        "phpstorm" => "PhpStorm",
+        "pycharm" => "PyCharm",
+        "rider" => "Rider",
+        "rubymine" => "RubyMine",
+        "rustrover" => "RustRover",
+        "webstorm" => "WebStorm",
         "file-manager" if cfg!(target_os = "macos") => "Finder",
         "file-manager" if cfg!(target_os = "windows") => "File Explorer",
         "file-manager" => "Files",
@@ -233,7 +275,7 @@ impl Workspace {
     fn details_key(&self) -> Option<String> {
         match self.target.as_ref()? {
             Target::Thread { env, id } => Some(format!("{env}:{id}")),
-            Target::Draft { env, project_id } => Some(format!("{env}:draft:{project_id}")),
+            Target::Draft { env, project_id, .. } => Some(format!("{env}:draft:{project_id}")),
         }
     }
 
@@ -283,7 +325,9 @@ impl Workspace {
     }
 
     pub(super) fn render_details_card(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if !self.details_shown(window) {
+        let shown = self.details_shown(window);
+        self.follow_card_pull_requests(shown, window, cx);
+        if !shown {
             return None;
         }
         let tokens = *theme::tokens(cx);
@@ -303,20 +347,24 @@ impl Workspace {
             self.version_control_section(&tokens, &colors, cx),
             self.servers_section(&tokens, &colors, cx),
             self.automations_section(&tokens, &colors, cx),
-            self.lineage_section(&relationships, &tokens, &colors, cx).filter(|_| self.details_item_shown("lineage")),
+            self.lineage_section(&relationships, f32::from(viewport.height), &tokens, &colors, cx)
+                .filter(|_| self.details_item_shown("lineage")),
             self.side_chats_section(&relationships, &tokens, &colors, cx)
                 .filter(|_| self.details_item_shown("sideChats")),
             self.usage_section(&tokens, &colors).filter(|_| self.details_item_shown("usage")),
             self.context_section(&tokens, &colors).filter(|_| self.details_item_shown("context")),
         ];
-        let height_at = |density: Density| {
-            let shown = sections.iter().flatten().filter(|s| s.min_density <= density);
-            shown.map(|s| s.height + SECTION_PADDING).sum::<f32>() + 2.
-        };
-        let density = resolve_density(available, height_at(Density::Full), height_at(Density::Compact));
+        let density = resolve_density(
+            available,
+            fitting_height(&sections, Density::Full),
+            fitting_height(&sections, Density::Compact),
+        );
         if density != Density::Full {
             sections[0] = self.workspace_section_at(density, &tokens, &colors, cx);
             sections[1] = self.version_control_section_at(density, &tokens, &colors, cx);
+        }
+        if lineage_renders(&sections, density) && self.lineage_ticks(&relationships) {
+            self.lineage.card_ticks.set(true);
         }
         let sections: Vec<AnyElement> = sections
             .into_iter()
@@ -374,7 +422,7 @@ impl Workspace {
         // `PopoverPopup variant="panel"` under the header, `align="end"`: 4px align
         // offset plus its 8px padding put the card where the inline one sits, 8px
         // below the header, capped at `100dvh - 6.5rem`.
-        let right = self.right_panel_width(window).map_or(px(0.), px) + RIGHT_RESIZE_INSET;
+        let right = self.right_panel_docked_width(window).map_or(px(0.), px) + RIGHT_RESIZE_INSET;
         let corner = point(viewport.width - right - px(CARD_INSET), TITLEBAR_HEIGHT + px(8.));
         Some(
             deferred(
@@ -513,13 +561,22 @@ impl Workspace {
             .or_else(|| available.first().map(String::as_str))
     }
 
+    /// `shouldShowOpenInPicker`: a project on the desktop's own environment or a remote one.
+    fn open_in_row_shows(&self, cx: &mut Context<Self>) -> Option<SharedString> {
+        let project = self.target_project()?;
+        let environment = self.active_environment()?.clone();
+        let shows = !project.workspace_root.is_empty()
+            && (self.primary_environment() == Some(&environment)
+                || self.remote_open_state(&environment, cx) != RemoteOpenState::LocalExec);
+        shows.then_some(environment)
+    }
+
     /// `OpenInPicker` in panel mode: the row opens the preferred editor, the chevron picks it.
     fn open_in_row(&self, tokens: &Tokens, colors: &CardColors, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let project = self.target_project()?;
-        if project.workspace_root.is_empty() {
-            return None;
-        }
-        let preferred = self.preferred_editor().map(str::to_owned);
+        let environment = self.open_in_row_shows(cx)?;
+        let open_in = self.open_in(&environment, cx);
+        let (can_open, host_denied) = (open_in.can_open(), open_in.host_denied);
+        let preferred = open_in.preferred.clone();
         let label: SharedString = match &preferred {
             Some(editor) => format!("Open in {}", editor_label(editor)).into(),
             None => "Open in editor".into(),
@@ -532,47 +589,44 @@ impl Workspace {
                 .into_any_element(),
         };
         let view = cx.entity();
-        let editors = self.server_info().available_editors.clone();
-        let current = preferred.clone();
         let menu_tokens = *tokens;
         let build = move |mut menu: PopupMenu, window: &mut Window, _: &mut Context<PopupMenu>| {
-            if editors.is_empty() {
-                return menu.item(PopupMenuItem::new("No installed editors found").disabled(true));
-            }
-            for editor in &editors {
+            for editor in open_in.listed() {
                 let picked = editor.clone();
                 let label = SharedString::from(editor_label(editor).to_owned());
-                let checked = current.as_deref() == Some(editor.as_str());
+                let checked = open_in.preferred.as_deref() == Some(editor.as_str());
                 let item_editor = editor.clone();
                 menu = menu.item(
                     PopupMenuItem::element(move |_, _| {
                         h_flex().gap_2().child(editor_icon(&item_editor, &menu_tokens)).child(label.clone())
                     })
                     .checked(checked)
+                    .disabled(!can_open)
                     .on_click(window.listener_for(&view, move |this, _, _, cx| {
                         this.preferred_editor = Some(picked.clone());
                         cx.notify();
                     })),
                 );
             }
-            menu
+            open_in.menu_notes(menu)
         };
-        let enabled = preferred.is_some() && self.git_cwd().is_some();
+        let enabled = preferred.is_some() && can_open && self.git_cwd().is_some();
         Some(
             split_row("details-open-in", colors, cx)
                 .child(
                     split_primary("details-open-in-primary", colors, enabled, cx)
                         .child(leading)
                         .child(div().min_w_0().truncate().child(label))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if let Some(editor) = preferred.clone() {
-                                this.open_in_editor(editor, cx);
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            if enabled {
+                                this.open_workspace_in_preferred_editor(window, cx);
                             }
                         })),
                 )
                 .child(split_hairline("details-open-in", colors))
                 .child(
                     split_menu("details-open-in-menu", tokens, colors, cx)
+                        .disabled(host_denied)
                         .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, cx| {
                             build(menu.min_w(px(264.)), window, cx)
                         }),
@@ -587,27 +641,17 @@ impl Workspace {
         if let Some(opened) = self.open_favorite_in_file_surface(window, cx) {
             return opened;
         }
-        if self.target_project().is_none_or(|project| project.workspace_root.is_empty()) {
-            return false;
-        }
-        let Some(editor) = self.preferred_editor().map(str::to_owned) else { return false };
-        self.open_in_editor(editor, cx);
-        true
+        self.open_workspace_in_preferred_editor(window, cx)
     }
 
-    /// `shell.openInEditor` on the thread's workspace.
-    fn open_in_editor(&mut self, editor: String, cx: &mut Context<Self>) {
-        let (Some(client), Some(cwd)) = (self.client(), self.git_cwd()) else { return };
-        self.preferred_editor = Some(editor.clone());
-        cx.spawn(async move |this, cx| {
-            if let Err(error) = client.request("shell.openInEditor", json!({"cwd": cwd, "editor": editor})).await {
-                let _ = this.update(cx, |this, cx| {
-                    this.error = Some(format!("Couldn't open the editor: {error}").into());
-                    cx.notify();
-                });
-            }
-        })
-        .detach();
+    /// The Open in row's primary action: the thread's workspace in the preferred editor, on its
+    /// host or, for a remote environment, in this machine's editor. Returns whether it opened.
+    fn open_workspace_in_preferred_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let (Some(environment), Some(cwd)) = (self.open_in_row_shows(cx), self.git_cwd()) else { return false };
+        let open_in = self.open_in(&environment, cx);
+        let can_open = open_in.can_open();
+        let Some(editor) = open_in.preferred.filter(|_| can_open) else { return false };
+        self.open_in_editor_at(&environment, cwd, false, editor, false, window, cx)
     }
 
     /// `ProjectScriptsControl` in panel mode: run the primary script, pick, import or add one from
@@ -618,7 +662,7 @@ impl Workspace {
             shortcut_label_for_command,
         };
         let project = self.target_project()?;
-        let project_id = project.id.clone();
+        let (project_key, project_id) = (crate::model::ScopedId::of_project(project), project.id.clone());
         let saved = resolve_project_scripts(&self.server_info().settings, project);
         // `useT3ProjectFileScripts` on the thread's checkout and machine; read on first sight.
         let checkout = self.active_environment().cloned().zip(self.git_cwd());
@@ -644,13 +688,13 @@ impl Workspace {
                     .child(div().ml(px(2.)).truncate().child("Add project script"))
                     .tooltip(|window, cx| Tooltip::new("Add project script").build(window, cx))
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.open_project_script_editor(&project_id, None, window, cx);
+                        this.open_project_script_editor(&project_key, None, window, cx);
                     }))
                     .into_any_element(),
             );
         }
         let primary = primary_script(&saved, self.last_invoked_script(&project_id))
-            .map(|script| (SharedString::from(script.name.clone()), ScriptRun::new(&project_id, script)));
+            .map(|script| (SharedString::from(script.name.clone()), ScriptRun::new(&project_key, script)));
         let keybindings = self.server_info().keybindings_json();
         let scripts: Vec<ScriptItem> = saved
             .iter()
@@ -660,7 +704,7 @@ impl Workspace {
                 icon: script.icon.clone(),
                 shortcut: shortcut_label_for_command(keybindings, command_for_project_script(&script.id).as_deref())
                     .map(Into::into),
-                run: ScriptRun::new(&project_id, script),
+                run: ScriptRun::new(&project_key, script),
             })
             .collect();
         // `scriptItems`: the scripts, then the `t3.json` ones to import, then "Add project script".
@@ -684,7 +728,7 @@ impl Workspace {
                 menu = menu.label("From t3.json");
             }
             for input in &importable {
-                let (pid, input) = (project_id.clone(), input.clone());
+                let (pid, input) = (project_key.clone(), input.clone());
                 let name = SharedString::from(input.name.clone());
                 menu = menu.item(
                     PopupMenuItem::element(move |_, cx| {
@@ -701,7 +745,7 @@ impl Workspace {
                     })),
                 );
             }
-            let pid = project_id.clone();
+            let pid = project_key.clone();
             menu.item(PopupMenuItem::new("Add project script").icon(icon("icons/plus.svg")).on_click(
                 window.listener_for(&view, move |this, _, window, cx| {
                     this.open_project_script_editor(&pid, None, window, cx);
@@ -750,7 +794,7 @@ impl Workspace {
     /// Scripts run in the thread's terminal; the terminal drawer owns `RunInTerminal`.
     fn run_project_script(&mut self, run: &ScriptRun, window: &mut Window, cx: &mut Context<Self>) {
         let Some(cwd) = self.git_cwd().filter(|_| self.can_run_scripts()) else { return };
-        self.remember_script(&run.project_id, &run.id);
+        self.remember_script(&run.project.id, &run.id);
         window.dispatch_action(Box::new(super::RunInTerminal::script(cwd, &run.script)), cx);
     }
 
@@ -793,11 +837,19 @@ impl Workspace {
     ) -> Option<Section> {
         self.vcs.cwd.as_ref()?;
         let status = self.vcs.status.as_ref();
-        let is_repo = status.is_none_or(|status| status.local.is_repo);
         // `BranchToolbarBranchSelector` as a select: a draft's base ("From main (remote)") or the branch.
-        let (branch, _, label) = self.branch_trigger();
+        let (_, _, label) = self.branch_trigger();
         let mut rows: Vec<AnyElement> = Vec::new();
-        if is_repo && self.details_item_shown("branch") && branch.is_some() {
+        // The pull request rows under the branch, past one row's height.
+        let mut extra = 0.;
+        let section = |rows: Vec<AnyElement>, extra: f32| {
+            (!rows.is_empty()).then(|| Section {
+                height: rows.len() as f32 * ROW_HEIGHT + extra,
+                element: v_flex().children(rows).into_any_element(),
+                min_density: Density::Essential,
+            })
+        };
+        if self.branch_row_shown() {
             let trigger = select_row("details-branch", tokens, colors, cx)
                 .disabled(!self.branch_picker_ready())
                 .child(
@@ -815,14 +867,12 @@ impl Workspace {
                     .child(self.branch_popover("details-branch-popover", trigger, true, tokens, cx))
                     .into_any_element(),
             );
+            if let Some((pull_requests, height)) = self.card_pull_request_rows(colors, tokens, cx) {
+                rows.push(pull_requests);
+                extra += height - ROW_HEIGHT;
+            }
         }
-        let Some(status) = status else {
-            return (!rows.is_empty()).then(|| Section {
-                height: rows.len() as f32 * ROW_HEIGHT,
-                element: v_flex().children(rows).into_any_element(),
-                min_density: Density::Essential,
-            });
-        };
+        let Some(status) = status else { return section(rows, extra) };
         let (actions_shown, changes_shown) =
             (self.details_item_shown("gitActions"), self.details_item_shown("changes"));
         if status.local.is_repo {
@@ -841,14 +891,10 @@ impl Workspace {
             }
         } else {
             if !actions_shown {
-                return (!rows.is_empty()).then(|| Section {
-                    height: rows.len() as f32 * ROW_HEIGHT,
-                    element: v_flex().children(rows).into_any_element(),
-                    min_density: Density::Essential,
-                });
+                return section(rows, extra);
             }
             let running = self.vcs.running().is_some();
-            let enabled = !running && self.can_write_source_control();
+            let enabled = !running && self.permits_vcs_request("vcs.init");
             rows.push(
                 action_row("details-init-git", colors, enabled, cx)
                     .child(icon("icons/git-branch-plus.svg").with_size(px(14.)).text_color(tokens.muted_foreground))
@@ -861,11 +907,13 @@ impl Workspace {
                     .into_any_element(),
             );
         }
-        (!rows.is_empty()).then(|| Section {
-            height: rows.len() as f32 * ROW_HEIGHT,
-            element: v_flex().children(rows).into_any_element(),
-            min_density: Density::Essential,
-        })
+        section(rows, extra)
+    }
+
+    /// The branch select shows, and the thread's pull requests under it.
+    pub(super) fn branch_row_shown(&self) -> bool {
+        let is_repo = self.vcs.status.as_ref().is_none_or(|status| status.local.is_repo);
+        self.vcs.cwd.is_some() && is_repo && self.details_item_shown("branch") && self.branch_trigger().0.is_some()
     }
 
     /// The quick action with its menu, or the running action's progress.
@@ -885,26 +933,34 @@ impl Workspace {
                 .into_any_element();
         }
         let can_write = self.can_write_source_control();
-        let disabled = quick.disabled() || !can_write;
+        let permitted = self.permits_quick_action(&quick.kind);
+        let disabled = quick.disabled() || !permitted;
         let kind = quick.kind.clone();
         // `quickActionDisabledReason`: the missing grant first, then the action's own hint.
         let hint = match &quick.kind {
             _ if !can_write => Some(SharedString::from(NO_SOURCE_CONTROL_WRITE)),
+            _ if !permitted => Some(SharedString::from(NO_THREAD_READ)),
             QuickKind::Hint(hint) => Some(SharedString::from(hint.clone())),
             _ => None,
         };
         let view = cx.entity();
-        let items = git::menu_actions(status, false);
-        let can_publish = can_write && status.local.is_repo && !status.local.has_primary_remote;
+        let items: Vec<_> = git::menu_actions(status, false)
+            .into_iter()
+            .map(|item| {
+                let permitted = self.permits_git_action(&GitRequest::new(item.action));
+                (item, permitted)
+            })
+            .collect();
+        let can_publish = self.permits_publish() && status.local.is_repo && !status.local.has_primary_remote;
         let build = move |mut menu: PopupMenu, window: &mut Window, cx: &mut Context<PopupMenu>| {
             // Built as the menu opens: refresh the status, like `requestVcsStatusRefresh` on open.
             view.update(cx, super::Workspace::refresh_vcs);
-            for item in &items {
+            for (item, permitted) in &items {
                 let action = item.action;
                 menu = menu.item(
                     PopupMenuItem::new(item.label.clone())
                         .icon(icon(item.icon))
-                        .disabled(!can_write || !item.enabled)
+                        .disabled(!permitted || !item.enabled)
                         .on_click(window.listener_for(&view, move |this, _, window, cx| match action {
                             "commit" => this.open_commit_dialog(window, cx),
                             action => this.request_git_action(GitRequest::new(action), window, cx),
@@ -912,10 +968,11 @@ impl Workspace {
                 );
             }
             if can_publish {
-                menu =
-                    menu.item(PopupMenuItem::new("Publish repository").icon(icon("icons/cloud-upload.svg")).on_click(
+                menu = menu.item(
+                    PopupMenuItem::new("Publish repository...").icon(icon("icons/cloud-upload.svg")).on_click(
                         window.listener_for(&view, |this, _, window, cx| this.open_publish_dialog(window, cx)),
-                    ));
+                    ),
+                );
             }
             menu
         };
@@ -930,7 +987,7 @@ impl Workspace {
                         el.tooltip(move |window, cx| Tooltip::new(hint.clone()).build(window, cx))
                     })
                     .on_click(cx.listener(move |this, _, window, cx| match &kind {
-                        _ if !this.can_write_source_control() => {}
+                        kind if !this.permits_quick_action(kind) => {}
                         QuickKind::Run(action) => this.request_git_action(GitRequest::new(action), window, cx),
                         QuickKind::Pull => this.run_vcs_request("vcs.pull", "Pulling latest changes...", cx),
                         QuickKind::Publish => this.open_publish_dialog(window, cx),
@@ -945,79 +1002,6 @@ impl Workspace {
                     }),
             )
             .into_any_element()
-    }
-
-    /// The commit dialog: an optional message; blank lets the server write one.
-    fn open_commit_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        use gpui_kit::component::WindowExt as _;
-        use gpui_kit::component::input::{Input, InputState};
-        use gpui_kit::{AppContext as _, Focusable as _};
-        let message = cx.new(|cx| InputState::new(window, cx).placeholder("Leave empty to auto-generate"));
-        let branch =
-            self.vcs.status.as_ref().and_then(|s| s.local.ref_name.clone()).unwrap_or("(detached HEAD)".into());
-        let view = cx.entity();
-        let focus = std::cell::Cell::new(true);
-        window.open_dialog(cx, move |dialog, window, cx| {
-            if focus.replace(false) {
-                message.focus_handle(cx).focus(window, cx);
-            }
-            let (message, view) = (message.clone(), view.clone());
-            let (can_write, can_branch) = {
-                let this = view.read(cx);
-                (this.can_write_source_control(), this.can_change_thread_branch())
-            };
-            let on_new_branch = {
-                let (message, view) = (message.clone(), view.clone());
-                move |_: &gpui_kit::ClickEvent, window: &mut Window, cx: &mut App| {
-                    let text = message.read(cx).value().trim().to_owned();
-                    view.update(cx, |this, cx| this.run_commit(text, true, cx));
-                    window.close_dialog(cx);
-                }
-            };
-            dialog
-                .title("Commit changes")
-                .w(px(512.))
-                .child(
-                    v_flex()
-                        .gap_3()
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(theme::tokens(cx).muted_foreground)
-                                .child("Review and confirm your commit. Leave the message blank to auto-generate one."),
-                        )
-                        .child(field("Branch", div().text_sm().child(branch.clone())))
-                        .child(field("Commit message (optional)", Input::new(&message))),
-                )
-                .footer({
-                    use gpui_kit::component::dialog::{DialogAction, DialogClose, DialogFooter};
-                    DialogFooter::new()
-                        .child(DialogClose::new().trigger(|button| button.outline().label("Cancel")))
-                        .child(
-                            Button::new("commit-new-branch")
-                                .outline()
-                                .label("Commit on new branch")
-                                .disabled(!can_branch)
-                                .on_click(on_new_branch),
-                        )
-                        .child(
-                            DialogAction::new()
-                                .child(Button::new("commit-confirm").primary().label("Commit").disabled(!can_write)),
-                        )
-                })
-                .on_ok(move |_, _, cx: &mut App| {
-                    let text = message.read(cx).value().trim().to_owned();
-                    view.update(cx, |this, cx| this.run_commit(text, false, cx));
-                    true
-                })
-        });
-    }
-
-    /// `runDialogAction`, or `runDialogActionOnNewBranch` with `feature_branch`; neither asks
-    /// about the default ref.
-    fn run_commit(&mut self, message: String, feature_branch: bool, cx: &mut Context<Self>) {
-        let commit_message = (!message.is_empty()).then_some(message);
-        self.run_git_action(GitRequest { action: "commit", commit_message, feature_branch }, cx);
     }
 
     /// The default-ref confirmation: Abort, continue on `branch`, or continue on a feature branch.
@@ -1043,7 +1027,8 @@ impl Workspace {
             let muted = theme::tokens(cx).muted_foreground;
             let (can_write, can_branch) = {
                 let this = view.read(cx);
-                (this.can_write_source_control(), this.can_change_thread_branch() && unavailable.is_none())
+                let can_write = this.permits_git_action(&request);
+                (can_write, can_write && this.can_change_thread_branch() && unavailable.is_none())
             };
             let run = |feature_branch: bool| {
                 let (view, request) = (view.clone(), request.clone());
@@ -1083,177 +1068,6 @@ impl Workspace {
                         ),
                 )
         });
-    }
-
-    /// `PublishRepositoryDialog`: the first signed-in source-control provider, `account/` prefilled.
-    fn open_publish_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(client) = self.client() else { return };
-        cx.spawn_in(window, async move |this, cx| {
-            let discovery = client.request("server.discoverSourceControl", json!({})).await;
-            let _ = this.update_in(cx, |this, window, cx| match discovery {
-                Ok(discovery) => match publish_provider(&discovery) {
-                    Some((kind, label, account)) => this.show_publish_dialog(kind, label, account, window, cx),
-                    None => {
-                        this.error = Some("No signed-in source control provider. Set one up in Settings.".into());
-                        cx.notify();
-                    }
-                },
-                Err(error) => {
-                    this.error = Some(error.to_string().into());
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
-    }
-
-    fn show_publish_dialog(
-        &mut self,
-        provider: String,
-        label: String,
-        account: Option<String>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        use gpui_kit::component::WindowExt as _;
-        use gpui_kit::component::input::{Input, InputState};
-        use gpui_kit::{AppContext as _, Focusable as _};
-        let prefill = account.map(|account| format!("{account}/")).unwrap_or_default();
-        let repository =
-            cx.new(|cx| InputState::new(window, cx).default_value(prefill).placeholder("owner/repository"));
-        let public = std::rc::Rc::new(std::cell::Cell::new(false));
-        // Advanced: the remote to add (`origin`) and its protocol (SSH unless HTTPS is picked).
-        let remote = cx.new(|cx| InputState::new(window, cx).default_value("origin").placeholder("origin"));
-        let https = std::rc::Rc::new(std::cell::Cell::new(false));
-        let advanced = std::rc::Rc::new(std::cell::Cell::new(false));
-        let view = cx.entity();
-        let focus = std::cell::Cell::new(true);
-        let title: SharedString = format!("Publish to {label}").into();
-        window.open_dialog(cx, move |dialog, window, cx| {
-            if focus.replace(false) {
-                repository.focus_handle(cx).focus(window, cx);
-            }
-            let tokens = theme::tokens(cx);
-            let choice = |id: &'static str, text: &'static str, cell: &std::rc::Rc<std::cell::Cell<bool>>, value| {
-                let cell = cell.clone();
-                Button::new(id)
-                    .label(text)
-                    .small()
-                    .map(|b| if cell.get() == value { b.primary() } else { b.outline() })
-                    .on_click(move |_, window, _| {
-                        cell.set(value);
-                        window.refresh();
-                    })
-            };
-            let small_field = |label: &'static str, input: AnyElement| {
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .gap(px(6.))
-                    .child(div().text_xs().font_weight(gpui_kit::FontWeight::MEDIUM).child(label))
-                    .child(input)
-            };
-            let open = advanced.get();
-            let toggle = {
-                let advanced = advanced.clone();
-                let hover = tokens.foreground;
-                h_flex()
-                    .id("publish-advanced")
-                    .gap(px(4.))
-                    .text_xs()
-                    .font_weight(gpui_kit::FontWeight::MEDIUM)
-                    .text_color(tokens.muted_foreground)
-                    .cursor_pointer()
-                    .hover(move |style| style.text_color(hover))
-                    .child(
-                        icon(if open { "icons/chevron-down.svg" } else { "icons/chevron-right.svg" })
-                            .with_size(px(14.)),
-                    )
-                    .child("Advanced")
-                    .on_click(move |_, window, _| {
-                        advanced.set(!advanced.get());
-                        window.refresh();
-                    })
-            };
-            let options = open.then(|| {
-                h_flex()
-                    .mt_3()
-                    .gap_3()
-                    .items_start()
-                    .child(small_field("Remote", Input::new(&remote).into_any_element()))
-                    .child(small_field(
-                        "Protocol",
-                        h_flex()
-                            .gap_2()
-                            .child(choice("publish-ssh", "SSH", &https, false))
-                            .child(choice("publish-https", "HTTPS", &https, true))
-                            .into_any_element(),
-                    ))
-            });
-            let visibility = h_flex()
-                .gap_2()
-                .child(choice("publish-private", "Private", &public, false))
-                .child(choice("publish-public", "Public", &public, true));
-            let (repository, remote, public, https, view, provider) =
-                (repository.clone(), remote.clone(), public.clone(), https.clone(), view.clone(), provider.clone());
-            dialog
-                .title(title.clone())
-                .w(px(448.))
-                .child(
-                    v_flex()
-                        .gap_3()
-                        .child(field("Repository", Input::new(&repository)))
-                        .child(field("Visibility", visibility))
-                        .child(v_flex().child(toggle).children(options)),
-                )
-                .footer(dialog_footer("publish-confirm", "Publish"))
-                .on_ok(move |_, _, cx: &mut App| {
-                    let repository = repository.read(cx).value().trim().to_owned();
-                    if repository.is_empty() || repository.ends_with('/') {
-                        return false;
-                    }
-                    let options = PublishOptions {
-                        visibility: if public.get() { "public" } else { "private" },
-                        remote_name: remote.read(cx).value().trim().to_owned(),
-                        protocol: if https.get() { "https" } else { "ssh" },
-                    };
-                    let provider = provider.clone();
-                    view.update(cx, |this, cx| this.publish_repository(provider, repository, options, cx));
-                    true
-                })
-        });
-    }
-
-    /// `sourceControl.publishRepository`; a blank remote name is `origin`, as on the web.
-    fn publish_repository(
-        &mut self,
-        provider: String,
-        repository: String,
-        options: PublishOptions,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.can_write_source_control() {
-            return;
-        }
-        let Some(client) = self.vcs_client() else { return };
-        let Some(checkout) = self.vcs.start("Publishing repository...") else { return };
-        let remote_name = if options.remote_name.is_empty() { "origin".to_owned() } else { options.remote_name };
-        let input = json!({
-            "cwd": checkout.1,
-            "provider": provider,
-            "repository": repository,
-            "visibility": options.visibility,
-            "remoteName": remote_name,
-            "protocol": options.protocol,
-        });
-        let origin = self.target.clone();
-        cx.spawn(async move |this, cx| {
-            let result = client.request("sourceControl.publishRepository", input).await;
-            let error = result.err().map(|e| e.to_string());
-            let _ = this.update(cx, |this, cx| this.finish_vcs(client, checkout, origin, error, cx));
-        })
-        .detach();
-        cx.notify();
     }
 
     /// `Changes  +N -M`: opens the diff in the right panel.
@@ -1306,18 +1120,19 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// `ThreadRelationshipsControl`'s Lineage: the parent thread, running subagents, and
-    /// settled ones folded under "Previous agents".
+    /// `ThreadRelationshipsControl`'s Lineage: the parent, forks and context transfers, running
+    /// subagents, and settled ones folded under "Previous agents".
     fn lineage_section(
         &self,
         relationships: &Relationships,
+        viewport_height: f32,
         tokens: &Tokens,
         colors: &CardColors,
         cx: &mut Context<Self>,
     ) -> Option<Section> {
-        let Some(Target::Thread { id, .. }) = &self.target else { return None };
-        let thread = self.shell.threads.iter().find(|thread| &thread.id == id)?;
-        let Relationships { parent, active, previous, side_chats } = relationships;
+        let Some(Target::Thread { env, id }) = &self.target else { return None };
+        let thread = self.shell.threads.iter().find(|thread| &thread.id == id && thread.environment_id == *env)?;
+        let Relationships { related, active, previous, side_chats, merge } = relationships;
         let can_detach = self
             .open_projection()
             .and_then(|projection| projection.provider_session())
@@ -1332,7 +1147,7 @@ impl Workspace {
         });
         let running = unthreaded + active.iter().filter(|row| row.status.as_deref() == Some("running")).count();
         // Disconnect lives in this heading, so a thread with only side chats still shows it.
-        let visible = parent.is_some()
+        let visible = !related.is_empty()
             || !active.is_empty()
             || !previous.is_empty()
             || running > 0
@@ -1345,71 +1160,127 @@ impl Workspace {
             0 => "Lineage".into(),
             running => format!("Lineage · {running} running").into(),
         };
-        let mut rows = 0usize;
         // A lone "Previous agents" row names itself; the heading returns for status or actions.
-        let show_heading = running > 0 || can_detach || parent.is_some() || !active.is_empty() || delegated.is_some();
+        let show_heading =
+            running > 0 || can_detach || !related.is_empty() || !active.is_empty() || delegated.is_some();
         let mut section = v_flex().when(show_heading, |el| {
             let actions = can_detach.then(|| self.lineage_menu(tokens, colors, cx));
             el.child(section_heading(heading, tokens).children(actions))
         });
         if let Some(from) = delegated {
             section = section.child(self.delegated_from_row(from, thread, tokens, colors, cx));
-            rows += 1;
         }
-        if let Some(parent) = parent {
-            section =
-                section.child(self.relationship_row(parent, "icons/corner-left-up.svg", false, tokens, colors, cx));
-            rows += 1;
-        }
-        for child in active {
-            section = section.child(self.relationship_row(child, "icons/bot.svg", false, tokens, colors, cx));
-            rows += 1;
+        for (list, rows) in [("details-related-threads", related), ("details-active-agents", active)] {
+            if !rows.is_empty() {
+                section =
+                    section.child(self.lineage_list(list, rows, merge.as_ref(), viewport_height, tokens, colors, cx));
+            }
         }
         if !previous.is_empty() {
             let expanded = self.lineage_expanded.as_ref() == Some(id);
             let thread_id = id.clone();
-            rows += 1;
             section = section.child(
-                row(colors)
-                    .id("details-previous-agents")
-                    .cursor_pointer()
-                    .hover(|style| style.bg(colors.hover))
-                    .child(icon("icons/bot.svg").with_size(px(16.)).text_color(tokens.muted_foreground))
-                    .child(div().flex_1().min_w_0().truncate().child("Previous agents"))
-                    .when(!expanded, |el| {
-                        el.child(
-                            div()
-                                .flex_none()
-                                .text_xs()
-                                .font_weight(gpui_kit::FontWeight::NORMAL)
-                                .text_color(tokens.muted_foreground)
-                                .child(previous.len().to_string()),
-                        )
-                    })
-                    .child(
-                        icon("icons/chevron-down.svg")
-                            .with_size(px(16.))
+                keyboard_button(
+                    row(colors).id("details-previous-agents").cursor_pointer().hover(|style| style.bg(colors.hover)),
+                    colors,
+                )
+                .child(icon("icons/bot.svg").with_size(px(16.)).text_color(tokens.muted_foreground))
+                .child(div().flex_1().min_w_0().truncate().child("Previous agents"))
+                .when(!expanded, |el| {
+                    el.child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .font_weight(gpui_kit::FontWeight::NORMAL)
                             .text_color(tokens.muted_foreground)
-                            .when(!expanded, |icon| icon.rotate(gpui_kit::radians(-std::f32::consts::FRAC_PI_2))),
+                            .child(previous.len().to_string()),
                     )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.lineage_expanded =
-                            (this.lineage_expanded.as_ref() != Some(&thread_id)).then(|| thread_id.clone());
-                        cx.notify();
-                    })),
+                })
+                .child(
+                    icon("icons/chevron-down.svg")
+                        .with_size(px(16.))
+                        .text_color(tokens.muted_foreground)
+                        .when(!expanded, |icon| icon.rotate(gpui_kit::radians(-std::f32::consts::FRAC_PI_2))),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.lineage_expanded =
+                        (this.lineage_expanded.as_ref() != Some(&thread_id)).then(|| thread_id.clone());
+                    cx.notify();
+                })),
             );
             if expanded {
-                for child in previous {
-                    section = section.child(self.relationship_row(child, "icons/bot.svg", false, tokens, colors, cx));
-                    rows += 1;
-                }
+                section = section.child(self.lineage_list(
+                    "details-previous-agents-list",
+                    previous,
+                    None,
+                    viewport_height,
+                    tokens,
+                    colors,
+                    cx,
+                ));
             }
         }
-        Some(Section {
-            height: rows as f32 * ROW_HEIGHT + if show_heading { HEADING_HEIGHT } else { 0. },
-            element: section.into_any_element(),
-            min_density: Density::Full,
-        })
+        // Left out of the density estimate (`fitting_height`).
+        Some(Section { height: 0., element: section.into_any_element(), min_density: Density::Full })
+    }
+
+    /// `ThreadLineageRowList`: a group's rows, scrolling past its cap so an open workflow
+    /// cannot push Lineage out of the card.
+    #[expect(clippy::too_many_arguments, reason = "the card's shared render inputs")]
+    fn lineage_list(
+        &self,
+        id: &'static str,
+        rows: &[Relative],
+        merge: Option<&MergeBack>,
+        viewport_height: f32,
+        tokens: &Tokens,
+        colors: &CardColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let workflow_open = rows.iter().any(|row| row.workflow.is_some() && self.workflow_open(&row.thread_id));
+        let max = if workflow_open { LINEAGE_WORKFLOW_LIST_MAX.min(viewport_height * 0.55) } else { LINEAGE_LIST_MAX };
+        div()
+            .id(id)
+            .max_h(px(max))
+            .overflow_y_scroll()
+            .children(rows.iter().map(|row| self.lineage_row(row, merge, tokens, colors, cx)))
+            .into_any_element()
+    }
+
+    /// Whether the open thread's workflow row for `thread_id` is expanded.
+    fn workflow_open(&self, thread_id: &str) -> bool {
+        let Some(Target::Thread { env, id }) = &self.target else { return false };
+        self.lineage.workflows_open.contains(&lineage::row_key(env, id, thread_id))
+    }
+
+    /// An expanded workflow row shows a running elapsed time, which repaints each second.
+    fn lineage_ticks(&self, relationships: &Relationships) -> bool {
+        let expanded_previous =
+            matches!(&self.target, Some(Target::Thread { id, .. }) if self.lineage_expanded.as_ref() == Some(id));
+        let rows = relationships.related.iter().chain(&relationships.active);
+        let rows = rows.chain(relationships.previous.iter().filter(|_| expanded_previous));
+        rows.filter(|row| self.workflow_open(&row.thread_id))
+            .filter_map(|row| row.workflow.as_ref())
+            .any(Workflow::ticks)
+    }
+
+    /// One lineage row: a workflow with its members, the merge-back target's split row, or a
+    /// plain related thread.
+    fn lineage_row(
+        &self,
+        relative: &Relative,
+        merge: Option<&MergeBack>,
+        tokens: &Tokens,
+        colors: &CardColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if let Some(workflow) = &relative.workflow {
+            return self.workflow_row(relative, workflow, tokens, colors, cx);
+        }
+        match merge.filter(|merge| merge.target_thread_id == relative.thread_id) {
+            Some(merge) => self.merge_row(relative, merge, tokens, colors, cx),
+            None => self.relationship_row(relative, tokens, colors, cx).into_any_element(),
+        }
     }
 
     /// `ThreadRelationshipsControl`'s Side chats: the open thread's side chats, which open in
@@ -1430,31 +1301,36 @@ impl Workspace {
                 0 => "Side chats".into(),
                 running => format!("Side chats · {running} running").into(),
             };
-        let section = v_flex().child(section_heading(heading, tokens)).children(
-            side_chats
-                .iter()
-                .map(|row| self.relationship_row(row, "icons/messages-square.svg", true, tokens, colors, cx)),
-        );
-        Some(Section {
-            height: side_chats.len() as f32 * ROW_HEIGHT + HEADING_HEIGHT,
-            element: section.into_any_element(),
-            min_density: Density::Full,
-        })
+        let section = v_flex()
+            .child(section_heading(heading, tokens))
+            .children(side_chats.iter().map(|row| self.relationship_row(row, tokens, colors, cx)));
+        // Left out of the density estimate (`fitting_height`).
+        Some(Section { height: 0., element: section.into_any_element(), min_density: Density::Full })
     }
 
-    /// One related thread; a running subagent's row shows Stop on hover.
+    /// Opens a related thread on the open thread's environment; a side chat opens in the side
+    /// chat panel.
+    fn open_relative(&mut self, thread_id: String, kind: Kind, window: &mut Window, cx: &mut Context<Self>) {
+        if kind == Kind::SideChat {
+            self.open_surface(super::right_panel::Surface::SideChat(thread_id), window, cx);
+        } else if let Some(Target::Thread { env, .. }) = self.target.clone() {
+            self.select_thread_in(env, thread_id, window, cx);
+        }
+    }
+
+    /// One related thread; a running subagent's row shows Stop on hover. Rows other than
+    /// subagents carry their status and say what a click opens.
     fn relationship_row(
         &self,
         relative: &Relative,
-        path: &'static str,
-        side_chat: bool,
         tokens: &Tokens,
         colors: &CardColors,
         cx: &mut Context<Self>,
     ) -> gpui_kit::Stateful<gpui_kit::Div> {
-        let thread_id = relative.thread_id.clone();
+        let (thread_id, kind) = (relative.thread_id.clone(), relative.kind);
         let group: SharedString = format!("details-lineage-{thread_id}").into();
         let stopping = self.lineage.stopping.as_deref() == Some(thread_id.as_str());
+        let ring = super::chat::focus_ring(tokens);
         let stop = relative.stop.clone().map(|stop| {
             let (thread_id, title) = (thread_id.clone(), relative.title.clone());
             let busy = self.lineage.stopping.is_some();
@@ -1469,7 +1345,9 @@ impl Workspace {
                 .justify_center()
                 .rounded(px(8.))
                 .text_color(tokens.error)
-                .when(!stopping, |el| el.invisible().group_hover(group.clone(), gpui_kit::Styled::visible))
+                .when(!stopping, |el| el.opacity(0.).group_hover(group.clone(), |style| style.opacity(1.)))
+                .tab_index(0)
+                .focus_visible(move |style| style.opacity(1.).shadow(vec![ring]))
                 .when(!busy, |el| el.cursor_pointer().hover(|s| s.bg(tokens.error.opacity(0.1))))
                 .when(busy && !stopping, |el| el.opacity(0.5))
                 .child(if stopping {
@@ -1484,32 +1362,345 @@ impl Workspace {
                 }))
         });
         let has_stop = stop.is_some();
-        row(colors)
-            .id(ElementId::Name(group.clone()))
-            .group(group)
-            .relative()
-            .cursor_pointer()
-            .hover(|style| style.bg(colors.hover))
-            .child(icon(path).with_size(px(16.)).text_color(tokens.muted_foreground))
+        let agent = kind == Kind::Subagent;
+        let failed = matches!(relative.status.as_deref(), Some("failed" | "error"));
+        let status = (!agent).then(|| {
+            div()
+                .flex_none()
+                .text_size(px(11.))
+                .font_weight(gpui_kit::FontWeight::NORMAL)
+                .text_color(if failed { tokens.error } else { tokens.muted_foreground })
+                .child(lineage::status_label(relative.status.as_deref()))
+        });
+        let tip = (!agent).then(|| {
+            let hint: SharedString = format!("Open {} in this chat", kind.label().to_lowercase()).into();
+            lineage_tooltip(relative.title.clone(), hint)
+        });
+        keyboard_button(
+            row(colors)
+                .id(ElementId::Name(group.clone()))
+                .group(group)
+                .relative()
+                .cursor_pointer()
+                .hover(|style| style.bg(colors.hover)),
+            colors,
+        )
+        .child(icon(kind.icon()).with_size(px(16.)).text_color(tokens.muted_foreground))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_sm()
+                .line_height(px(16.))
+                .text_color(tokens.foreground.opacity(0.85))
+                .when(has_stop, |el| el.pr(px(24.)))
+                .child(relative.title.clone()),
+        )
+        .children(status)
+        .children(stop)
+        .when_some(tip, gpui_kit::StatefulInteractiveElement::tooltip)
+        .on_click(cx.listener(move |this, _, window, cx| this.open_relative(thread_id.clone(), kind, window, cx)))
+    }
+
+    /// The fork's source as a split row: open it, or Merge back into it
+    /// (`ThreadRelationshipsControl`'s merge-back target row).
+    fn merge_row(
+        &self,
+        relative: &Relative,
+        merge: &MergeBack,
+        tokens: &Tokens,
+        colors: &CardColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(Target::Thread { env, id }) = &self.target else { return div().into_any_element() };
+        let (thread_id, kind) = (relative.thread_id.clone(), relative.kind);
+        let group: SharedString = format!("details-lineage-merge-{thread_id}").into();
+        let busy = self.lineage.merging.as_deref() == Some(format!("{env}:{id}").as_str());
+        let can_operate = self.can_operate(env);
+        let enabled = can_operate && merge.run_id.is_some() && self.lineage.merging.is_none();
+        let merge_tip: SharedString = match (&merge.run_id, &merge.target_title) {
+            _ if !can_operate => NOT_OPERATE.into(),
+            (None, _) => "Complete a run in this fork before merging it back".into(),
+            (Some(_), Some(title)) => format!("Merge this conversation back into {title}").into(),
+            (Some(_), None) => "Merge this conversation back into its source".into(),
+        };
+        let hint: SharedString = format!("Open {} in this chat", kind.label().to_lowercase()).into();
+        let label = lineage::status_label(relative.status.as_deref());
+        split_row(group.clone(), colors, cx)
+            .child(
+                split_primary(format!("{group}-open"), colors, true, cx)
+                    .child(icon(kind.icon()).with_size(px(16.)).text_color(tokens.muted_foreground))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .line_height(px(16.))
+                            .text_color(tokens.foreground.opacity(0.85))
+                            .child(relative.title.clone()),
+                    )
+                    .tooltip(lineage_tooltip(relative.title.clone(), hint))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_relative(thread_id.clone(), kind, window, cx);
+                    })),
+            )
+            .child(split_hairline(group.clone(), colors))
+            .child(
+                split_secondary(format!("{group}-merge"), colors, enabled)
+                    .text_color(tokens.muted_foreground)
+                    .child(if busy {
+                        gpui_kit::component::spinner::Spinner::new().xsmall().into_any_element()
+                    } else {
+                        icon("icons/git-merge.svg").with_size(px(12.)).into_any_element()
+                    })
+                    .tooltip(move |window, cx| Tooltip::new(merge_tip.clone()).build(window, cx))
+                    .when(enabled, |el| el.on_click(cx.listener(|this, _, window, cx| this.merge_back(window, cx)))),
+            )
             .child(
                 div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_sm()
-                    .line_height(px(16.))
-                    .text_color(tokens.foreground.opacity(0.85))
-                    .when(has_stop, |el| el.pr(px(24.)))
-                    .child(relative.title.clone()),
+                    .flex_none()
+                    .pl(px(4.))
+                    .pr(px(10.))
+                    .text_size(px(11.))
+                    .font_weight(gpui_kit::FontWeight::MEDIUM)
+                    .text_color(tokens.muted_foreground)
+                    .child(label),
+            )
+            .into_any_element()
+    }
+
+    /// `ThreadLineageWorkflowRow`: the workflow opens its thread, Stop ends it, and the chevron
+    /// lists its members by phase.
+    fn workflow_row(
+        &self,
+        relative: &Relative,
+        workflow: &Workflow,
+        tokens: &Tokens,
+        colors: &CardColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(Target::Thread { env, id }) = &self.target else { return div().into_any_element() };
+        let (thread_id, kind, title) = (relative.thread_id.clone(), relative.kind, relative.title.clone());
+        let key = lineage::row_key(env, id, &thread_id);
+        let expanded = self.lineage.workflows_open.contains(&key);
+        let group: SharedString = format!("details-lineage-workflow-{thread_id}").into();
+        let stop = json!({"threadId": id, "subagentId": workflow.subagent_id});
+        let can_stop = workflow.stoppable && self.env_permits(env, "orchestration.stopWorkflow", &stop);
+        let stopping = self.lineage.stopping.as_deref() == Some(workflow.subagent_id.as_str());
+        let busy = self.lineage.stopping.is_some();
+        let ring = super::chat::focus_ring(tokens);
+        let stop = can_stop.then(|| {
+            let (subagent_id, error) = (workflow.subagent_id.clone(), tokens.error);
+            div()
+                .id(ElementId::Name(format!("{group}-stop").into()))
+                .absolute()
+                .right(px(36.))
+                .top(px((ROW_HEIGHT - 24.) / 2.))
+                .size(px(24.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.))
+                .text_color(error)
+                .when(!stopping, |el| el.opacity(0.).group_hover(group.clone(), |style| style.opacity(1.)))
+                .tab_index(0)
+                .focus_visible(move |style| style.opacity(1.).shadow(vec![ring]))
+                .when(!busy, |el| el.cursor_pointer().hover(move |s| s.bg(error.opacity(0.1))))
+                .when(busy && !stopping, |el| el.opacity(0.5))
+                .child(if stopping {
+                    gpui_kit::component::spinner::Spinner::new().xsmall().into_any_element()
+                } else {
+                    div().size(px(9.)).rounded(px(1.5)).bg(error).into_any_element()
+                })
+                .tooltip(|window, cx| Tooltip::new("Stop entire workflow").build(window, cx))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.stop_workflow(subagent_id.clone(), window, cx);
+                }))
+        });
+        let toggle_key = key.clone();
+        let header = split_row(group.clone(), colors, cx)
+            .relative()
+            .child(
+                split_primary(format!("{group}-open"), colors, true, cx)
+                    .child(icon(kind.icon()).with_size(px(16.)).text_color(tokens.muted_foreground))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .line_height(px(16.))
+                            .text_color(tokens.foreground.opacity(0.85))
+                            .when(can_stop, |el| el.pr(px(28.)))
+                            .child(title),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_relative(thread_id.clone(), kind, window, cx);
+                    })),
             )
             .children(stop)
-            .on_click(cx.listener(move |this, _, window, cx| {
-                if side_chat {
-                    this.open_surface(super::right_panel::Surface::SideChat(thread_id.clone()), window, cx);
-                } else {
-                    this.select_thread(thread_id.clone(), window, cx);
+            .child(split_hairline(group.clone(), colors))
+            .child(
+                split_secondary(format!("{group}-toggle"), colors, true)
+                    .child(
+                        icon("icons/chevron-down.svg")
+                            .with_size(px(14.))
+                            .text_color(tokens.muted_foreground)
+                            .when(expanded, |icon| icon.rotate(gpui_kit::radians(std::f32::consts::PI))),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if !this.lineage.workflows_open.remove(&toggle_key) {
+                            this.lineage.workflows_open.insert(toggle_key.clone());
+                        }
+                        cx.notify();
+                    })),
+            );
+        let mut list = v_flex().child(header);
+        if expanded {
+            let mut members = v_flex().pl(px(26.));
+            for phase in &workflow.phases {
+                let open =
+                    self.lineage.phases_open.get(&(key.clone(), phase.index)).copied().unwrap_or(phase.running());
+                members = members.child(self.phase_header(&key, phase, open, tokens, cx));
+                if open {
+                    for member in &phase.members {
+                        members = members.child(self.member_row(&key, member, &workflow.driver, tokens, colors, cx));
+                    }
                 }
+            }
+            for member in &workflow.unphased {
+                members = members.child(self.member_row(&key, member, &workflow.driver, tokens, colors, cx));
+            }
+            if workflow.phases.is_empty() && workflow.unphased.is_empty() {
+                members = members.child(
+                    div()
+                        .px(px(10.))
+                        .py(px(6.))
+                        .text_size(px(11.))
+                        .text_color(tokens.muted_foreground.opacity(0.7))
+                        .child("No agents yet"),
+                );
+            }
+            list = list.child(members);
+        }
+        list.into_any_element()
+    }
+
+    /// `CollapsibleSectionHeader variant="panel"` for one workflow phase.
+    fn phase_header(
+        &self,
+        key: &str,
+        phase: &crate::workflow::Phase,
+        open: bool,
+        tokens: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::Stateful<gpui_kit::Div> {
+        let status = phase.status_label();
+        let running = phase.running();
+        let count = phase.members.len();
+        let agents = format!("{}/{count} {}", phase.settled, if count == 1 { "agent" } else { "agents" });
+        let elapsed = phase_elapsed(phase);
+        let ring = super::chat::focus_ring(tokens);
+        let toggle = (key.to_owned(), phase.index);
+        h_flex()
+            .id(ElementId::Name(format!("details-phase-{key}-{}", phase.index).into()))
+            .h(px(ROW_HEIGHT))
+            .w_full()
+            .flex_none()
+            .gap_2()
+            .pl(px(8.))
+            .pr(px(10.))
+            .rounded(px(6.))
+            .cursor_pointer()
+            .text_xs()
+            .font_weight(gpui_kit::FontWeight::MEDIUM)
+            .text_color(if running { tokens.foreground.opacity(0.8) } else { tokens.muted_foreground })
+            .tab_index(0)
+            .focus_visible(move |style| style.shadow(vec![ring]))
+            .child(div().min_w_0().truncate().child(phase.title.clone()))
+            .child(div().flex_1().min_w(px(8.)))
+            .when(status == "failed", |el| {
+                el.child(div().flex_none().text_size(px(10.)).text_color(tokens.error_foreground).child("Failed"))
+            })
+            .child(div().flex_none().text_size(px(11.)).font_weight(gpui_kit::FontWeight::NORMAL).child(agents))
+            .children(elapsed.map(|elapsed| {
+                div().flex_none().text_size(px(11.)).font_weight(gpui_kit::FontWeight::NORMAL).child(elapsed)
             }))
+            .child(
+                icon("icons/chevron-down.svg")
+                    .with_size(px(12.))
+                    .when(!open, |icon| icon.rotate(gpui_kit::radians(-std::f32::consts::FRAC_PI_2))),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.lineage.phases_open.insert(toggle.clone(), !open);
+                cx.notify();
+            }))
+    }
+
+    /// `WorkflowMemberRow`: one agent of a workflow, opening its thread when it has one.
+    fn member_row(
+        &self,
+        key: &str,
+        member: &crate::workflow::Member,
+        driver: &str,
+        tokens: &Tokens,
+        colors: &CardColors,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::Stateful<gpui_kit::Div> {
+        let child = member.child_thread_id.clone();
+        let hover = colors.hover;
+        let dot = match member.status.as_str() {
+            "pending" | "running" | "waiting" => tokens.info,
+            "failed" => tokens.error,
+            "completed" => tokens.success_foreground,
+            _ => tokens.muted_foreground.opacity(0.45),
+        };
+        let logo = match crate::assets::provider_icon(driver) {
+            Some((path, tint)) => icon(path).with_size(px(16.)).text_color(tint.unwrap_or(tokens.muted_foreground)),
+            None => icon("icons/bot.svg").with_size(px(16.)).text_color(tokens.muted_foreground),
+        };
+        let avatar = div().relative().size(px(16.)).flex_none().child(logo).child(
+            div()
+                .absolute()
+                .right(px(-4.))
+                .bottom(px(-4.))
+                .size(px(8.))
+                .rounded_full()
+                .border_2()
+                .border_color(colors.background)
+                .bg(dot),
+        );
+        let elapsed = member.started_ms.and_then(|start| {
+            let live = matches!(member.status.as_str(), "pending" | "running" | "waiting");
+            let end = member.completed_ms.or_else(|| live.then(super::sidebar::now_ms))?;
+            Some(crate::timeline::agent_elapsed(end.saturating_sub(start)))
+        });
+        let element = row(colors).id(ElementId::Name(format!("details-member-{key}-{}", member.id).into()));
+        let element = match child {
+            Some(_) => keyboard_button(element.cursor_pointer().hover(move |style| style.bg(hover)), colors),
+            None => element.opacity(0.64),
+        };
+        let hint: SharedString = format!("Open {} chat", member.title).into();
+        element
+            .child(avatar)
+            .child(div().flex_1().min_w_0().truncate().child(member.title.clone()))
+            .children(elapsed.map(|elapsed| {
+                div()
+                    .flex_none()
+                    .text_size(px(11.))
+                    .font_weight(gpui_kit::FontWeight::NORMAL)
+                    .text_color(tokens.muted_foreground)
+                    .child(elapsed)
+            }))
+            .tooltip(lineage_tooltip(member.title.clone().into(), hint))
+            .when_some(child, |el, child| {
+                el.on_click(cx.listener(move |this, _, window, cx| {
+                    this.open_relative(child.clone(), Kind::Subagent, window, cx);
+                }))
+            })
     }
 
     /// `DelegatedFromRow`: the thread on a linked environment whose agent delegated this one.
@@ -1600,6 +1791,7 @@ impl Workspace {
 
     /// `stopThreadSession`: detaches every provider session of the open thread.
     fn detach_provider_sessions(&mut self, cx: &mut Context<Self>) {
+        let Some(Target::Thread { env, .. }) = self.target.clone() else { return };
         let Some(projection) = self.open_projection() else { return };
         let thread_id = projection.thread.id.clone();
         let command_id = new_id();
@@ -1617,7 +1809,7 @@ impl Workspace {
             })
             .collect();
         for command in commands {
-            self.dispatch(command, cx);
+            self.dispatch(&env, command, cx);
         }
     }
 
@@ -1650,11 +1842,13 @@ impl Workspace {
     }
 
     pub(super) fn target_project(&self) -> Option<&crate::model::ProjectShell> {
-        let project_id = match self.target.as_ref()? {
-            Target::Thread { id, .. } => &self.shell.threads.iter().find(|thread| &thread.id == id)?.project_id,
-            Target::Draft { project_id, .. } => project_id,
+        let project = match self.target.as_ref()? {
+            Target::Thread { env, id } => crate::model::ScopedId::thread_project(
+                self.shell.thread(&crate::model::ScopedId::new(env.clone(), id.as_str()))?,
+            ),
+            Target::Draft { env, project_id, .. } => crate::model::ScopedId::new(env.clone(), project_id.as_str()),
         };
-        self.shell.projects.iter().find(|project| &project.id == project_id)
+        self.shell.project(&project)
     }
 }
 
@@ -1681,42 +1875,9 @@ pub(in crate::app) fn thread_details_items_menu(
     }
 }
 
-/// `getPublishProviderReadiness`: the first available, signed-in provider as (kind, label, account).
-fn publish_provider(discovery: &Value) -> Option<(String, String, Option<String>)> {
-    discovery["sourceControlProviders"].as_array()?.iter().find_map(|provider| {
-        let auth = &provider["auth"];
-        let ready =
-            provider["status"].as_str() == Some("available") && auth["status"].as_str() != Some("unauthenticated");
-        if !ready {
-            return None;
-        }
-        let account = auth["account"]["value"].as_str().map(str::to_owned);
-        Some((provider["kind"].as_str()?.to_owned(), provider["label"].as_str()?.to_owned(), account))
-    })
-}
-
-/// The publish dialog's visibility and its Advanced remote and protocol.
-struct PublishOptions {
-    visibility: &'static str,
-    remote_name: String,
-    protocol: &'static str,
-}
-
-/// Cancel and the confirming action; the action runs the dialog's `on_ok`.
-fn dialog_footer(id: &'static str, label: &'static str) -> impl IntoElement {
-    use gpui_kit::component::dialog::{DialogAction, DialogClose, DialogFooter};
-    DialogFooter::new()
-        .child(DialogClose::new().trigger(|button| button.outline().label("Cancel")))
-        .child(DialogAction::new().child(Button::new(id).primary().label(label)))
-}
-
-fn field(label: &'static str, input: impl IntoElement) -> impl IntoElement {
-    v_flex().gap(px(6.)).child(div().text_sm().font_weight(gpui_kit::FontWeight::MEDIUM).child(label)).child(input)
-}
-
 /// The statuses `ThreadRelationshipsControl.tsx` files under "Previous agents".
 /// `THREAD_DETAILS_PANEL_LOCKED_ROW_CLASS`: 32px, 10px inset and gap, 13px medium.
-fn row(colors: &CardColors) -> gpui_kit::Div {
+pub(super) fn row(colors: &CardColors) -> gpui_kit::Div {
     h_flex()
         .h(px(ROW_HEIGHT))
         .w_full()
@@ -1748,7 +1909,7 @@ fn action_row(
 
 /// `ThreadDetailsControl` as a keyboard button: a tab stop that Enter and Space click, with
 /// `focus-visible:ring-2 ring-inset`. The ring takes 2px of the row's 10px inset, so nothing moves.
-fn keyboard_button(
+pub(super) fn keyboard_button(
     element: gpui_kit::Stateful<gpui_kit::Div>,
     colors: &CardColors,
 ) -> gpui_kit::Stateful<gpui_kit::Div> {
@@ -1762,21 +1923,32 @@ fn keyboard_button(
 }
 
 /// `THREAD_DETAILS_PANEL_SPLIT_GROUP_CLASS`: the pair shares one hover fill and shows its hairline.
-fn split_row(id: &'static str, colors: &CardColors, _: &mut Context<Workspace>) -> gpui_kit::Stateful<gpui_kit::Div> {
-    let hover = colors.hover;
-    h_flex().id(id).group(id).h(px(ROW_HEIGHT)).w_full().flex_none().rounded(px(8.)).hover(move |style| style.bg(hover))
+fn split_row(
+    id: impl Into<SharedString>,
+    colors: &CardColors,
+    _: &mut Context<Workspace>,
+) -> gpui_kit::Stateful<gpui_kit::Div> {
+    let (id, hover) = (id.into(), colors.hover);
+    h_flex()
+        .id(ElementId::Name(id.clone()))
+        .group(id)
+        .h(px(ROW_HEIGHT))
+        .w_full()
+        .flex_none()
+        .rounded(px(8.))
+        .hover(move |style| style.bg(hover))
 }
 
 /// The split's primary half; each half stacks its own fill over the group's.
 fn split_primary(
-    id: &'static str,
+    id: impl Into<SharedString>,
     colors: &CardColors,
     enabled: bool,
     _: &mut Context<Workspace>,
 ) -> gpui_kit::Stateful<gpui_kit::Div> {
     let hover = colors.hover;
     h_flex()
-        .id(id)
+        .id(ElementId::Name(id.into()))
         .flex_1()
         .min_w_0()
         .h_full()
@@ -1791,9 +1963,62 @@ fn split_primary(
 }
 
 /// The 1×16 `bg-border/65` hairline between the halves, shown while the pair is hovered.
-fn split_hairline(group: &'static str, colors: &CardColors) -> impl IntoElement {
+fn split_hairline(group: impl Into<SharedString>, colors: &CardColors) -> impl IntoElement {
     let line = colors.divider;
     div().w(px(1.)).h(px(16.)).flex_none().group_hover(group, move |style| style.bg(line))
+}
+
+/// The split's 32px secondary half (`part="secondary"`); a disabled one is dimmed and out of the
+/// tab order.
+fn split_secondary(
+    id: impl Into<SharedString>,
+    colors: &CardColors,
+    enabled: bool,
+) -> gpui_kit::Stateful<gpui_kit::Div> {
+    let (hover, ring) = (colors.hover, colors.ring);
+    div()
+        .id(ElementId::Name(id.into()))
+        .w(px(32.))
+        .h_full()
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_r(px(8.))
+        .border_2()
+        .border_color(gpui_kit::transparent_black())
+        .when(enabled, |el| {
+            el.tab_index(0)
+                .cursor_pointer()
+                .hover(move |style| style.bg(hover))
+                .focus_visible(move |style| style.border_color(ring))
+        })
+        .when(!enabled, |el| el.opacity(0.64))
+}
+/// `LineageTooltipContent`: the full title, since the row truncates it, and what a click does.
+fn lineage_tooltip(title: SharedString, hint: SharedString) -> impl Fn(&mut Window, &mut App) -> gpui_kit::AnyView {
+    move |window, cx| {
+        let (title, hint) = (title.clone(), hint.clone());
+        Tooltip::element(move |_, cx| {
+            let muted = theme::tokens(cx).muted_foreground;
+            v_flex()
+                .child(div().font_weight(gpui_kit::FontWeight::MEDIUM).child(title.clone()))
+                .child(div().text_color(muted).child(hint.clone()))
+        })
+        .build(window, cx)
+    }
+}
+
+/// `phaseElapsed`: from the first member's start to the last one's end, or to now while the
+/// phase runs.
+fn phase_elapsed(phase: &crate::workflow::Phase) -> Option<String> {
+    let start = phase.members.iter().filter_map(|member| member.started_ms).min()?;
+    let end = if phase.running() {
+        super::sidebar::now_ms()
+    } else {
+        phase.members.iter().filter_map(|member| member.completed_ms).max()?
+    };
+    Some(crate::timeline::agent_elapsed(end.saturating_sub(start)))
 }
 
 /// `ThreadDetailsControl part="select"`: one trigger holding the row's label and its chevron.
@@ -2058,12 +2283,12 @@ fn script_item_row(
     popup: &gpui_kit::Entity<PopupMenu>,
 ) -> impl Fn(&mut Window, &mut App) -> AnyElement + 'static {
     let (label, name, shortcut) = (item.label.clone(), item.name.clone(), item.shortcut.clone());
-    let (project_id, script_id) = (item.run.project_id.clone(), item.run.id.clone());
+    let (project, script_id) = (item.run.project.clone(), item.run.id.clone());
     let (view, popup) = (view.clone(), popup.clone());
     move |_, cx| {
         let tokens = *theme::tokens(cx);
         let group: SharedString = format!("details-script-{script_id}").into();
-        let (view, popup, project_id, script_id) = (view.clone(), popup.clone(), project_id.clone(), script_id.clone());
+        let (view, popup, project, script_id) = (view.clone(), popup.clone(), project.clone(), script_id.clone());
         let tooltip: SharedString = format!("Edit {name}").into();
         let edit = div()
             .id(ElementId::Name(format!("{group}-edit").into()))
@@ -2081,7 +2306,7 @@ fn script_item_row(
             .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
             .on_click(move |_, window, cx| {
                 cx.stop_propagation();
-                view.update(cx, |this, cx| this.open_project_script_editor(&project_id, Some(&script_id), window, cx));
+                view.update(cx, |this, cx| this.open_project_script_editor(&project, Some(&script_id), window, cx));
                 popup.update(cx, |_, cx| cx.emit(gpui_kit::DismissEvent));
             });
         h_flex()
@@ -2111,15 +2336,15 @@ fn script_item_row(
 
 #[derive(Clone)]
 struct ScriptRun {
-    project_id: String,
+    project: crate::model::ScopedId,
     id: String,
     /// The whole script, so its run keeps `stopOnSettle` and its preview settings.
     script: std::rc::Rc<ProjectScript>,
 }
 
 impl ScriptRun {
-    fn new(project_id: &str, script: &ProjectScript) -> Self {
-        Self { project_id: project_id.to_owned(), id: script.id.clone(), script: std::rc::Rc::new(script.clone()) }
+    fn new(project: &crate::model::ScopedId, script: &ProjectScript) -> Self {
+        Self { project: project.clone(), id: script.id.clone(), script: std::rc::Rc::new(script.clone()) }
     }
 }
 
@@ -2221,13 +2446,25 @@ mod tests {
     }
 
     #[test]
-    fn publish_picks_the_first_signed_in_provider() {
-        let discovery = json!({"sourceControlProviders": [
-            {"kind": "gitlab", "label": "GitLab", "status": "missing", "auth": {"status": "unknown", "account": {"_tag": "None"}}},
-            {"kind": "github", "label": "GitHub", "status": "available", "auth": {"status": "unauthenticated", "account": {"_tag": "None"}}},
-            {"kind": "forgejo", "label": "Forgejo", "status": "available", "auth": {"status": "authenticated", "account": {"_tag": "Some", "value": "me"}}},
-        ]});
-        assert_eq!(publish_provider(&discovery), Some(("forgejo".into(), "Forgejo".into(), Some("me".into()))));
-        assert_eq!(publish_provider(&json!({"sourceControlProviders": []})), None);
+    fn scrolling_lineage_and_side_chats_do_not_count_toward_density() {
+        let section = |height| Some(Section { element: div().into_any_element(), height, min_density: Density::Full });
+        let mut sections: [Option<Section>; 8] = Default::default();
+        sections[0] = section(100.);
+        sections[LINEAGE_SLOT] = section(1000.);
+        sections[SIDE_CHATS_SLOT] = section(1000.);
+        let full = fitting_height(&sections, Density::Full);
+        assert_eq!(full, 100. + SECTION_PADDING + 2.);
+        assert_eq!(resolve_density(200., full, fitting_height(&sections, Density::Compact)), Density::Full);
+    }
+
+    #[test]
+    fn lineage_renders_only_at_full_density() {
+        let mut sections: [Option<Section>; 8] = Default::default();
+        assert!(!lineage_renders(&sections, Density::Full));
+        sections[LINEAGE_SLOT] =
+            Some(Section { element: div().into_any_element(), height: 0., min_density: Density::Full });
+        assert!(lineage_renders(&sections, Density::Full));
+        assert!(!lineage_renders(&sections, Density::Compact));
+        assert!(!lineage_renders(&sections, Density::Essential));
     }
 }

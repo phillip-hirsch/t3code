@@ -13,12 +13,14 @@ use anyhow::{Context as _, Result, anyhow};
 use futures::channel::oneshot;
 use futures::{SinkExt as _, StreamExt as _};
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{Message, Utf8Bytes};
+
+use crate::rpc_permissions::{self, Grants};
 
 const PING_INTERVAL: Duration = Duration::from_secs(5);
 const PING_TIMEOUT: Duration = Duration::from_secs(15);
@@ -27,6 +29,8 @@ const OPEN_TIMEOUT: Duration = Duration::from_secs(15);
 const FRAME_PART_PREFIX: char = '\u{1e}';
 /// The most a split frame may join to, like the socket's per-message cap.
 const MAX_JOINED_FRAME: usize = 256 << 20;
+/// How long a guarded request waits for the environment's first grants (`commandPermissions.ts`).
+const GRANT_WAIT: Duration = Duration::from_secs(6);
 
 #[derive(Debug, Clone)]
 pub enum RpcError {
@@ -88,8 +92,15 @@ enum Pending {
     Stream(async_channel::Sender<Delivery>),
 }
 
+struct Request {
+    id: u64,
+    tag: String,
+    payload: Value,
+    pending: Pending,
+}
+
 enum Command {
-    Request { id: u64, tag: String, payload: Value, pending: Pending },
+    Request(Request),
     Interrupt { id: u64 },
     Ack { id: u64 },
 }
@@ -100,12 +111,14 @@ pub struct ConnectOptions {
     pub bearer_token: String,
 }
 
-/// Cheap to clone; all clones share one socket.
+/// Cheap to clone; all clones share one socket and its environment's grants.
 #[derive(Clone)]
 pub struct RpcClient {
     commands: mpsc::UnboundedSender<Command>,
     next_id: Arc<AtomicU64>,
     closed: async_channel::Receiver<String>,
+    /// What the socket checks guarded requests against before sending them.
+    grants: Arc<watch::Sender<Grants>>,
 }
 
 /// Names a client's socket without keeping it open; another connection never equals it.
@@ -128,6 +141,7 @@ impl RpcClient {
         let (ready_tx, ready_rx) = oneshot::channel();
         let (commands, command_rx) = mpsc::unbounded_channel();
         let (closed_tx, closed) = async_channel::bounded(1);
+        let (grants, grants_rx) = watch::channel(Grants::Pending);
         runtime.spawn(async move {
             let socket = match open_socket(&options).await {
                 Ok(socket) => {
@@ -139,12 +153,12 @@ impl RpcClient {
                     return;
                 }
             };
-            let reason = run_socket(socket, command_rx).await;
+            let reason = run_socket(socket, command_rx, grants_rx).await;
             log::info!("rpc socket closed: {reason}");
             let _ = closed_tx.try_send(reason);
         });
         ready_rx.await.map_err(|_| anyhow!("rpc runtime stopped"))??;
-        Ok(Self { commands, next_id: Arc::new(AtomicU64::new(0)), closed })
+        Ok(Self { commands, next_id: Arc::new(AtomicU64::new(0)), closed, grants: Arc::new(grants) })
     }
 
     /// A client whose socket never opened, for state that only asks whether one is held.
@@ -152,7 +166,17 @@ impl RpcClient {
     pub fn unopened() -> Self {
         let (commands, _) = mpsc::unbounded_channel();
         let (_, closed) = async_channel::bounded(1);
-        Self { commands, next_id: Arc::default(), closed }
+        Self { commands, next_id: Arc::default(), closed, grants: Arc::new(watch::channel(Grants::Pending).0) }
+    }
+
+    /// The environment's grants, as its session check answered; guarded requests that wait for
+    /// them are sent or refused now.
+    pub fn set_grants(&self, grants: Grants) {
+        self.grants.send_if_modified(|current| {
+            let changed = *current != grants;
+            *current = grants;
+            changed
+        });
     }
 
     /// Resolves with the reason once the socket closes.
@@ -165,7 +189,18 @@ impl RpcClient {
         self.commands.same_channel(&other.commands)
     }
 
+    /// A pull request request may be answered by another trusted machine (see
+    /// [`crate::pull_request_routing`]).
     pub async fn request(&self, tag: &str, payload: Value) -> Result<Value, RpcError> {
+        if crate::pull_request_routing::intercepts(tag) {
+            return crate::pull_request_routing::request(self, tag, payload).await;
+        }
+        self.request_direct(tag, payload).await
+    }
+
+    /// The request on this socket, never routed. A guarded one its environment's grants lack
+    /// fails with `EnvironmentAuthorizationError` without being sent.
+    pub async fn request_direct(&self, tag: &str, payload: Value) -> Result<Value, RpcError> {
         let (tx, rx) = oneshot::channel();
         self.send(tag, payload, Pending::Unary(tx));
         rx.await.unwrap_or_else(|_| Err(RpcError::Disconnected("socket closed".into())))
@@ -182,9 +217,9 @@ impl RpcClient {
 
     fn send(&self, tag: &str, payload: Value, pending: Pending) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let command = Command::Request { id, tag: tag.to_owned(), payload, pending };
-        if let Err(mpsc::error::SendError(Command::Request { pending, .. })) = self.commands.send(command) {
-            fail_pending(pending, RpcError::Disconnected("socket closed".into()));
+        let command = Command::Request(Request { id, tag: tag.to_owned(), payload, pending });
+        if let Err(mpsc::error::SendError(Command::Request(request))) = self.commands.send(command) {
+            fail_pending(request.pending, RpcError::Disconnected("socket closed".into()));
         }
         id
     }
@@ -263,24 +298,109 @@ async fn open_socket(options: &ConnectOptions) -> Result<Socket> {
     Ok(socket)
 }
 
-/// Owns the socket until it closes. Returns the close reason.
-async fn run_socket(socket: Socket, mut commands: mpsc::UnboundedReceiver<Command>) -> String {
+/// Guarded requests waiting for the environment's first grants, oldest first.
+#[derive(Default)]
+struct Held(Vec<(Request, Instant)>);
+
+impl Held {
+    fn hold(&mut self, request: Request, now: Instant) {
+        self.0.push((request, now + GRANT_WAIT));
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        self.0.first().map(|(_, deadline)| *deadline)
+    }
+
+    /// Drops a held request whose caller stopped waiting; whether it was held.
+    fn interrupt(&mut self, id: u64) -> bool {
+        let before = self.0.len();
+        self.0.retain(|(request, _)| request.id != id);
+        self.0.len() != before
+    }
+
+    /// The held requests `grants` decide, and those that waited past their deadline, refused.
+    fn decide(&mut self, grants: &Grants, now: Instant) -> Vec<(Request, Result<(), RpcError>)> {
+        let mut decided = Vec::new();
+        for (request, deadline) in std::mem::take(&mut self.0) {
+            match authorize(grants, &request) {
+                Some(result) => decided.push((request, result)),
+                None if now >= deadline => {
+                    let refused = authorize(&Grants::Failed, &request).unwrap_or(Ok(()));
+                    decided.push((request, refused));
+                }
+                None => self.0.push((request, deadline)),
+            }
+        }
+        decided
+    }
+}
+
+/// `None` while the grants a guarded request needs are still loading.
+fn authorize(grants: &Grants, request: &Request) -> Option<Result<(), RpcError>> {
+    grants.authorize(&request.tag, &request.payload).map(|result| result.map_err(rpc_permissions::denied))
+}
+
+/// The request's frame; it is pending from now on.
+fn request_message(request: Request, pending: &mut HashMap<u64, Pending>) -> Value {
+    let Request { id, tag, payload, pending: entry } = request;
+    pending.insert(id, entry);
+    json!({"_tag": "Request", "id": id, "tag": tag, "payload": payload, "headers": []})
+}
+
+/// Sends the held requests the grants now allow and fails the ones they refuse.
+async fn release(
+    held: &mut Held,
+    grants: &Grants,
+    pending: &mut HashMap<u64, Pending>,
+    sink: &mut futures::stream::SplitSink<Socket, Message>,
+) -> Result<(), String> {
+    let mut messages = Vec::new();
+    for (request, result) in held.decide(grants, Instant::now()) {
+        match result {
+            Ok(()) => messages.push(request_message(request, pending)),
+            Err(error) => fail_pending(request.pending, error),
+        }
+    }
+    for message in messages {
+        sink.send(Message::text(message.to_string())).await.map_err(|error| format!("send failed: {error}"))?;
+    }
+    Ok(())
+}
+
+/// Owns the socket until it closes. Returns the close reason. A guarded request is sent only
+/// once `grants` allow it.
+async fn run_socket(
+    socket: Socket,
+    mut commands: mpsc::UnboundedReceiver<Command>,
+    mut grants: watch::Receiver<Grants>,
+) -> String {
     let (mut sink, mut source) = socket.split();
     let mut pending: HashMap<u64, Pending> = HashMap::new();
+    let mut held = Held::default();
     let mut frame_parts = String::new();
     let mut ping = tokio::time::interval(PING_INTERVAL);
     let mut last_inbound = Instant::now();
 
-    let reason = loop {
+    let reason = 'socket: loop {
+        let deadline = held.deadline();
         tokio::select! {
             command = commands.recv() => {
                 let Some(command) = command else { break "client dropped".to_owned() };
                 let message = match command {
-                    Command::Request { id, tag, payload, pending: entry } => {
-                        pending.insert(id, entry);
-                        json!({"_tag": "Request", "id": id, "tag": tag, "payload": payload, "headers": []})
+                    Command::Request(request) => {
+                        let decision = authorize(&grants.borrow(), &request);
+                        match decision {
+                            Some(Ok(())) => request_message(request, &mut pending),
+                            Some(Err(error)) => { fail_pending(request.pending, error); continue }
+                            None => { held.hold(request, Instant::now()); continue }
+                        }
                     }
                     Command::Interrupt { id } => {
+                        if held.interrupt(id) { continue }
                         // Only interrupt what is still running; finished streams are already gone.
                         if pending.remove(&id).is_none() { continue }
                         json!({"_tag": "Interrupt", "requestId": id})
@@ -321,8 +441,20 @@ async fn run_socket(socket: Socket, mut commands: mpsc::UnboundedReceiver<Comman
                 for id in acks {
                     let ack = json!({"_tag": "Ack", "requestId": id}).to_string();
                     if let Err(error) = sink.send(Message::Text(Utf8Bytes::from(ack))).await {
-                        return close(&mut pending, format!("send failed: {error}"));
+                        break 'socket format!("send failed: {error}");
                     }
+                }
+            }
+            changed = grants.changed(), if !held.is_empty() => {
+                let current = if changed.is_ok() { grants.borrow_and_update().clone() } else { Grants::Failed };
+                if let Err(reason) = release(&mut held, &current, &mut pending, &mut sink).await {
+                    break reason;
+                }
+            }
+            () = tokio::time::sleep_until(deadline.unwrap_or_else(Instant::now)), if deadline.is_some() => {
+                let current = grants.borrow().clone();
+                if let Err(reason) = release(&mut held, &current, &mut pending, &mut sink).await {
+                    break reason;
                 }
             }
             _ = ping.tick() => {
@@ -336,6 +468,9 @@ async fn run_socket(socket: Socket, mut commands: mpsc::UnboundedReceiver<Comman
         }
     };
     let _ = sink.close().await;
+    for (request, _) in held.0 {
+        fail_pending(request.pending, RpcError::Disconnected(reason.clone()));
+    }
     close(&mut pending, reason)
 }
 
@@ -485,6 +620,94 @@ mod tests {
         assert!(is_unauthorized(&rejected(401)));
         assert!(!is_unauthorized(&rejected(426)));
         assert!(!is_unauthorized(&anyhow!("websocket open timed out")));
+    }
+
+    #[test]
+    fn held_requests_are_refused_once_the_first_grants_never_came() {
+        let mut held = Held::default();
+        let now = Instant::now();
+        let (tx, _rx) = oneshot::channel();
+        held.hold(Request { id: 1, tag: "vcs.init".into(), payload: Value::Null, pending: Pending::Unary(tx) }, now);
+        assert!(held.decide(&Grants::Pending, now + GRANT_WAIT - Duration::from_millis(1)).is_empty());
+        let decided = held.decide(&Grants::Pending, now + GRANT_WAIT);
+        let [(_, Err(RpcError::Failure(error)))] = &decided[..] else { panic!("expected a refusal") };
+        assert_eq!(error["requiredPermission"], "source-control:write");
+        assert!(held.is_empty());
+    }
+
+    /// A server that answers each request with its tag, and reports each tag it received.
+    async fn echo_server() -> (String, mpsc::UnboundedReceiver<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ws_url = format!("ws://{}/ws", listener.local_addr().unwrap());
+        let (received, tags) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(Message::Text(text))) = socket.next().await {
+                let message: Value = serde_json::from_str(&text).unwrap();
+                if message["_tag"] != "Request" {
+                    continue;
+                }
+                let tag = message["tag"].as_str().unwrap().to_owned();
+                let exit =
+                    json!({"_tag": "Exit", "requestId": message["id"], "exit": {"_tag": "Success", "value": tag}});
+                received.send(tag).unwrap();
+                socket.send(Message::text(exit.to_string())).await.unwrap();
+            }
+        });
+        (ws_url, tags)
+    }
+
+    fn required_permission(result: Result<Value, RpcError>) -> String {
+        match result {
+            Err(RpcError::Failure(error)) if error["_tag"] == "EnvironmentAuthorizationError" => {
+                error["requiredPermission"].as_str().unwrap().to_owned()
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn guarded_requests_go_out_only_when_the_environments_grants_allow_them() {
+        use crate::rpc_permissions::{ORCHESTRATION_OPERATE, SOURCE_CONTROL_WRITE};
+        let (ws_url, mut received) = echo_server().await;
+        let options = ConnectOptions { ws_url, bearer_token: "token".into() };
+        let client = RpcClient::connect(&tokio::runtime::Handle::current(), options).await.unwrap();
+        let mut sent = move || std::iter::from_fn(|| received.try_recv().ok()).collect::<Vec<_>>();
+
+        // Before the first grants arrive a guarded request waits; others go out.
+        let mut run_now = Box::pin(client.request_direct("scheduledTasks.runNow", json!({"id": "a"})));
+        assert!(futures::poll!(&mut run_now).is_pending());
+        let dropped =
+            client.stream("git.runStackedAction", json!({"actionId": "x", "cwd": "/repo", "action": "commit"}));
+        drop(dropped);
+        assert_eq!(client.request_direct("server.getConfig", json!({})).await.unwrap(), "server.getConfig");
+        assert_eq!(sent(), ["server.getConfig"]);
+        client.set_grants(Grants::ready(|scope| scope == ORCHESTRATION_OPERATE));
+        assert_eq!(run_now.await.unwrap(), "scheduledTasks.runNow");
+
+        // Refused without reaching the server, unary and streamed alike.
+        client.set_grants(Grants::ready(|scope| scope == SOURCE_CONTROL_WRITE));
+        assert_eq!(
+            required_permission(client.request_direct("scheduledTasks.delete", json!({"id": "a"})).await),
+            "orchestration:operate"
+        );
+        let create_pr = json!({"actionId": "y", "cwd": "/repo", "action": "create_pr", "threadId": "t"});
+        let stream = client.stream("git.runStackedAction", create_pr);
+        let Some(StreamEvent::End(result)) = stream.next().await else { panic!("expected the stream to end") };
+        assert_eq!(required_permission(result.map(|()| Value::Null)), "orchestration:read");
+        assert_eq!(client.request_direct("vcs.init", json!({"cwd": "/repo"})).await.unwrap(), "vcs.init");
+        client.set_grants(Grants::Failed);
+        assert_eq!(
+            required_permission(client.request_direct("vcs.init", json!({"cwd": "/repo"})).await),
+            "source-control:write"
+        );
+        assert_eq!(client.request_direct("server.getConfig", json!({})).await.unwrap(), "server.getConfig");
+        assert_eq!(
+            sent(),
+            ["scheduledTasks.runNow", "vcs.init", "server.getConfig"],
+            "the dropped stream never went out"
+        );
     }
 
     #[test]

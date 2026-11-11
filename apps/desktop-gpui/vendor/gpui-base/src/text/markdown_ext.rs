@@ -13,7 +13,7 @@ use gpui::{AnyElement, App, IntoElement, SharedString, Window};
 use markdown::{ParseOptions, mdast};
 
 use super::{InlineElement, InlineRenderContext};
-use crate::text::node::Span;
+use crate::text::node::{LinkMark, Span};
 
 static MARKDOWN_EXTENSIONS_REVISION: AtomicU64 = AtomicU64::new(1);
 
@@ -78,11 +78,18 @@ pub trait MarkdownPlugin: Send + Sync + 'static {
 pub struct MarkdownParseContext<'a> {
     source: &'a str,
     offset: usize,
+    definitions: &'a HashMap<SharedString, LinkMark>,
 }
 
 impl<'a> MarkdownParseContext<'a> {
-    pub(crate) fn new(source: &'a str, offset: usize) -> Self {
-        Self { source, offset }
+    pub(crate) fn new(source: &'a str, offset: usize, definitions: &'a HashMap<SharedString, LinkMark>) -> Self {
+        Self { source, offset, definitions }
+    }
+
+    /// The URL a reference's normalized `identifier` is defined as, as an
+    /// `ImageReference` or `LinkReference` resolves it.
+    pub fn definition(&self, identifier: &str) -> Option<&'a str> {
+        self.definitions.get(identifier).map(|definition| definition.url.as_ref())
     }
 
     /// Source text for the Markdown fragment currently being parsed.
@@ -113,6 +120,7 @@ pub struct MarkdownNode {
     data: Arc<dyn Any + Send + Sync>,
     pub(crate) span: Option<Span>,
     pub(crate) after_children: bool,
+    pub(crate) leading: bool,
 }
 
 impl MarkdownNode {
@@ -129,6 +137,7 @@ impl MarkdownNode {
             data: Arc::new(data),
             span: None,
             after_children: false,
+            leading: false,
         }
     }
 
@@ -198,6 +207,15 @@ impl MarkdownNode {
         self
     }
 
+    /// Lead a claimed link instead of replacing it: the converter places this
+    /// node first, then converts the link as if no plugin claimed it, and the
+    /// node opens the link too. Its text and Markdown stay empty unless set,
+    /// so it adds nothing to the text and copying skips it.
+    pub fn leading(mut self) -> Self {
+        self.leading = true;
+        self
+    }
+
     /// Set the text representation of this custom node.
     pub fn text(mut self, text: impl Into<SharedString>) -> Self {
         self.text = text.into();
@@ -250,6 +268,7 @@ impl PartialEq for MarkdownNode {
             && self.accessibility_label == other.accessibility_label
             && self.span == other.span
             && self.after_children == other.after_children
+            && self.leading == other.leading
     }
 }
 

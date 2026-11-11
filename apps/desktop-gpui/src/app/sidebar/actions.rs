@@ -3,6 +3,7 @@
 //! `hooks/useThreadActionMenu.ts`, `components/threadActionMenu.logic.ts`,
 //! `SidebarThreadUndoNotice.tsx`).
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use gpui_kit::assets::IconName as Lucide;
@@ -21,6 +22,8 @@ use super::{Shelf, now_ms};
 use crate::app::thread_menu::hosted_thread_link;
 use crate::app::{Workspace, new_id};
 use crate::inbox::{self, Facts};
+use crate::model::{ScopedId, ThreadShell};
+use crate::rpc::RpcClient;
 
 /// The undoable actions (`showThreadUndoNotice`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -84,31 +87,31 @@ pub(in crate::app) fn failure_message(title: Option<&str>, error: &str) -> Strin
 /// Where the window goes once the open thread is parked: the next inbox thread, else a
 /// draft in its project.
 pub(super) struct Leave {
-    thread_id: String,
-    next: Option<String>,
-    project_id: Option<String>,
+    thread: ScopedId,
+    next: Option<ScopedId>,
+    project: Option<ScopedId>,
 }
 
 /// `getFallbackThreadIdAfterDelete`: the newest thread still in the inbox of the deleted
-/// thread's project, by the sidebar's thread sort order.
+/// thread's project on its environment, by the sidebar's thread sort order.
 fn fallback_after_delete<'a>(
-    threads: &'a [crate::model::ThreadShell],
-    deleted: &str,
+    threads: &'a [ThreadShell],
+    deleted: &ScopedId,
     sort_order: &str,
     now: i64,
-) -> Option<&'a str> {
-    let project = &threads.iter().find(|t| t.id == deleted)?.project_id;
+) -> Option<&'a ThreadShell> {
+    let project = threads.iter().find(|t| deleted.is_thread(t))?.project_ref();
     let requests = inbox::child_requests(threads);
     let parse = crate::timestamp::parse_ms;
-    let sorted_at = |t: &crate::model::ThreadShell| match sort_order {
+    let sorted_at = |t: &ThreadShell| match sort_order {
         "created_at" => parse(&t.created_at).or_else(|| parse(&t.updated_at)),
         _ => t.latest_user_message_at.as_deref().and_then(parse).or_else(|| parse(&t.updated_at)),
     };
     threads
         .iter()
         .filter(|t| {
-            &t.project_id == project
-                && t.id != deleted
+            t.project_ref() == project
+                && !deleted.is_thread(t)
                 && t.is_listed()
                 && t.archived_at.is_none()
                 && t.deleted_at.is_none()
@@ -116,12 +119,11 @@ fn fallback_after_delete<'a>(
                 && !Facts::new(t, &requests).is_snoozed(now)
         })
         .max_by(|a, b| sorted_at(a).cmp(&sorted_at(b)).then_with(|| a.id.cmp(&b.id)))
-        .map(|t| t.id.as_str())
 }
 
 /// What undo restores for one thread.
 pub(super) struct UndoEntry {
-    thread_id: String,
+    thread: ScopedId,
     pin_key: Option<String>,
     was_pinned: bool,
     snoozed_until: Option<String>,
@@ -152,7 +154,7 @@ pub(in crate::app) enum MenuOrigin {
 
 /// The title editor of the thread being renamed, in its row or in the chat title.
 pub(in crate::app) struct Renaming {
-    pub(in crate::app) thread_id: String,
+    pub(in crate::app) thread: ScopedId,
     pub(in crate::app) input: Entity<InputState>,
     original: String,
     _subscription: Subscription,
@@ -172,23 +174,52 @@ const NOT_CONNECTED: &str = "The environment is not connected.";
 /// `threadOperationFailure`: the connection lacks `orchestration:operate`.
 const NOT_OPERATE: &str = "This connection cannot change threads.";
 
+/// `threadActionRequiresOperate`: read-only connections keep read markers.
+fn requires_operate(kind: &str) -> bool {
+    !matches!(kind, "thread.mark-unread" | "thread.visit")
+}
+
 impl Workspace {
-    fn thread(&self, thread_id: &str) -> Option<&crate::model::ThreadShell> {
-        self.shell.threads.iter().find(|t| t.id == thread_id)
+    fn thread(&self, key: &ScopedId) -> Option<&ThreadShell> {
+        self.shell.thread(key)
     }
 
-    /// Dispatches `{type, commandId, threadId, ..fields}`; `false` when there is no
-    /// connection to send it on, so callers skip their optimistic undo and navigation.
+    /// `checkThreadOperations`: whether this connection may change every thread in `keys`
+    /// now, toasting when it may not. Grants change on reconnect, so handlers ask again.
+    pub(super) fn check_thread_operations<'a>(
+        &mut self,
+        keys: impl IntoIterator<Item = &'a ScopedId>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if keys.into_iter().all(|key| self.can_operate(&key.env)) {
+            return true;
+        }
+        self.error = Some(failure_message(Some("Thread action unavailable"), NOT_OPERATE).into());
+        cx.notify();
+        false
+    }
+
+    /// The socket for a command on `key`, once this connection may send it there.
+    fn thread_command_client(&mut self, kind: &str, key: &ScopedId, cx: &mut Context<Self>) -> Option<RpcClient> {
+        if requires_operate(kind) && !self.check_thread_operations([key], cx) {
+            return None;
+        }
+        self.env_client(&key.env)
+    }
+
+    /// Dispatches `{type, commandId, threadId, ..fields}` on the thread's environment; `false`
+    /// when there is no connection to send it on or it may not change the thread, so callers
+    /// skip their optimistic undo and navigation.
     pub(in crate::app) fn thread_command(
         &mut self,
         kind: &str,
-        thread_id: &str,
+        key: &ScopedId,
         fields: Value,
         cx: &mut Context<Self>,
     ) -> bool {
         let title = failure_title(kind, &fields);
-        let command = Self::thread_command_value(kind, thread_id, fields);
-        let Some(client) = self.thread_client(thread_id) else { return false };
+        let command = Self::thread_command_value(kind, &key.id, fields);
+        let Some(client) = self.thread_command_client(kind, key, cx) else { return false };
         cx.spawn(async move |this, cx| {
             if let Err(error) = client.request("orchestration.dispatchCommand", command).await {
                 let _ = this.update(cx, |this, cx| {
@@ -206,15 +237,15 @@ impl Workspace {
     pub(in crate::app) fn thread_command_then(
         &mut self,
         kind: &str,
-        thread_id: &str,
+        key: &ScopedId,
         fields: Value,
         window: &mut Window,
         cx: &mut Context<Self>,
         accepted: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
     ) {
         let title = failure_title(kind, &fields);
-        let command = Self::thread_command_value(kind, thread_id, fields);
-        let Some(client) = self.thread_client(thread_id) else { return };
+        let command = Self::thread_command_value(kind, &key.id, fields);
+        let Some(client) = self.thread_command_client(kind, key, cx) else { return };
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("orchestration.dispatchCommand", command).await;
             let _ = this.update_in(cx, |this, window, cx| match result {
@@ -237,18 +268,17 @@ impl Workspace {
         command
     }
 
-    /// Dispatches `commands` in order, then reports failures as one toast titled by
-    /// `title(failed, succeeded)`; a command whose environment is down fails too.
+    /// Dispatches each command on its environment in order, then reports failures as one toast
+    /// titled by `title(failed, succeeded)`; a command whose environment is down fails too.
     /// `stop_at_failure` ends the batch at the first one.
     pub(super) fn dispatch_batch(
         &mut self,
-        commands: Vec<Value>,
+        commands: Vec<(gpui_kit::SharedString, Value)>,
         stop_at_failure: bool,
         title: fn(usize, usize) -> String,
         cx: &mut Context<Self>,
     ) {
-        // Each command goes to the environment its thread or project lives on.
-        let routed: Vec<_> = commands.into_iter().map(|command| (self.command_client(&command), command)).collect();
+        let routed: Vec<_> = commands.into_iter().map(|(env, command)| (self.env_client(&env), command)).collect();
         cx.spawn(async move |this, cx| {
             let (mut failed, mut succeeded, mut first_error) = (0, 0, None);
             for (client, command) in routed {
@@ -279,10 +309,10 @@ impl Workspace {
         .detach();
     }
 
-    pub(super) fn undo_entry(&self, thread_id: &str) -> UndoEntry {
-        let thread = self.thread(thread_id);
+    pub(super) fn undo_entry(&self, key: &ScopedId) -> UndoEntry {
+        let thread = self.thread(key);
         UndoEntry {
-            thread_id: thread_id.to_owned(),
+            thread: key.clone(),
             pin_key: thread.and_then(|t| t.pin_order_key.clone()),
             was_pinned: thread.is_some_and(|t| t.pinned_at.is_some()),
             snoozed_until: thread.and_then(|t| t.snoozed_until.clone()),
@@ -296,7 +326,7 @@ impl Workspace {
             Some(notice) if notice.action == action => notice.entries,
             _ => Vec::new(),
         };
-        entries.retain(|e| e.thread_id != entry.thread_id);
+        entries.retain(|e| e.thread != entry.thread);
         entries.push(entry);
         self.set_undo(action, entries, None, cx);
     }
@@ -320,10 +350,10 @@ impl Workspace {
         self.notify_sidebar(cx);
     }
 
-    /// Drops a pending undo for `thread_id` that a newer action makes stale.
-    fn expire_undo(&mut self, thread_id: &str) {
+    /// Drops a pending undo for `key` that a newer action makes stale.
+    fn expire_undo(&mut self, key: &ScopedId) {
         if let Some(notice) = &mut self.sidebar.undo {
-            notice.entries.retain(|e| e.thread_id != thread_id);
+            notice.entries.retain(|e| e.thread != *key);
             if notice.entries.is_empty() {
                 self.sidebar.undo = None;
             }
@@ -338,11 +368,14 @@ impl Workspace {
             self.restore_discarded(draft, window, cx);
             return;
         }
+        if !self.check_thread_operations(notice.entries.iter().map(|e| &e.thread), cx) {
+            return;
+        }
         let now = now_ms();
         let action = notice.action;
         let mut plans = Vec::new();
         for entry in notice.entries {
-            let command = |kind: &str, fields| Self::thread_command_value(kind, &entry.thread_id, fields);
+            let command = |kind: &str, fields| Self::thread_command_value(kind, &entry.thread.id, fields);
             let repin =
                 || command("thread.pin", entry.pin_key.as_ref().map_or(json!({}), |key| json!({"orderKey": key})));
             let resnooze = entry
@@ -367,7 +400,7 @@ impl Workspace {
                 UndoAction::Archived => steps.push(command("thread.unarchive", json!({}))),
                 UndoAction::Discarded => {}
             }
-            plans.push((self.thread_client(&entry.thread_id), steps));
+            plans.push((self.env_client(&entry.thread.env), steps));
         }
         cx.spawn(async move |this, cx| {
             for (client, steps) in plans {
@@ -391,27 +424,23 @@ impl Workspace {
     /// to the next inbox thread in sidebar order (wrapping), passing over `parked` (threads
     /// parked with it, `coParkingKeys`), else a new draft in its project. It is planned
     /// before the command, as the thread leaves the inbox order once the server takes it.
-    pub(super) fn plan_leave(&self, thread_id: &str, parked: &[String]) -> Option<Leave> {
-        if self.open_thread_id() != Some(thread_id) {
+    pub(super) fn plan_leave(&self, key: &ScopedId, parked: &[ScopedId]) -> Option<Leave> {
+        if !self.is_open_thread(key) {
             return None;
         }
-        let order = &self.sidebar.inbox_order;
-        let next = order.iter().position(|id| id == thread_id).and_then(|at| {
-            order[at + 1..].iter().chain(&order[..at]).find(|id| *id != thread_id && !parked.contains(id)).cloned()
-        });
         Some(Leave {
-            thread_id: thread_id.to_owned(),
-            next,
-            project_id: self.thread(thread_id).map(|t| t.project_id.clone()),
+            thread: key.clone(),
+            next: next_in_inbox(&self.sidebar.inbox_order, key, parked).cloned(),
+            project: self.thread(key).map(ScopedId::thread_project),
         })
     }
 
     /// Runs the plan if the thread it leaves is still open.
     pub(super) fn leave(&mut self, plan: Option<Leave>, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(plan) = plan.filter(|plan| self.open_thread_id() == Some(plan.thread_id.as_str())) else { return };
-        match (plan.next, plan.project_id) {
-            (Some(next), _) => self.select_thread(next, window, cx),
-            (None, Some(project_id)) => self.start_draft(project_id, window, cx),
+        let Some(plan) = plan.filter(|plan| self.is_open_thread(&plan.thread)) else { return };
+        match (plan.next, plan.project) {
+            (Some(next), _) => self.select_thread_in(next.env, next.id, window, cx),
+            (None, Some(project)) => self.start_draft_in(project.env, project.id, window, cx),
             (None, None) => {}
         }
     }
@@ -419,27 +448,27 @@ impl Workspace {
     /// `advance` moves on from the open thread, as the sidebar's settle does.
     pub(in crate::app) fn settle_thread(
         &mut self,
-        thread_id: &str,
+        key: &ScopedId,
         advance: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let entry = self.undo_entry(thread_id);
-        let plan = advance.then(|| self.plan_leave(thread_id, &[])).flatten();
-        self.thread_command_then("thread.settle", thread_id, json!({}), window, cx, move |this, window, cx| {
+        let entry = self.undo_entry(key);
+        let plan = advance.then(|| self.plan_leave(key, &[])).flatten();
+        self.thread_command_then("thread.settle", key, json!({}), window, cx, move |this, window, cx| {
             this.push_undo(UndoAction::Settled, entry, cx);
             this.leave(plan, window, cx);
         });
     }
 
-    pub(in crate::app) fn unsettle_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
-        self.expire_undo(thread_id);
-        self.thread_command("thread.unsettle", thread_id, json!({"reason": "user"}), cx);
+    pub(in crate::app) fn unsettle_thread(&mut self, key: &ScopedId, cx: &mut Context<Self>) {
+        self.expire_undo(key);
+        self.thread_command("thread.unsettle", key, json!({"reason": "user"}), cx);
     }
 
     pub(super) fn snooze_thread(
         &mut self,
-        thread_id: &str,
+        key: &ScopedId,
         wake_ms: i64,
         advance: bool,
         window: &mut Window,
@@ -450,38 +479,38 @@ impl Workspace {
             cx.notify();
             return;
         }
-        let entry = self.undo_entry(thread_id);
+        let entry = self.undo_entry(key);
         let wake = json!({"snoozedUntil": crate::timestamp::iso(wake_ms).unwrap_or_default()});
-        let plan = advance.then(|| self.plan_leave(thread_id, &[])).flatten();
-        self.thread_command_then("thread.snooze", thread_id, wake, window, cx, move |this, window, cx| {
+        let plan = advance.then(|| self.plan_leave(key, &[])).flatten();
+        self.thread_command_then("thread.snooze", key, wake, window, cx, move |this, window, cx| {
             this.push_undo(UndoAction::Snoozed, entry, cx);
             this.leave(plan, window, cx);
         });
     }
 
-    pub(super) fn wake_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
-        self.expire_undo(thread_id);
-        self.thread_command("thread.unsnooze", thread_id, json!({"reason": "user"}), cx);
+    pub(super) fn wake_thread(&mut self, key: &ScopedId, cx: &mut Context<Self>) {
+        self.expire_undo(key);
+        self.thread_command("thread.unsnooze", key, json!({"reason": "user"}), cx);
     }
 
     /// `useAcknowledgeThreadWoke`: marks the thread visited at its wake, which clears "Woke".
-    pub(super) fn acknowledge_woke(&mut self, thread_id: &str, cx: &mut Context<Self>) {
-        let Some(thread) = self.thread(thread_id).filter(|t| t.tracks_visits()) else { return };
+    pub(super) fn acknowledge_woke(&mut self, key: &ScopedId, cx: &mut Context<Self>) {
+        let Some(thread) = self.thread(key).filter(|t| t.tracks_visits()) else { return };
         let requests = inbox::child_requests(&self.shell.threads);
         let Some(woke_at) = Facts::new(thread, &requests).woke_at(now_ms()).map(str::to_owned) else { return };
-        self.thread_command("thread.visit", thread_id, json!({"visitedAt": woke_at}), cx);
+        self.thread_command("thread.visit", key, json!({"visitedAt": woke_at}), cx);
     }
 
-    pub(in crate::app) fn pin_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
-        self.expire_undo(thread_id);
+    pub(in crate::app) fn pin_thread(&mut self, key: &ScopedId, cx: &mut Context<Self>) {
+        self.expire_undo(key);
         let fields = inbox::top_pin_key(&self.shell.threads).map_or(json!({}), |key| json!({"orderKey": key}));
-        self.thread_command("thread.pin", thread_id, fields, cx);
+        self.thread_command("thread.pin", key, fields, cx);
     }
 
     /// `confirmAndUnpinThread`: asked first when `confirmThreadUnpin` is on.
-    pub(in crate::app) fn unpin_thread(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let title = self.thread(thread_id).map(|t| t.title.clone()).unwrap_or_default();
-        let thread_id = thread_id.to_owned();
+    pub(in crate::app) fn unpin_thread(&mut self, key: &ScopedId, window: &mut Window, cx: &mut Context<Self>) {
+        let title = self.thread(key).map(|t| t.title.clone()).unwrap_or_default();
+        let key = key.clone();
         let question = Confirm {
             setting: "confirmThreadUnpin",
             message: format!("Unpin thread \"{title}\"?"),
@@ -489,15 +518,15 @@ impl Workspace {
             destructive: false,
         };
         self.confirm_then(question, window, cx, move |this, window, cx| {
-            let entry = this.undo_entry(&thread_id);
-            this.thread_command_then("thread.unpin", &thread_id, json!({}), window, cx, move |this, _, cx| {
+            let entry = this.undo_entry(&key);
+            this.thread_command_then("thread.unpin", &key, json!({}), window, cx, move |this, _, cx| {
                 this.push_undo(UndoAction::Unpinned, entry, cx);
             });
         });
     }
 
     /// The selection's Unpin: one question for all of them, unlike the web's one per thread.
-    pub(super) fn unpin_threads(&mut self, ids: &[String], window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn unpin_threads(&mut self, ids: &[ScopedId], window: &mut Window, cx: &mut Context<Self>) {
         if let [id] = ids {
             self.unpin_thread(id, window, cx);
             return;
@@ -521,10 +550,10 @@ impl Workspace {
 
     /// `thread.archive`, asked first when `confirmThreadArchive` is on; the open thread
     /// gives way to a new draft in its project.
-    pub(in crate::app) fn archive_thread(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(thread) = self.thread(thread_id) else { return };
-        let (project_id, title) = (thread.project_id.clone(), thread.title.clone());
-        let thread_id = thread_id.to_owned();
+    pub(in crate::app) fn archive_thread(&mut self, key: &ScopedId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(thread) = self.thread(key) else { return };
+        let (project, title) = (ScopedId::thread_project(thread), thread.title.clone());
+        let key = key.clone();
         let question = Confirm {
             setting: "confirmThreadArchive",
             message: format!("Archive thread \"{title}\"?"),
@@ -532,51 +561,51 @@ impl Workspace {
             destructive: false,
         };
         self.confirm_then(question, window, cx, move |this, window, cx| {
-            let entry = this.undo_entry(&thread_id);
-            let was_open = this.open_thread_id() == Some(&*thread_id);
-            let id = thread_id.clone();
-            this.thread_command_then("thread.archive", &thread_id, json!({}), window, cx, move |this, window, cx| {
+            let entry = this.undo_entry(&key);
+            let was_open = this.is_open_thread(&key);
+            let id = key.clone();
+            this.thread_command_then("thread.archive", &key, json!({}), window, cx, move |this, window, cx| {
                 this.push_undo(UndoAction::Archived, entry, cx);
                 // Only when the user is still on the thread they archived.
-                if was_open && this.open_thread_id() == Some(&*id) {
-                    this.start_draft(project_id, window, cx);
+                if was_open && this.is_open_thread(&id) {
+                    this.start_draft_in(project.env, project.id, window, cx);
                 }
             });
         });
     }
 
     /// `thread.delete`, asked first unless `confirmThreadDelete` is off; there is no undo.
-    pub(in crate::app) fn delete_thread(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let title = self.thread(thread_id).map(|t| t.title.clone()).unwrap_or_default();
-        let thread_id = thread_id.to_owned();
+    pub(in crate::app) fn delete_thread(&mut self, key: &ScopedId, window: &mut Window, cx: &mut Context<Self>) {
+        let title = self.thread(key).map(|t| t.title.clone()).unwrap_or_default();
+        let key = key.clone();
         let question = Confirm {
             setting: "confirmThreadDelete",
             message: format!("Delete thread \"{title}\"?"),
             detail: Some("This permanently clears conversation history for this thread."),
             destructive: true,
         };
-        self.confirm_then(question, window, cx, move |this, window, cx| this.delete_confirmed(&thread_id, window, cx));
+        self.confirm_then(question, window, cx, move |this, window, cx| this.delete_confirmed(&key, window, cx));
     }
 
     /// After a delete of the open thread: the newest open thread in its project, else a draft in
     /// the most recently active project, as the index route lands. Another thread opened since stays.
     fn land_after_delete(
         &mut self,
-        deleted: &str,
-        fallback: Option<String>,
+        deleted: &ScopedId,
+        fallback: Option<ScopedId>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // The deletion event may already have closed it.
-        if !(self.target.is_none() || self.open_thread_id() == Some(deleted)) {
+        if !(self.target.is_none() || self.is_open_thread(deleted)) {
             return;
         }
         match fallback.filter(|next| self.thread(next).is_some()) {
-            Some(next) => self.select_thread(next, window, cx),
+            Some(next) => self.select_thread_in(next.env, next.id, window, cx),
             None => {
                 let landing = inbox::most_recent_project(&self.shell.projects, &self.shell.threads);
-                if let Some(project_id) = landing.map(|p| p.id.clone()) {
-                    self.start_draft(project_id, window, cx);
+                if let Some(project) = landing.map(ScopedId::of_project) {
+                    self.start_draft_in(project.env, project.id, window, cx);
                 }
             }
         }
@@ -584,102 +613,65 @@ impl Workspace {
 
     /// `deleteThread` once agreed: offers to remove a worktree only this thread uses, stops the
     /// thread's provider sessions, deletes it, then removes the worktree if asked to.
-    fn delete_confirmed(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(client), Some(thread)) = (self.thread_client(thread_id), self.thread(thread_id)) else { return };
-        let was_open = self.open_thread_id() == Some(thread_id);
+    fn delete_confirmed(&mut self, key: &ScopedId, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.check_thread_operations([key], cx) {
+            return;
+        }
+        let Some(plan) = self.delete_plan(key, &HashSet::new()) else { return };
+        cx.spawn_in(window, async move |this, cx| {
+            if let Err(error) = run_delete(&this, plan, cx).await {
+                let _ = this.update(cx, |this, cx| {
+                    this.error = Some(failure_message(Some("Failed to delete thread"), &error).into());
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// What deleting `key` takes, read now. A worktree is only its own once no thread outside
+    /// `deleted` (this batch's deletions so far) uses it.
+    pub(super) fn delete_plan(&self, key: &ScopedId, deleted: &HashSet<ScopedId>) -> Option<DeletePlan> {
+        let thread = self.thread(key).filter(|_| self.env_client(&key.env).is_some())?;
         let sort_order =
             self.client_settings.values.get("sidebarThreadSortOrder").as_str().unwrap_or_default().to_owned();
-        let fallback = fallback_after_delete(&self.shell.threads, thread_id, &sort_order, now_ms()).map(str::to_owned);
+        let fallback = fallback_after_delete(&self.shell.threads, key, &sort_order, now_ms()).map(ScopedId::of_thread);
         let environment = thread.environment_id.clone();
-        let info = self.env_info(&environment).unwrap_or_else(|| self.server_info());
-        let project = self.shell.projects.iter().find(|p| p.id == thread.project_id);
+        let info = self.env_info(&environment).unwrap_or(&self.unscoped_server_info);
+        let project = self.shell.project(&ScopedId::thread_project(thread));
         let scratch_root = info.scratch_workspace_root.as_deref().map(crate::project_groups::normalize_path);
         let removable = project.filter(|p| {
             scratch_root.as_deref() != Some(crate::project_groups::normalize_path(&p.workspace_root).as_str())
         });
-        let siblings: Vec<_> = self.shell.threads.iter().filter(|t| t.environment_id == environment).collect();
-        let orphan = orphaned_worktree(&siblings, thread_id)
-            .filter(|_| removable.is_some() && self.env_grants(&environment, "source-control:write"));
+        let siblings: Vec<_> = (self.shell.threads.iter())
+            .filter(|t| t.environment_id == environment && !deleted.iter().any(|d| d.is_thread(t)))
+            .collect();
+        let orphan = orphaned_worktree(&siblings, &key.id).filter(|path| {
+            removable.is_some_and(|p| {
+                let input = json!({"cwd": p.workspace_root, "path": path, "force": true});
+                self.env_permits(&environment, "vcs.removeWorktree", &input)
+            })
+        });
         let automatic = removable.is_some_and(|p| {
             crate::settings::scope::worktree_cleanup_rules(&info.settings, Some(&p.scope_project()))
                 .get("worktreeOnDelete")
                 .and_then(Value::as_bool)
                 == Some(true)
         });
-        // A shell that leaves idle subagent children out can't prove nobody else uses the worktree.
-        let ask_server = info.config.get("shellThreadFamilies").and_then(Value::as_bool) == Some(true);
-        let has_runtime = Facts::new(thread, &std::collections::HashMap::new()).runtime_status().is_some();
-        let project_root = removable.map(|p| p.workspace_root.clone());
-        let thread_id = thread_id.to_owned();
-        cx.spawn_in(window, async move |this, cx| {
-            let mut orphan = orphan.filter(|_| !automatic);
-            if let (Some(path), true) = (&orphan, ask_server) {
-                let occupants =
-                    client.request("orchestration.getWorktreeThreadIds", json!({"worktreePath": path})).await;
-                let alone = occupants.ok().and_then(|value| {
-                    let ids = value["threadIds"].as_array()?.clone();
-                    Some(ids.iter().all(|id| id.as_str() == Some(&thread_id)))
-                });
-                if alone != Some(true) {
-                    orphan = None;
-                }
-            }
-            let mut remove = false;
-            if let Some(path) = &orphan {
-                let message = format!(
-                    "This thread is the only one linked to this worktree:\n{}\n\nDelete the worktree too?",
-                    worktree_display(path)
-                );
-                let Ok(answer) =
-                    this.update_in(cx, |_, window, cx| super::super::confirm::confirm(&message, true, window, cx))
-                else {
-                    return;
-                };
-                let Ok(agreed) = answer.await else { return };
-                remove = agreed;
-            }
-            if has_runtime {
-                stop_provider_sessions(&client, &thread_id).await;
-            }
-            let command = Self::thread_command_value("thread.delete", &thread_id, json!({}));
-            if let Err(error) = client.request("orchestration.dispatchCommand", command).await {
-                let _ = this.update(cx, |this, cx| {
-                    this.error = Some(failure_message(Some("Failed to delete thread"), &error.to_string()).into());
-                    cx.notify();
-                });
-                return;
-            }
-            let removing = this.update_in(cx, |this, window, cx| {
-                this.expire_undo(&thread_id);
-                if was_open {
-                    this.land_after_delete(&thread_id, fallback, window, cx);
-                }
-                remove && this.env_grants(&environment, "source-control:write")
-            });
-            let (Some(path), Some(root), Ok(true)) = (orphan.filter(|_| remove), project_root, removing) else {
-                return;
-            };
-            let removed = client
-                .request("vcs.removeWorktree", json!({"cwd": root, "path": path, "force": true}))
-                .await
-                .map_err(|error| {
-                    ("Failed to delete worktree", format!("Could not remove {}. {error}", worktree_display(&path)))
-                });
-            let failure = match removed {
-                Ok(_) => client
-                    .request("vcs.refreshStatus", json!({"cwd": root}))
-                    .await
-                    .err()
-                    .map(|error| ("Worktree deleted, but Git status refresh failed", error.to_string())),
-                Err(failure) => Some(failure),
-            };
-            if let Some((title, description)) = failure {
-                let _ = this.update_in(cx, |_, window, cx| {
-                    window.push_notification(Notification::error(description).title(title), cx);
-                });
-            }
+        // A shell that leaves idle subagent children or older settled threads out can't prove
+        // nobody else uses the worktree.
+        let ask_server = info.config.get("shellThreadFamilies").and_then(Value::as_bool) == Some(true)
+            || self.shell.older_settled(&environment).is_some();
+        Some(DeletePlan {
+            key: key.clone(),
+            was_open: self.is_open_thread(key),
+            fallback,
+            orphan: orphan.filter(|_| !automatic),
+            ask_server,
+            has_runtime: Facts::new(thread, &std::collections::HashMap::new()).runtime_status().is_some(),
+            project_root: removable.map(|p| p.workspace_root.clone()),
+            side_chats: self.listed_side_chats(&environment, &key.id),
         })
-        .detach();
     }
 
     /// Runs `then` at once when the question's setting is off, else once the user agrees.
@@ -717,13 +709,13 @@ impl Workspace {
     /// chat title (double-click, the title menu).
     pub(in crate::app) fn start_rename(
         &mut self,
-        thread_id: &str,
+        key: &ScopedId,
         origin: MenuOrigin,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // A read-only connection can't rename (`startRename`).
-        let Some(thread) = self.thread(thread_id).filter(|t| self.can_operate(&t.environment_id)) else { return };
+        let Some(thread) = self.thread(key).filter(|t| self.can_operate(&t.environment_id)) else { return };
         let title = thread.title.clone();
         let input = cx.new(|cx| InputState::new(window, cx).default_value(title.clone()));
         let subscription =
@@ -735,8 +727,7 @@ impl Workspace {
             input.focus(window, cx);
             input.select_all(window, cx);
         });
-        let renaming =
-            Renaming { thread_id: thread_id.to_owned(), input, original: title, _subscription: subscription };
+        let renaming = Renaming { thread: key.clone(), input, original: title, _subscription: subscription };
         *self.renaming_slot(origin) = Some(renaming);
         self.notify_sidebar(cx);
         cx.notify();
@@ -756,18 +747,33 @@ impl Workspace {
         }
     }
 
+    /// Losing operate access cancels a rename without committing it, so the editor does not
+    /// come back and take focus when access returns (`canOperateRenamingThread`).
+    pub(in crate::app) fn drop_unoperable_renames(&mut self) {
+        for origin in [MenuOrigin::Sidebar, MenuOrigin::Title] {
+            let env = self.renaming_slot(origin).as_ref().map(|renaming| renaming.thread.env.clone());
+            if env.is_some_and(|env| !self.can_operate(&env)) {
+                *self.renaming_slot(origin) = None;
+            }
+        }
+    }
+
     /// `resolveRenameCommit`: an empty title is refused, an unchanged one is a no-op; both
     /// refusals and failures toast, as `ChatHeader` and the sidebar do.
     fn commit_rename(&mut self, origin: MenuOrigin, window: &mut Window, cx: &mut Context<Self>) {
         let Some(renaming) = self.renaming_slot(origin).take() else { return };
         let title = renaming.input.read(cx).value().trim().to_owned();
-        if title.is_empty() {
+        // `commitThreadRename` asks again: access can go while the editor is open.
+        let operable = self.can_operate(&renaming.thread.env);
+        if operable && title.is_empty() {
             window.push_notification(Notification::warning("").title("Thread title cannot be empty"), cx);
-        } else if let (true, Some(client)) = (title != renaming.original, self.thread_client(&renaming.thread_id)) {
+        } else if let (true, Some(client)) =
+            (operable && !title.is_empty() && title != renaming.original, self.env_client(&renaming.thread.env))
+        {
             let command = json!({
                 "type": "thread.metadata.update",
                 "commandId": new_id(),
-                "threadId": renaming.thread_id,
+                "threadId": renaming.thread.id,
                 "title": title,
             });
             cx.spawn_in(window, async move |_, cx| {
@@ -787,13 +793,13 @@ impl Workspace {
     /// Opens the snooze menu for a card's clock button at `position`.
     pub(super) fn open_snooze_menu(
         &mut self,
-        thread_id: &str,
+        key: &ScopedId,
         position: Point<Pixels>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let view = cx.weak_entity();
-        let snooze = SnoozeItems::new(self, thread_id, MenuOrigin::Sidebar, false, cx);
+        let snooze = SnoozeItems::new(self, key, MenuOrigin::Sidebar, false, cx);
         // Below the clock, right-aligned (`side="bottom" align="end"`).
         let position = gpui_kit::point(position.x + px(10.), position.y + px(14.));
         self.open_menu(position, gpui_kit::Anchor::TopRight, window, cx, move |menu, _, _| {
@@ -804,20 +810,20 @@ impl Workspace {
     /// What a thread's menu shows, read before the menu is built.
     pub(in crate::app) fn thread_menu(
         &self,
-        thread_id: &str,
+        key: &ScopedId,
         origin: MenuOrigin,
         cx: &gpui_kit::App,
     ) -> Option<ThreadMenu> {
-        let thread = self.thread(thread_id)?;
+        let thread = self.thread(key)?;
         let now = now_ms();
         let requests = inbox::child_requests(&self.shell.threads);
         let facts = Facts::new(thread, &requests);
         // The thread's own machine: the menu can open on any listed thread.
-        let info = self.env_info(&thread.environment_id).unwrap_or_else(|| self.server_info());
-        let project = self.shell.projects.iter().find(|p| p.id == thread.project_id);
+        let info = self.env_info(&thread.environment_id).unwrap_or(&self.unscoped_server_info);
+        let project = self.shell.project(&ScopedId::thread_project(thread));
         let sidebar = origin == MenuOrigin::Sidebar;
         let groups = self.project_groups();
-        let group = project.and_then(|p| groups.iter().find(|g| g.contains(&p.id)));
+        let group = project.and_then(|p| groups.iter().find(|g| g.contains_project(p)));
         let filter = group.filter(|g| sidebar && !g.archived).map(|g| {
             let scoped = self.sidebar.scope == [g.key.clone()];
             let label = if scoped { "Show all projects".to_owned() } else { format!("Filter by {}", g.display_name) };
@@ -828,8 +834,7 @@ impl Workspace {
             scratch_root.as_deref() == Some(crate::project_groups::normalize_path(&p.workspace_root).as_str())
         });
         Some(ThreadMenu {
-            thread_id: thread.id.clone(),
-            environment_id: thread.environment_id.clone(),
+            thread: key.clone(),
             can_operate: self.can_operate(&thread.environment_id),
             origin,
             // Only the chat title finds in its thread (`onFindInThread`).
@@ -840,7 +845,7 @@ impl Workspace {
             pinned: thread.pinned_at.is_some(),
             settled: thread.settled_override.as_deref() == Some("settled"),
             snoozed: facts.is_snoozed(now),
-            snooze: facts.can_snooze(now).then(|| SnoozeItems::new(self, thread_id, origin, true, cx)),
+            snooze: facts.can_snooze(now).then(|| SnoozeItems::new(self, key, origin, true, cx)),
             regenerating: thread.title_regeneration.is_some(),
             auto_settle: info.capability("threadAutoSettleOptOut").then_some(thread.auto_settle_disabled_at.is_none()),
             filter,
@@ -853,10 +858,10 @@ impl Workspace {
     }
 
     /// The shelf a row's inline action acts on (slim rows).
-    pub(super) fn slim_action(&mut self, shelf: Shelf, thread_id: &str, cx: &mut Context<Self>) {
+    pub(super) fn slim_action(&mut self, shelf: Shelf, key: &ScopedId, cx: &mut Context<Self>) {
         match shelf {
-            Shelf::Settled => self.unsettle_thread(thread_id, cx),
-            Shelf::Snoozed => self.wake_thread(thread_id, cx),
+            Shelf::Settled => self.unsettle_thread(key, cx),
+            Shelf::Snoozed => self.wake_thread(key, cx),
             Shelf::Working => {}
         }
     }
@@ -914,7 +919,7 @@ impl Workspace {
 /// The snooze menu rows for one thread, resolved when the menu opens.
 #[derive(Clone)]
 pub(super) struct SnoozeItems {
-    thread_id: String,
+    thread: ScopedId,
     settings: Vec<inbox::SnoozeSetting>,
     presets: Vec<inbox::SnoozePreset>,
     /// A thread menu's submenu shows "Label (time)"; the card menu right-aligns the time.
@@ -924,12 +929,14 @@ pub(super) struct SnoozeItems {
 }
 
 impl SnoozeItems {
-    fn new(workspace: &Workspace, thread_id: &str, origin: MenuOrigin, inline_when: bool, cx: &gpui_kit::App) -> Self {
-        let settings = inbox::snooze_settings(workspace.server_info().settings.get("snoozePresets"));
+    fn new(workspace: &Workspace, key: &ScopedId, origin: MenuOrigin, inline_when: bool, cx: &gpui_kit::App) -> Self {
+        // The thread's own machine's presets.
+        let info = workspace.env_info(&key.env).unwrap_or(&workspace.unscoped_server_info);
+        let settings = inbox::snooze_settings(info.settings.get("snoozePresets"));
         let presets = inbox::snooze_presets(&settings, &chrono::Local::now(), workspace.hour12());
         let muted = crate::theme::tokens(cx).sidebar.secondary_label;
         let advance = origin == MenuOrigin::Sidebar;
-        Self { thread_id: thread_id.to_owned(), settings, presets, inline_when, advance, muted }
+        Self { thread: key.clone(), settings, presets, inline_when, advance, muted }
     }
 
     /// Adds the preset rows, a separator, and "Custom…" (`SnoozeMenuButton`).
@@ -952,17 +959,17 @@ impl SnoozeItems {
                 let now = chrono::Local::now();
                 let Some(wake) = inbox::pick_snooze(&this.presets, &id, &this.settings, &now) else { return };
                 let _ = view.update(cx, |workspace, cx| {
-                    workspace.snooze_thread(&this.thread_id, wake, this.advance, window, cx);
+                    workspace.snooze_thread(&this.thread, wake, this.advance, window, cx);
                 });
             }));
         }
         if !self.presets.is_empty() {
             menu = menu.separator();
         }
-        let (view, thread_id, advance) = (view.clone(), self.thread_id.clone(), self.advance);
+        let (view, thread, advance) = (view.clone(), self.thread.clone(), self.advance);
         menu.item(PopupMenuItem::new("Custom…").on_click(move |_, window, cx| {
             let _ = view.update(cx, |workspace, cx| {
-                workspace.open_custom_snooze(std::slice::from_ref(&thread_id), advance, window, cx);
+                workspace.open_custom_snooze(std::slice::from_ref(&thread), advance, window, cx);
             });
         }))
     }
@@ -970,8 +977,7 @@ impl SnoozeItems {
 
 /// A thread's menu (`buildThreadActionMenuItems`), from a sidebar row or the chat title.
 pub(in crate::app) struct ThreadMenu {
-    thread_id: String,
-    environment_id: gpui_kit::SharedString,
+    thread: ScopedId,
     /// A read-only connection keeps navigation, read markers and copying; the rest is disabled.
     can_operate: bool,
     origin: MenuOrigin,
@@ -1019,8 +1025,15 @@ fn native_rows(menu: PopupMenu, cx: &gpui_kit::App) -> PopupMenu {
     })
 }
 
+/// `planForwardNavigation`'s next card: the inbox row after `key` (wrapping) that is neither it
+/// nor parked with it.
+fn next_in_inbox<'a>(order: &'a [ScopedId], key: &ScopedId, parked: &[ScopedId]) -> Option<&'a ScopedId> {
+    let at = order.iter().position(|row| row == key)?;
+    order[at + 1..].iter().chain(&order[..at]).find(|row| *row != key && !parked.contains(row))
+}
+
 /// `getOrphanedWorktreePathForThread`: the thread's worktree when no other listed thread uses it.
-fn orphaned_worktree(threads: &[&crate::model::ThreadShell], thread_id: &str) -> Option<String> {
+fn orphaned_worktree(threads: &[&ThreadShell], thread_id: &str) -> Option<String> {
     let path = threads.iter().find(|t| t.id == thread_id)?.worktree_path.as_deref()?.trim();
     if path.is_empty() {
         return None;
@@ -1046,6 +1059,105 @@ fn worktree_display(path: &str) -> &str {
 
 /// `stopThreadSession`: detaches each provider session the thread holds; failures don't stop
 /// the delete, which detaches them on the server too.
+/// What deleting one thread takes, from [`Workspace::delete_plan`].
+pub(super) struct DeletePlan {
+    key: ScopedId,
+    was_open: bool,
+    fallback: Option<ScopedId>,
+    orphan: Option<String>,
+    ask_server: bool,
+    has_runtime: bool,
+    project_root: Option<String>,
+    side_chats: Vec<String>,
+}
+
+/// Runs a [`DeletePlan`]: asks about the worktree only this thread uses, stops its provider
+/// sessions, deletes it, then removes the worktree if asked to. `Ok(false)` when the question
+/// went unanswered and nothing was deleted; `Err` carries the delete's failure.
+pub(super) async fn run_delete(
+    this: &WeakEntity<Workspace>,
+    plan: DeletePlan,
+    cx: &mut gpui_kit::AsyncWindowContext,
+) -> Result<bool, String> {
+    let DeletePlan { key, was_open, fallback, mut orphan, ask_server, has_runtime, project_root, side_chats } = plan;
+    let (environment, thread_id) = (key.env.clone(), key.id.clone());
+    // The environment's socket at each step: a reconnect while the question is open replaces it.
+    let live_client = |cx: &mut gpui_kit::AsyncWindowContext| {
+        this.read_with(cx, |this, _| this.env_client(&environment))
+            .ok()
+            .flatten()
+            .ok_or_else(|| NOT_CONNECTED.to_owned())
+    };
+    if let (Some(path), true) = (&orphan, ask_server) {
+        let client = live_client(cx)?;
+        let occupants = client.request("orchestration.getWorktreeThreadIds", json!({"worktreePath": path})).await;
+        let alone = occupants.ok().and_then(|value| {
+            let ids = value["threadIds"].as_array()?.clone();
+            Some(ids.iter().all(|id| id.as_str() == Some(&thread_id)))
+        });
+        if alone != Some(true) {
+            orphan = None;
+        }
+    }
+    let mut remove = false;
+    if let Some(path) = &orphan {
+        let message = format!(
+            "This thread is the only one linked to this worktree:\n{}\n\nDelete the worktree too?",
+            worktree_display(path)
+        );
+        let Ok(answer) = this.update_in(cx, |_, window, cx| super::super::confirm::confirm(&message, true, window, cx))
+        else {
+            return Ok(false);
+        };
+        let Ok(agreed) = answer.await else { return Ok(false) };
+        remove = agreed;
+        // `checkThreadOperations` again: the grant can go while the question is open.
+        if !this.read_with(cx, |this, _| this.can_operate(&environment)).unwrap_or(false) {
+            return Err(NOT_OPERATE.to_owned());
+        }
+    }
+    let client = live_client(cx)?;
+    if has_runtime {
+        stop_provider_sessions(&client, &thread_id).await;
+    }
+    let command = Workspace::thread_command_value("thread.delete", &thread_id, json!({}));
+    client.request("orchestration.dispatchCommand", command).await.map_err(|error| error.to_string())?;
+    let removing = this.update_in(cx, |this, window, cx| {
+        this.expire_undo(&key);
+        this.forget_thread_panel(&environment, &thread_id);
+        if was_open {
+            this.land_after_delete(&key, fallback, window, cx);
+        }
+        this.forget_deleted_thread(&environment, &thread_id, &side_chats, cx);
+        // The socket the environment has now, which the question above may have outlived.
+        let input = json!({"cwd": project_root, "path": orphan, "force": true});
+        (remove && this.env_permits(&environment, "vcs.removeWorktree", &input))
+            .then(|| this.env_client(&environment))
+            .flatten()
+    });
+    let (Some(path), Some(root), Ok(Some(client))) = (orphan.filter(|_| remove), project_root, removing) else {
+        return Ok(true);
+    };
+    let removed =
+        client.request("vcs.removeWorktree", json!({"cwd": root, "path": path, "force": true})).await.map_err(
+            |error| ("Failed to delete worktree", format!("Could not remove {}. {error}", worktree_display(&path))),
+        );
+    let failure = match removed {
+        Ok(_) => client
+            .request("vcs.refreshStatus", json!({"cwd": root}))
+            .await
+            .err()
+            .map(|error| ("Worktree deleted, but Git status refresh failed", error.to_string())),
+        Err(failure) => Some(failure),
+    };
+    if let Some((title, description)) = failure {
+        let _ = this.update_in(cx, |_, window, cx| {
+            window.push_notification(Notification::error(description).title(title), cx);
+        });
+    }
+    Ok(true)
+}
+
 async fn stop_provider_sessions(client: &crate::rpc::RpcClient, thread_id: &str) {
     let Ok(projection) = client.request("orchestration.getThreadProjection", json!({"threadId": thread_id})).await
     else {
@@ -1087,7 +1199,7 @@ impl ThreadMenu {
         macro_rules! act {
             ($item:expr, |$this:ident, $window:ident, $cx:ident, $id:ident| $body:expr) => {{
                 let view = view.clone();
-                let $id = self.thread_id.clone();
+                let $id = self.thread.clone();
                 $item.on_click(move |_, $window, $cx| {
                     let _ = view.update($cx, |$this, $cx| $body);
                 })
@@ -1099,15 +1211,11 @@ impl ThreadMenu {
         macro_rules! op {
             ($item:expr, $disabled:expr, |$this:ident, $window:ident, $cx:ident, $id:ident| $body:expr) => {{
                 let view = view.clone();
-                let $id = self.thread_id.clone();
-                let environment = self.environment_id.clone();
+                let $id = self.thread.clone();
                 $item.disabled($disabled || !can_operate).on_click(move |_, $window, $cx| {
                     let _ = view.update($cx, |$this, $cx| {
-                        if $this.can_operate(&environment) {
+                        if $this.check_thread_operations([&$id], $cx) {
                             let _ = $body;
-                        } else {
-                            $this.error = Some(failure_message(Some("Thread action unavailable"), NOT_OPERATE).into());
-                            $cx.notify();
                         }
                     });
                 })
@@ -1181,10 +1289,10 @@ impl ThreadMenu {
         if self.auto_settle.is_some() && !can_operate {
             menu = menu.item(locked_submenu("Auto-settle behavior", window, cx));
         } else if let Some(enabled) = self.auto_settle {
-            let (view, id) = (view.clone(), self.thread_id.clone());
+            let (view, id) = (view.clone(), self.thread.clone());
             menu = menu.submenu("Auto-settle behavior", window, cx, move |menu, _, cx| {
                 let mut menu = native_rows(menu, cx);
-                for (label, on) in [("Enabled", true), ("Disabled", false)] {
+                for (label, on) in [("Follow settings", true), ("Never", false)] {
                     let (view, id) = (view.clone(), id.clone());
                     menu = menu.item(PopupMenuItem::new(label).checked(enabled == on).on_click(move |_, _, cx| {
                         let _ = view.update(cx, |this, cx| {
@@ -1197,7 +1305,7 @@ impl ThreadMenu {
         }
         menu = menu.separator();
         let (path, branch, link, id) =
-            (self.path.clone(), self.branch.clone(), self.link.clone(), self.thread_id.clone());
+            (self.path.clone(), self.branch.clone(), self.link.clone(), self.thread.id.clone());
         menu = menu.submenu("Copy", window, cx, move |menu, _, cx| {
             let mut menu = native_rows(menu, cx);
             let copy = |text: String| {
@@ -1217,8 +1325,8 @@ impl ThreadMenu {
             menu.item(PopupMenuItem::new("Thread ID").on_click(copy(id.clone())))
         });
         menu = menu.item(act!(item("Project settings"), |this, _w, cx, id| {
-            if let Some(project_id) = this.shell.threads.iter().find(|t| t.id == id).map(|t| t.project_id.clone()) {
-                this.open_project_settings(&project_id, cx);
+            if let Some(project) = this.thread(&id).map(ScopedId::thread_project) {
+                this.open_project_settings(&project, cx);
             }
         }));
         menu = menu.separator();
@@ -1260,7 +1368,7 @@ mod tests {
         assert_eq!(worktree_display("plain"), "plain");
     }
 
-    fn thread(id: &str, project: &str, extra: serde_json::Value) -> crate::model::ThreadShell {
+    fn thread(id: &str, project: &str, extra: serde_json::Value) -> ThreadShell {
         let mut value = json!({
             "id": id, "projectId": project, "title": id, "status": "idle",
             "createdAt": "2026-11-01T00:00:00.000Z", "updatedAt": "2026-11-01T00:00:00.000Z",
@@ -1297,10 +1405,40 @@ mod tests {
                 json!({"latestUserMessageAt": "2026-11-03T12:00:00.000Z", "archivedAt": "2026-11-03T00:00:00.000Z"}),
             ),
             thread("elsewhere", "q", json!({"latestUserMessageAt": "2026-11-03T12:00:00.000Z"})),
+            // Project `p` on another machine is another project.
+            ThreadShell {
+                environment_id: "copy".into(),
+                ..thread("copied", "p", json!({"latestUserMessageAt": "2026-11-03T23:00:00.000Z"}))
+            },
         ];
-        assert_eq!(fallback_after_delete(&threads, "gone", "updated_at", now), Some("new"));
-        assert_eq!(fallback_after_delete(&threads, "gone", "created_at", now), Some("old"));
-        assert_eq!(fallback_after_delete(&threads, "elsewhere", "updated_at", now), None);
-        assert_eq!(fallback_after_delete(&threads, "missing", "updated_at", now), None);
+        let fallback = |deleted: &str, order: &str| {
+            fallback_after_delete(&threads, &ScopedId::new("", deleted), order, now).map(|t| t.id.as_str())
+        };
+        assert_eq!(fallback("gone", "updated_at"), Some("new"));
+        assert_eq!(fallback("gone", "created_at"), Some("old"));
+        assert_eq!(fallback("elsewhere", "updated_at"), None);
+        assert_eq!(fallback("missing", "updated_at"), None);
+        // The copy's project holds nothing else, whatever shares its id elsewhere.
+        assert!(fallback_after_delete(&threads, &ScopedId::new("copy", "copied"), "updated_at", now).is_none());
+    }
+
+    #[test]
+    fn the_next_inbox_thread_skips_parked_ones_and_wraps() {
+        let key = |env: &str, id: &str| ScopedId::new(env.to_owned(), id);
+        // The same id on two machines is two rows.
+        let order = [key("a", "1"), key("b", "1"), key("a", "2"), key("a", "3")];
+        assert_eq!(next_in_inbox(&order, &key("a", "1"), &[]), Some(&key("b", "1")));
+        assert_eq!(next_in_inbox(&order, &key("b", "1"), &[key("a", "2")]), Some(&key("a", "3")));
+        assert_eq!(next_in_inbox(&order, &key("a", "3"), &[]), Some(&key("a", "1")));
+        assert_eq!(next_in_inbox(&order, &key("c", "1"), &[]), None);
+        assert_eq!(next_in_inbox(&order[..1], &key("a", "1"), &[]), None);
+    }
+
+    #[test]
+    fn read_markers_need_no_operate_grant() {
+        assert!(!requires_operate("thread.mark-unread"));
+        assert!(!requires_operate("thread.visit"));
+        assert!(requires_operate("thread.settle"));
+        assert!(requires_operate("thread.metadata.update"));
     }
 }

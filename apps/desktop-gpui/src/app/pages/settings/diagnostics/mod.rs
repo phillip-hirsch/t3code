@@ -123,6 +123,12 @@ impl DiagnosticsState {
         self.session.grants(scope)
     }
 
+    /// The socket a signal goes out on, read when it is sent (after a SIGKILL confirmation):
+    /// the one the page's reads and grants are on now, as a reconnect starts them over.
+    fn signal_client(&self) -> Option<RpcClient> {
+        self.started.clone().filter(|_| self.grants(ENVIRONMENT_MAINTAIN))
+    }
+
     fn refresh_all(&mut self, client: &RpcClient, cx: &mut Context<Self>) {
         self.subscribe_telemetry(client.clone(), cx);
         self.load_telemetry_history(client.clone(), cx);
@@ -258,20 +264,11 @@ impl DiagnosticsState {
 
     /// `signalProcess` for the Live Processes table. The result toasts in `window`, the
     /// one clicked, whether or not it is still focused.
-    fn signal_live(
-        &mut self,
-        client: RpcClient,
-        pid: u64,
-        signal: &'static str,
-        window: AnyWindowHandle,
-        cx: &mut Context<Self>,
-    ) {
+    fn signal_live(&mut self, pid: u64, signal: &'static str, window: AnyWindowHandle, cx: &mut Context<Self>) {
         let Some(process) = self.processes.data.as_ref().and_then(|d| d.processes.iter().find(|p| p.pid == pid)) else {
             return;
         };
-        if !self.grants(ENVIRONMENT_MAINTAIN) || self.signaling_pid.is_some() {
-            return;
-        }
+        let Some(client) = self.signal_client().filter(|_| self.signaling_pid.is_none()) else { return };
         self.signaling_pid = Some(pid);
         let input = json!({ "pid": pid, "startTimeMs": process.start_time_ms, "signal": signal });
         cx.notify();
@@ -313,14 +310,14 @@ impl DiagnosticsState {
     /// `signalProcess` for the Live process tree.
     fn signal_telemetry(
         &mut self,
-        client: RpcClient,
         identity: Identity,
         signal: &'static str,
         window: AnyWindowHandle,
         cx: &mut Context<Self>,
     ) {
         let key = identity.key();
-        if !self.grants(ENVIRONMENT_MAINTAIN) || !self.signaling_keys.insert(key.clone()) {
+        let Some(client) = self.signal_client() else { return };
+        if !self.signaling_keys.insert(key.clone()) {
             return;
         }
         let input = json!({ "pid": identity.pid, "startTimeMs": identity.start_time_ms, "signal": signal });
@@ -1342,12 +1339,12 @@ impl Workspace {
                     _ => success(),
                 };
                 let actions = if can_signal(&p.category) {
-                    let (state, client, identity) = (state.clone(), client.clone(), p.identity);
+                    let (state, identity) = (state.clone(), p.identity);
                     let disabled = !maintain || s.signaling_keys.contains(&key);
                     signal_actions(&format!("tree-{key}"), disabled, t, move |signal, window, cx| {
-                        let (state, client, handle) = (state.clone(), client.clone(), window.window_handle());
+                        let (state, handle) = (state.clone(), window.window_handle());
                         let send = move |cx: &mut App| {
-                            state.update(cx, |s, cx| s.signal_telemetry(client.clone(), identity, signal, handle, cx));
+                            state.update(cx, |s, cx| s.signal_telemetry(identity, signal, handle, cx));
                         };
                         if signal == "SIGKILL" {
                             confirm_kill(identity.pid, window, cx, send);
@@ -1579,12 +1576,12 @@ impl Workspace {
                     });
                     (!s.collapsed_pids.contains(&pid), on_toggle)
                 });
-                let (signal_state, signal_client) = (state.clone(), client.clone());
+                let signal_state = state.clone();
                 let disabled = !maintain || s.signaling_pid == Some(pid);
                 let actions = signal_actions(&format!("proc-{pid}"), disabled, t, move |signal, window, cx| {
-                    let (state, client, handle) = (signal_state.clone(), signal_client.clone(), window.window_handle());
+                    let (state, handle) = (signal_state.clone(), window.window_handle());
                     let send = move |cx: &mut App| {
-                        state.update(cx, |s, cx| s.signal_live(client.clone(), pid, signal, handle, cx));
+                        state.update(cx, |s, cx| s.signal_live(pid, signal, handle, cx));
                     };
                     if signal == "SIGKILL" {
                         confirm_kill(pid, window, cx, send);

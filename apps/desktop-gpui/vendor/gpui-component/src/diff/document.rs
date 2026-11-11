@@ -1,4 +1,7 @@
-use std::{ops::Range, sync::Arc};
+use std::{
+    ops::Range,
+    sync::{Arc, Weak},
+};
 
 use gpui::SharedString;
 
@@ -262,6 +265,8 @@ pub(crate) struct Hunk {
     label: SharedString,
     /// The one-based original lines the hunk supplies.
     original_lines: Range<usize>,
+    /// The one-based modified lines the hunk supplies.
+    modified_lines: Range<usize>,
     /// Whether the hunk ended before its declared line counts.
     truncated: bool,
 }
@@ -272,15 +277,17 @@ impl Hunk {
         original: Range<usize>,
         modified: Range<usize>,
         label: SharedString,
-        original_lines: Range<usize>,
+        source_lines: [Range<usize>; 2],
         truncated: bool,
     ) -> Self {
+        let [original_lines, modified_lines] = source_lines;
         Self {
             pairs,
             original,
             modified,
             label,
             original_lines,
+            modified_lines,
             truncated,
         }
     }
@@ -289,6 +296,13 @@ impl Hunk {
     pub(crate) fn hidden_lines_before(&self, previous: Option<&Hunk>) -> usize {
         let after = previous.map_or(1, |previous| previous.original_lines.end);
         self.original_lines.start.saturating_sub(after)
+    }
+    /// The one-based source lines the hunk supplies on `side`.
+    fn source_lines(&self, side: DiffSide) -> Range<usize> {
+        match side {
+            DiffSide::Original => self.original_lines.clone(),
+            DiffSide::Modified => self.modified_lines.clone(),
+        }
     }
     pub(crate) fn pairs(&self) -> Range<usize> {
         self.pairs.clone()
@@ -360,6 +374,27 @@ pub(crate) struct PatchLine {
     modified: Option<usize>,
 }
 
+/// One line of [`DiffFile::patch_body`]: its one-based line on each side it
+/// is on (an unchanged line is on both) and its text without the line ending.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DiffPatchLine<'a> {
+    original: Option<usize>,
+    modified: Option<usize>,
+    text: &'a str,
+}
+
+impl<'a> DiffPatchLine<'a> {
+    pub fn original(&self) -> Option<usize> {
+        self.original
+    }
+    pub fn modified(&self) -> Option<usize> {
+        self.modified
+    }
+    pub fn text(&self) -> &'a str {
+        self.text
+    }
+}
+
 impl PatchLine {
     pub(crate) fn line(&self, side: DiffSide) -> Option<usize> {
         match side {
@@ -386,17 +421,37 @@ struct DocumentInner {
     patch_lines: Vec<PatchLine>,
     patch_ixs: [Vec<usize>; 2],
     conflicts: Vec<DiffConflict>,
+    /// Whether both sides hold every line of their file, from
+    /// [`DiffFile::with_contents`], not only the hunks' lines.
+    hydrated: bool,
 }
 
 /// One changed file parsed from a unified or Git diff.
 ///
-/// Only source fragments present in the patch are retained; unavailable
-/// context is never reconstructed or compared. Cloning is cheap.
+/// Only source fragments present in the patch are retained until
+/// [`DiffFile::with_contents`] fills in the rest from the full files; context
+/// is never reconstructed or compared. Cloning is cheap.
 #[derive(Clone)]
 pub struct DiffFile {
     inner: Arc<DocumentInner>,
     language: Option<SharedString>,
+    /// The patch-only file this one was hydrated from. Weak, so it holds no
+    /// lines, yet its allocation (and address) outlives it.
+    origin: Option<Weak<DocumentInner>>,
 }
+
+/// Full file contents that do not fit a patch's hunks, so they cannot fill
+/// in the lines between them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DiffContentsMismatch;
+
+impl std::fmt::Display for DiffContentsMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the file contents do not match the patch")
+    }
+}
+
+impl std::error::Error for DiffContentsMismatch {}
 
 impl DiffFile {
     /// Parses every file in a unified or Git diff, in patch order, without
@@ -413,9 +468,198 @@ impl DiffFile {
         super::parser::parse(patch, options)
     }
 
-    /// Whether `other` is this file (a clone of it), not just an equal parse.
+    /// Whether `other` is this file (a clone of it), or the patch-only file
+    /// this one was hydrated from, not just an equal parse.
     pub(crate) fn is_same(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.inner, &other.inner) && self.language == other.language
+        let origin = self
+            .origin
+            .as_ref()
+            .is_some_and(|origin| std::ptr::eq(origin.as_ptr(), Arc::as_ptr(&other.inner)));
+        (origin || Arc::ptr_eq(&self.inner, &other.inner)) && self.language == other.language
+    }
+
+    /// Whether both sides hold every line of their file, from [`Self::with_contents`].
+    pub fn is_hydrated(&self) -> bool {
+        self.inner.hydrated
+    }
+
+    /// Whether [`Self::with_contents`] can fill in the unchanged lines the
+    /// patch omits: a modified or renamed text file with complete hunks.
+    pub fn can_load_contents(&self) -> bool {
+        !self.inner.hydrated
+            && matches!(
+                self.status(),
+                DiffFileStatus::Modified | DiffFileStatus::Renamed
+            )
+            && !self.inner.hunks.is_empty()
+            && !self.inner.binary
+            && !self.is_truncated()
+            && self.original_path().is_some()
+            && self.modified_path().is_some()
+    }
+
+    /// This file with every line of both sides, `original` and `modified`
+    /// being the full files. The hunks keep their changes; the unchanged
+    /// lines between and after them come from the contents, and
+    /// [`super::DiffState`] shows them on demand. Fails when the contents are
+    /// too short for the hunks, the gaps between hunks differ in length or
+    /// text, or a hunk's lines differ from the patch: the file changed since.
+    pub fn with_contents(
+        &self,
+        original: &str,
+        modified: &str,
+    ) -> Result<Self, DiffContentsMismatch> {
+        self.hydrate_with(original, modified, |a, b| a == b)
+    }
+
+    /// [`Self::with_contents`] for a patch made ignoring whitespace (`git diff
+    /// -w`): its unchanged lines may differ from the contents, and from each
+    /// other, in whitespace only.
+    pub fn with_contents_ignoring_whitespace(
+        &self,
+        original: &str,
+        modified: &str,
+    ) -> Result<Self, DiffContentsMismatch> {
+        let visible = |c: &char| !c.is_whitespace();
+        self.hydrate_with(original, modified, |a, b| {
+            a.chars().filter(visible).eq(b.chars().filter(visible))
+        })
+    }
+
+    fn hydrate_with(
+        &self,
+        original: &str,
+        modified: &str,
+        same: impl Fn(&str, &str) -> bool,
+    ) -> Result<Self, DiffContentsMismatch> {
+        if !self.can_load_contents() {
+            return Err(DiffContentsMismatch);
+        }
+        let contents = [original, modified];
+        let sides = contents.map(line_ranges);
+        let count = |side: DiffSide| sides[side as usize].len();
+        // The zero-based `line` on `side` with its ending, which `git diff` compares too.
+        let text = |side: DiffSide, line: usize| {
+            &contents[side as usize][sides[side as usize][line].clone()]
+        };
+        let mut pairs = Vec::with_capacity(count(DiffSide::Modified) + self.deletions());
+        let mut hunks = Vec::with_capacity(self.inner.hunks.len());
+        // The next one-based line on each side not yet paired.
+        let mut next = [1, 1];
+        let gap = |pairs: &mut Vec<LinePair>, next: [usize; 2], end: [usize; 2]| {
+            let len = end[0].checked_sub(next[0]).ok_or(DiffContentsMismatch)?;
+            if end[1].checked_sub(next[1]) != Some(len)
+                || (0..len).any(|ix| {
+                    !same(
+                        text(DiffSide::Original, next[0] - 1 + ix),
+                        text(DiffSide::Modified, next[1] - 1 + ix),
+                    )
+                })
+            {
+                return Err(DiffContentsMismatch);
+            }
+            pairs
+                .extend((0..len).map(|ix| {
+                    LinePair::new(Some(next[0] - 1 + ix), Some(next[1] - 1 + ix), false)
+                }));
+            Ok(())
+        };
+        for hunk in &self.inner.hunks {
+            let lines =
+                [DiffSide::Original, DiffSide::Modified].map(|side| hunk.source_lines(side));
+            if lines
+                .iter()
+                .zip([DiffSide::Original, DiffSide::Modified])
+                .any(|(lines, side)| lines.end > count(side) + 1)
+            {
+                return Err(DiffContentsMismatch);
+            }
+            gap(&mut pairs, next, lines.clone().map(|lines| lines.start))?;
+            let start = pairs.len();
+            let index =
+                |side: DiffSide, ix: Option<usize>| ix.map(|ix| self.line_number(side, ix) - 1);
+            let differs = |side: DiffSide, ix: Option<usize>| {
+                ix.is_some_and(|ix| {
+                    !same(
+                        &self.source(side)[self.lines(side)[ix].source.clone()],
+                        text(side, self.line_number(side, ix) - 1),
+                    )
+                })
+            };
+            if self.inner.pairs[hunk.pairs()].iter().any(|pair| {
+                differs(DiffSide::Original, pair.original)
+                    || differs(DiffSide::Modified, pair.modified)
+            }) {
+                return Err(DiffContentsMismatch);
+            }
+            pairs.extend(self.inner.pairs[hunk.pairs()].iter().map(|pair| {
+                LinePair::new(
+                    index(DiffSide::Original, pair.original),
+                    index(DiffSide::Modified, pair.modified),
+                    pair.changed,
+                )
+            }));
+            hunks.push(Hunk::new(
+                start..pairs.len(),
+                lines[0].start - 1..lines[0].end - 1,
+                lines[1].start - 1..lines[1].end - 1,
+                hunk.label.clone(),
+                lines.clone(),
+                false,
+            ));
+            next = lines.map(|lines| lines.end);
+        }
+        gap(
+            &mut pairs,
+            next,
+            [count(DiffSide::Original) + 1, count(DiffSide::Modified) + 1],
+        )?;
+        let [original_lines, modified_lines] = sides;
+        let side = |path: &Option<SharedString>, source: &str, lines: Vec<Range<usize>>| {
+            FileSide::new(
+                path.clone(),
+                source.to_owned(),
+                lines
+                    .into_iter()
+                    .enumerate()
+                    .map(|(ix, range)| (ix + 1, range)),
+            )
+        };
+        let mut file = Self::new(
+            self.status(),
+            side(&self.inner.original.path, original, original_lines),
+            side(&self.inner.modified.path, modified, modified_lines),
+            pairs,
+            hunks,
+            self.inner.extended_headers.clone(),
+            false,
+        );
+        Arc::get_mut(&mut file.inner)
+            .expect("a newly built file is not shared")
+            .hydrated = true;
+        file.language = self.language.clone();
+        file.origin = Some(Arc::downgrade(&self.inner));
+        Ok(file)
+    }
+
+    /// The pairs between hunk `gap - 1` (or the file start) and hunk `gap`
+    /// (or the file end, for `gap == hunks().len()`); empty unless hydrated.
+    pub(crate) fn gap_pairs(&self, gap: usize) -> Range<usize> {
+        let hunks = &self.inner.hunks;
+        let start = gap
+            .checked_sub(1)
+            .and_then(|ix| hunks.get(ix))
+            .map_or(0, |hunk| hunk.pairs.end);
+        let end = hunks
+            .get(gap)
+            .map_or(self.inner.pairs.len(), |hunk| hunk.pairs.start);
+        start..end.max(start)
+    }
+
+    /// The pairs split at every hunk boundary: each hunk, and each run of
+    /// pairs between them. A file without hunks is one segment.
+    pub(crate) fn segments(&self) -> Vec<Range<usize>> {
+        segments(self.inner.pairs.len(), &self.inner.hunks)
     }
 
     /// Assembles a parsed file, pairing counterpart lines and deriving its
@@ -469,8 +713,10 @@ impl DiffFile {
                 patch_lines,
                 patch_ixs,
                 conflicts: Vec::new(),
+                hydrated: false,
             }),
             language: None,
+            origin: None,
         }
     }
 
@@ -557,8 +803,13 @@ impl DiffFile {
         self
     }
 
-    pub(crate) fn lines_count(&self, side: DiffSide) -> usize {
+    /// How many of `side`'s lines the file holds: the patch's, or every line once hydrated.
+    pub fn lines_count(&self, side: DiffSide) -> usize {
         self.lines(side).len()
+    }
+    /// How many hunks the patch has.
+    pub fn hunk_count(&self) -> usize {
+        self.inner.hunks.len()
     }
 
     /// Copies patch-provided lines. Unavailable context is omitted, without
@@ -598,6 +849,18 @@ impl DiffFile {
     pub(crate) fn patch_lines(&self) -> &[PatchLine] {
         &self.inner.patch_lines
     }
+    /// The patch body in patch order, for tools that anchor to its lines.
+    pub fn patch_body(&self) -> impl Iterator<Item = DiffPatchLine<'_>> + '_ {
+        self.inner.patch_lines.iter().map(|line| {
+            let original = line.original.map(|ix| &self.inner.original.lines[ix]);
+            let modified = line.modified.map(|ix| &self.inner.modified.lines[ix]);
+            DiffPatchLine {
+                original: original.map(SourceLine::line_number),
+                modified: modified.map(SourceLine::line_number),
+                text: modified.or(original).map_or("", |line| line.text.as_str()),
+            }
+        })
+    }
     /// The position of a side's line in [`Self::patch_lines`].
     pub(crate) fn patch_ix(&self, side: DiffSide, ix: usize) -> usize {
         self.inner.patch_ixs[side as usize][ix]
@@ -631,12 +894,7 @@ fn patch_order(
 ) -> (Vec<PatchLine>, [Vec<usize>; 2]) {
     let mut lines = Vec::with_capacity(pairs.len());
     let mut ixs = [vec![0; original.lines.len()], vec![0; modified.lines.len()]];
-    let ranges = if hunks.is_empty() {
-        vec![0..pairs.len()]
-    } else {
-        hunks.iter().map(Hunk::pairs).collect()
-    };
-    for range in ranges {
+    for range in segments(pairs.len(), hunks) {
         let mut ix = range.start;
         while ix < range.end {
             if !pairs[ix].changed {
@@ -681,13 +939,46 @@ fn patch_order(
     (lines, ixs)
 }
 
-/// Builds the display form of one source line from its range in `source`.
-fn source_line(source: &str, range: Range<usize>, line_number: usize) -> SourceLine {
-    let raw = &source[range.clone()];
-    let content = match raw.strip_suffix('\n') {
+/// `0..len` split at every hunk boundary; hunks are ordered and disjoint.
+fn segments(len: usize, hunks: &[Hunk]) -> Vec<Range<usize>> {
+    let mut bounds = Vec::with_capacity(hunks.len() * 2 + 2);
+    bounds.push(0);
+    for hunk in hunks {
+        bounds.extend([hunk.pairs.start, hunk.pairs.end]);
+    }
+    bounds.push(len);
+    bounds.dedup();
+    bounds
+        .windows(2)
+        .filter(|bounds| bounds[0] < bounds[1])
+        .map(|bounds| bounds[0]..bounds[1])
+        .collect()
+}
+
+/// Each line's byte range in `text`, including its ending, as the parser
+/// splits patch lines.
+fn line_ranges(text: &str) -> Vec<Range<usize>> {
+    let mut offset = 0;
+    text.split_inclusive('\n')
+        .map(|line| {
+            let range = offset..offset + line.len();
+            offset = range.end;
+            range
+        })
+        .collect()
+}
+
+/// A line without its `\n` or `\r\n` ending.
+fn line_content(raw: &str) -> &str {
+    match raw.strip_suffix('\n') {
         Some(content) => content.strip_suffix('\r').unwrap_or(content),
         None => raw,
-    };
+    }
+}
+
+/// Builds the display form of one source line from its range in `source`.
+fn source_line(source: &str, range: Range<usize>, line_number: usize) -> SourceLine {
+    let content = line_content(&source[range.clone()]);
     let text = SharedString::from(content.to_owned());
     let (display, display_tabs): (SharedString, Vec<DisplayTab>) = if content.contains('\t') {
         let mut display = String::with_capacity(content.len());
@@ -975,6 +1266,20 @@ mod tests {
             }
         );
         assert_eq!(doc.text_for_lines(DiffSide::Modified, 2, 3), "new\nextra\n");
+        let body: Vec<_> = doc
+            .patch_body()
+            .map(|line| (line.original(), line.modified(), line.text()))
+            .collect();
+        assert_eq!(
+            body,
+            [
+                (Some(1), Some(1), "same"),
+                (Some(2), None, "old"),
+                (None, Some(2), "new"),
+                (None, Some(3), "extra"),
+                (Some(3), Some(4), "tail"),
+            ]
+        );
         assert_eq!(doc.text_for_lines(DiffSide::Original, 99, 100), "");
         let bare_cr = fixture::modified("a.txt", "a\rb", "a\rb");
         assert!(!bare_cr.has_changes());

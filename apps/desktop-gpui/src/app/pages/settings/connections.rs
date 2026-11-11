@@ -12,23 +12,30 @@
 //! section is on screen, like the web's mounted component.
 
 mod access;
+mod add_environment;
 mod environments;
 mod exposure;
+pub(in crate::app) mod linking;
 mod load_balancing;
-pub(super) mod logic;
+pub(in crate::app) mod logic;
+mod pairing;
+mod pull_request_routing;
+mod routes;
 mod saved;
+pub(super) use saved::empty_media;
 mod secrets;
-pub(super) mod ui;
+pub(in crate::app) mod ui;
 
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::notification::Notification;
-use gpui_kit::{AnyElement, App, Context, SharedString, Task, Window};
+use gpui_kit::{AnyElement, App, Context, SharedString, Task, WeakEntity, Window};
 use serde_json::{Value, json};
 
 use crate::app::Workspace;
 use crate::app::pages::settings::widgets::SettingsView;
 use crate::backend::Endpoint;
 use crate::rpc::RpcClient;
+use crate::rpc_permissions::Grants;
 
 use self::logic::Session;
 
@@ -56,6 +63,20 @@ impl SessionLoad {
     /// A failed or pending check grants nothing, like `resolveRemoteOperateAccess`.
     pub(in crate::app) fn grants(&self, scope: &str) -> bool {
         self.session().is_some_and(|session| session.grants(scope))
+    }
+
+    /// `permissionAtom`: whether a control that sends `method` with `payload` may be used.
+    pub(in crate::app) fn permits(&self, method: &str, payload: &Value) -> bool {
+        crate::rpc_permissions::permits(method, payload, |scope| self.grants(scope))
+    }
+
+    /// What the environment's socket checks guarded requests against.
+    pub(in crate::app) fn rpc_grants(&self) -> Grants {
+        match self {
+            Self::Pending => Grants::Pending,
+            Self::Ready(session) => Grants::ready(|scope| session.grants(scope)),
+            Self::Failed => Grants::Failed,
+        }
     }
 }
 
@@ -113,6 +134,12 @@ pub(in crate::app) fn operates_terminals(load: &SessionLoad) -> bool {
 }
 
 impl Workspace {
+    /// `useEnvironmentScope` on the Settings environment: this client's current session there
+    /// grants `scope`. A pending or failed check grants nothing.
+    fn settings_grants(&self, scope: &str) -> bool {
+        self.settings_auth().is_some_and(|auth| auth.grants(scope))
+    }
+
     pub(super) fn render_settings_connections(
         &mut self,
         view: &SettingsView,
@@ -182,6 +209,36 @@ pub(super) async fn auth_request(
     crate::runtime().spawn(request).await.map_err(|error| error.to_string())?
 }
 
+/// The environment a dialog or menu opened on, whose socket and grants are read when it saves:
+/// either can stay open through a reconnect.
+#[derive(Clone)]
+struct SettingsWriter {
+    workspace: WeakEntity<Workspace>,
+    environment: Option<SharedString>,
+    label: String,
+}
+
+impl SettingsWriter {
+    /// `useUpdateEnvironmentSettings`: a session without `scopes` there saves nothing.
+    fn save(&self, patch: Value, scopes: &[&str], window: &mut Window, cx: &mut App) {
+        let Some(workspace) = self.workspace.upgrade() else { return };
+        let workspace = workspace.read(cx);
+        let environment = self.environment.as_deref().unwrap_or_default();
+        if !scopes.iter().all(|scope| workspace.env_grants(environment, scope)) {
+            let reason = format!("This connection lacks permission to change settings on {}.", self.label);
+            return window.push_notification(Notification::warning(reason).title("Setting not saved"), cx);
+        }
+        let client = workspace.env_client(environment);
+        window
+            .spawn(cx, async move |cx| {
+                if let Err(error) = update_settings(client, patch).await {
+                    let _ = cx.update(|window, cx| error_toast(window, cx, "Could not update settings", error));
+                }
+            })
+            .detach();
+    }
+}
+
 /// `server.updateSettings` with a plain environment-wide patch.
 async fn update_settings(client: Option<RpcClient>, patch: Value) -> Result<(), String> {
     let client = client.ok_or("Not connected to the environment.")?;
@@ -219,5 +276,23 @@ mod tests {
         assert!(!operates_terminals(&session(json!(["terminal:read"]))));
         assert!(operates_terminals(&SessionLoad::Pending), "the server still checks every write");
         assert!(operates_terminals(&SessionLoad::Failed));
+    }
+
+    #[test]
+    fn exact_empty_permissions_grant_nothing_and_legacy_parents_still_grant() {
+        let load = |session: Value| SessionLoad::Ready(Session::from_json(&session));
+        let exact = load(json!({"authenticated": true, "scopes": ["orchestration:operate"], "permissions": []}));
+        let legacy = load(json!({"authenticated": true, "scopes": ["orchestration:operate"]}));
+        let signed_out = load(json!({"authenticated": false, "scopes": ["orchestration:operate"]}));
+        for (load, allowed) in [(&exact, false), (&legacy, true), (&signed_out, false), (&SessionLoad::Pending, false)]
+        {
+            assert_eq!(load.permits("vcs.init", &json!({"cwd": "/repo"})), allowed);
+            let answer = load.rpc_grants().authorize("vcs.init", &Value::Null);
+            match load {
+                SessionLoad::Pending => assert_eq!(answer, None, "a guarded request waits for the first answer"),
+                _ => assert_eq!(answer, Some(if allowed { Ok(()) } else { Err("source-control:write") })),
+            }
+        }
+        assert!(SessionLoad::Failed.rpc_grants().authorize("vcs.init", &Value::Null).is_some_and(|r| r.is_err()));
     }
 }

@@ -17,9 +17,9 @@ use gpui_kit::{
 };
 use serde_json::{Value, json};
 
+use super::Workspace;
 use super::sidebar::now_ms;
-use super::{Target, Workspace};
-use crate::model::GuestShare;
+use crate::model::{GuestShare, ScopedId};
 use crate::theme;
 
 /// The dialog's create request (`CreateState`).
@@ -35,7 +35,7 @@ enum Create {
 #[derive(Default)]
 pub(super) struct ShareHeader {
     tick: Cell<Option<i64>>,
-    closing: Option<String>,
+    closing: Option<ScopedId>,
 }
 
 fn minute(ms: i64) -> i64 {
@@ -57,19 +57,24 @@ impl Workspace {
     /// links beta is on, and no policy turns T3 Connect off.
     pub(super) fn can_share_with_guest(&self, environment_id: &str) -> bool {
         let Some(info) = self.env_info(environment_id) else { return false };
-        self.env_grants(environment_id, "access:write")
+        self.env_permits(environment_id, "guestShare.create", &Value::Null)
             && info.settings.bool("guestSharingEnabled")
             && info.managed_policy.pointer("/limits/connect") != Some(&Value::Bool(false))
     }
 
     /// `GuestShareDialog`: creates a one-use link to the thread and shows it to copy.
-    pub(super) fn open_guest_share(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(client) = self.thread_client(thread_id) else { return };
-        let Some(environment) = self.shell.threads.iter().find(|t| t.id == thread_id).map(|t| t.environment_id.clone())
-        else {
+    pub(super) fn open_guest_share(
+        &mut self,
+        key: &crate::model::ScopedId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(environment) = self.shell.thread(key).map(|t| t.environment_id.clone()) else { return };
+        if self.env_client(&environment).is_none() {
             return;
-        };
-        let open = matches!(&self.target, Some(Target::Thread { id, .. }) if id == thread_id);
+        }
+        let thread_id = key.id.as_str();
+        let open = self.is_open_thread(key);
         let shared = open && self.open_projection().is_some_and(|p| p.thread.guest_share.is_some());
         let note =
             if shared { "A new link ends the current one." } else { "The link works once and expires in 24 hours." };
@@ -124,7 +129,8 @@ impl Workspace {
                         .on_click(|_, window, cx| window.close_dialog(cx)),
                 )
             } else {
-                let (state, client, thread_id) = (state.clone(), client.clone(), thread_id.clone());
+                let (state, view, environment, thread_id) =
+                    (state.clone(), view.clone(), environment.clone(), thread_id.clone());
                 DialogFooter::new()
                     .child(
                         Button::new("guest-share-cancel")
@@ -141,10 +147,19 @@ impl Workspace {
                             .label(if creating { "Creating..." } else { "Create link" })
                             .disabled(!can_create || creating)
                             .on_click(move |_, window, cx| {
+                                // The environment's socket now: a reconnect while the dialog was open replaced it.
+                                let input = json!({"threadId": thread_id});
+                                let Some(client) = view.upgrade().and_then(|w| {
+                                    let w = w.read(cx);
+                                    w.env_permits(&environment, "guestShare.create", &input)
+                                        .then(|| w.env_client(&environment))
+                                        .flatten()
+                                }) else {
+                                    return;
+                                };
                                 *state.borrow_mut() = Create::Creating;
                                 window.refresh();
-                                let (state, client) = (state.clone(), client.clone());
-                                let input = json!({"threadId": thread_id});
+                                let state = state.clone();
                                 window
                                     .spawn(cx, async move |cx| {
                                         let result = client.request("guestShare.create", input).await;
@@ -190,7 +205,7 @@ impl Workspace {
 
     /// `GuestShareIndicator`: the open thread's sharing status and Stop sharing.
     pub(super) fn render_guest_share_indicator(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let Some(Target::Thread { id, .. }) = &self.target else { return None };
+        let key = self.target.as_ref()?.thread_key()?;
         let share = self.open_projection()?.thread.guest_share.as_ref()?;
         let now = now_ms();
         // `useNowMinute`: "expired" shows from the minute the link expires.
@@ -206,8 +221,7 @@ impl Workspace {
             .detach();
         }
         let t = *theme::tokens(cx);
-        let closing = self.share_header.closing.as_deref() == Some(id.as_str());
-        let thread_id = id.clone();
+        let closing = self.share_header.closing.as_ref() == Some(&key);
         let (accent, foreground) = (t.accent, t.foreground);
         let ring = gpui_kit::BoxShadow::new(px(0.), px(0.), t.ring).spread_radius(px(2.)).inset();
         // `Button size="xs" variant="ghost-muted"`, `disabled` while the close is in flight.
@@ -222,8 +236,19 @@ impl Workspace {
             .focus_visible(move |s| s.shadow(vec![ring]))
             .child("Stop sharing")
             .when(closing, |el| el.opacity(0.64))
-            .when(!closing, |el| el.cursor_pointer().hover(move |s| s.bg(accent).text_color(foreground)))
-            .on_click(cx.listener(move |this, _, _, cx| this.stop_guest_share(&thread_id, cx)));
+            // A theme gives the chat header's buttons its toolbar controls (`[data-chat-header] [data-slot="button"]`).
+            .when(t.themed, |el| {
+                el.bg(t.toolbar.control)
+                    .border_1()
+                    .border_color(t.toolbar.border)
+                    .text_color(t.toolbar.control_foreground)
+            })
+            .when(!closing, |el| {
+                el.cursor_pointer().hover(move |s| {
+                    if t.themed { s.bg(t.toolbar.control_hover) } else { s.bg(accent).text_color(foreground) }
+                })
+            })
+            .on_click(cx.listener(move |this, _, _, cx| this.stop_guest_share(&key, cx)));
         Some(
             h_flex()
                 .flex_none()
@@ -238,10 +263,10 @@ impl Workspace {
     }
 
     /// `thread.guest-share.close`; the button stays disabled until the server answers.
-    fn stop_guest_share(&mut self, thread_id: &str, cx: &mut Context<Self>) {
-        let Some(client) = self.thread_client(thread_id) else { return };
-        let command = json!({"type": "thread.guest-share.close", "commandId": super::new_id(), "threadId": thread_id});
-        self.share_header.closing = Some(thread_id.to_owned());
+    fn stop_guest_share(&mut self, thread: &ScopedId, cx: &mut Context<Self>) {
+        let Some(client) = self.env_client(&thread.env) else { return };
+        let command = json!({"type": "thread.guest-share.close", "commandId": super::new_id(), "threadId": thread.id});
+        self.share_header.closing = Some(thread.clone());
         cx.spawn(async move |this, cx| {
             let result = client.request("orchestration.dispatchCommand", command).await;
             let _ = this.update(cx, |this, cx| {

@@ -704,6 +704,29 @@ pub struct Capslock {
     pub on: bool,
 }
 
+/// The physical key of a key event, in the platform's own numbering.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub enum NativeKeyCode {
+    /// Windows: the scan code, with `0xE000` set for an extended key (`0xE01C` is keypad Enter).
+    Windows(u16),
+    /// Linux, X11 and Wayland: the XKB keycode, which is the evdev code plus 8.
+    Xkb(u32),
+    /// macOS: `NSEvent.keyCode`.
+    Mac(u16),
+}
+
+/// What the platform reports about the key event being dispatched beyond its [`Keystroke`].
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash)]
+pub struct NativeKey {
+    /// The key's physical code, when the platform reports one.
+    pub code: Option<NativeKeyCode>,
+    /// Whether Num Lock was on, when the platform reports it.
+    pub num_lock: Option<bool>,
+    /// The character the key types without modifiers on the current layout (a browser's
+    /// keyboard layout map), when the platform reports one.
+    pub unshifted: Option<char>,
+}
+
 impl AsKeystroke for Keystroke {
     fn as_keystroke(&self) -> &Keystroke {
         self

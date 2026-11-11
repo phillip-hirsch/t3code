@@ -114,25 +114,31 @@ impl Workspace {
         self.automations.tasks.iter().find(|task| task.id == task_id).map(|task| task.title.clone())
     }
 
+    /// `runScheduledTaskNow.permissionAtom` on the tasks' environment; toggling needs the same grant.
+    fn can_operate_automations(&self) -> bool {
+        let environment = self.automations.environment.as_deref();
+        environment.is_some_and(|environment| self.env_permits(environment, "scheduledTasks.runNow", &json!({})))
+    }
+
     fn automation_action(&mut self, id: String, enabled: Option<bool>, window: &mut Window, cx: &mut Context<Self>) {
-        let client = self.automations.environment.as_deref().and_then(|environment| self.env_client(environment));
-        let Some(client) = client else { return };
-        if self.automations.busy.is_some() {
-            return;
-        }
+        let Some(environment) = self.automations.environment.clone() else { return };
+        let Some(client) = self.env_client(&environment) else { return };
         let (method, payload, failure) = match enabled {
             Some(enabled) => {
                 ("scheduledTasks.setEnabled", json!({"id": id, "enabled": enabled}), "Could not update automation")
             }
             None => ("scheduledTasks.runNow", json!({"id": id}), "Could not run automation"),
         };
+        if self.automations.busy.is_some() || !self.env_permits(&environment, method, &payload) {
+            return;
+        }
         self.automations.busy = Some(id);
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request(method, payload).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.automations.busy = None;
                 if let Err(error) = result {
-                    window.push_notification(Notification::error(error.to_string()).title(failure), cx);
+                    window.push_notification(Notification::error(error.message()).title(failure), cx);
                 }
                 cx.notify();
             });
@@ -157,6 +163,7 @@ impl Workspace {
         }
         let now = crate::app::sidebar::now_ms();
         let busy = self.automations.busy.is_some();
+        let can_operate = self.can_operate_automations();
         let icon_button = |id: String, icon: Lucide, tip: &'static str| {
             div()
                 .id(ElementId::Name(id.into()))
@@ -230,7 +237,7 @@ impl Workspace {
                     .when(!matches!(task.schedule(), Schedule::Webhook), |el| {
                         el.child(
                             icon_button(format!("automation-run-{}", task.id), Lucide::Play, "Run now")
-                                .when(busy || running, |el| el.opacity(0.5))
+                                .when(busy || running || !can_operate, |el| el.opacity(0.5))
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     if !running {
                                         this.automation_action(run_id.clone(), None, window, cx);
@@ -242,7 +249,7 @@ impl Workspace {
                         Switch::new(ElementId::Name(format!("automation-enabled-{}", task.id).into()))
                             .checked(enabled)
                             .small()
-                            .disabled(busy)
+                            .disabled(busy || !can_operate)
                             .on_click(cx.listener(move |this, checked: &bool, window, cx| {
                                 this.automation_action(toggle_id.clone(), Some(*checked), window, cx);
                             })),

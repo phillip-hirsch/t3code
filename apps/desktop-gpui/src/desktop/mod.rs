@@ -3,6 +3,7 @@
 //! and app links.
 
 pub mod activation;
+pub mod app_control;
 pub mod badge;
 pub mod cli;
 pub mod exposure;
@@ -13,6 +14,7 @@ pub mod settings;
 pub mod shell_env;
 pub mod snap_shot;
 pub mod window_state;
+pub mod zoom;
 
 use gpui_kit::{App, Bounds, Global, Pixels, WindowBounds, point, px, size};
 

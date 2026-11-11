@@ -139,6 +139,11 @@ impl Workspace {
         self.pull_requests.panel.is_some()
     }
 
+    /// The page's panel shows `reference` among its tabs.
+    pub(in crate::app) fn pull_request_tab_shown(&self, reference: &Reference) -> bool {
+        self.pull_request_panel_shown() && self.pull_requests.tabs.contains(reference)
+    }
+
     pub(in crate::app) fn pull_request_panel_maximized(&self) -> bool {
         self.pull_requests.layout.maximized(self.pull_requests.panel.is_some())
     }
@@ -177,6 +182,7 @@ impl Workspace {
                 self.pull_requests.panel = Some(panel);
                 self.rebuild_pr_timeline();
                 self.read_pr_avatars(&key, cx);
+                self.read_unread_pr(&key, cx);
                 cx.notify();
                 true
             }
@@ -192,6 +198,7 @@ impl Workspace {
         let Some(index) = self.pull_requests.tabs.iter().position(|r| r == reference) else { return };
         self.pull_requests.tabs.remove(index);
         self.pull_requests.parked.remove(&reference.key());
+        self.remember_closed_pull_request_tabs(vec![reference.clone()], None);
         if self.pull_requests.panel.as_ref().is_some_and(|p| &p.reference == reference) {
             self.pull_requests.panel = None;
             let next = self.pull_requests.tabs.get(index).or_else(|| self.pull_requests.tabs.last()).cloned();
@@ -274,6 +281,10 @@ impl Workspace {
 
     /// Closes several tabs at once; when the shown one goes, `keep` shows instead.
     fn close_pr_tabs(&mut self, close: &[Reference], keep: Option<Reference>, cx: &mut Context<Self>) {
+        let closed: Vec<Reference> =
+            self.pull_requests.tabs.iter().filter(|tab| close.contains(tab)).cloned().collect();
+        let shown = self.pull_requests.panel.as_ref().map(|panel| panel.reference.clone());
+        self.remember_closed_pull_request_tabs(closed, shown.as_ref());
         self.pull_requests.tabs.retain(|tab| !close.contains(tab));
         for reference in close {
             self.pull_requests.parked.remove(&reference.key());
@@ -367,7 +378,7 @@ impl Workspace {
             return;
         }
         if let Some(environment) = environment
-            && self.project_environment(&panel.reference.project_id).as_deref() != Some(environment)
+            && panel.reference.environment_id != environment
         {
             return;
         }
@@ -410,10 +421,43 @@ impl Workspace {
             self.sessions().iter().filter_map(|s| Some((s.id.clone()?, s.client.clone()?))).collect();
         let start =
             crate::pull_requests::resync_follows(&mut self.pull_requests.refreshes, &connected, RpcClient::same_socket);
+        let started = !start.is_empty();
         for index in start {
             let (environment, client) = connected[index].clone();
             let task = self.follow_pr_refreshes(environment.clone(), client.clone(), cx);
             self.pull_requests.refreshes.insert(environment, (client, task));
+        }
+        if started {
+            self.read_what_was_missed_offline(cx);
+        }
+    }
+
+    /// Sockets came up: a list or a shown pull request that opened while they were down, or whose
+    /// read failed, has nothing to refresh in place, so it reads now, as the web's queries rerun.
+    fn read_what_was_missed_offline(&mut self, cx: &mut Context<Self>) {
+        if self.pr_panel_on_screen() {
+            self.read_unread_shown_pr(cx);
+        }
+        self.read_unread_pull_requests(cx);
+    }
+
+    /// The shown pull request comes on screen (its tab, the page or a thread's surface): what it
+    /// never read on its environment's current socket reads now, as the web's queries do on mount.
+    pub(in crate::app) fn read_unread_shown_pr(&mut self, cx: &mut Context<Self>) {
+        if let Some(key) = self.shown_pr_key() {
+            self.read_unread_pr(&key, cx);
+        }
+    }
+
+    fn read_unread_pr(&mut self, key: &str, cx: &mut Context<Self>) {
+        let (Some(client), Some(panel)) = (self.pull_request_client_of(key), self.pr_panel_ref(key)) else { return };
+        let socket = client.socket_id();
+        let (detail, guide) = (panel.needs_detail_read(&socket), panel.needs_guide_read(&socket));
+        if detail {
+            self.read_pr_detail_of(key, cx);
+        }
+        if guide {
+            self.read_pr_guide_of(key, cx);
         }
     }
 
@@ -467,7 +511,7 @@ impl Workspace {
     pub(super) fn follow_pr_checks(&mut self, key: &str, cx: &mut Context<Self>) {
         let Some(panel) = self.pr_panel_ref(key) else { return };
         if panel._checks_poll.is_some()
-            || !self.pull_request_info(&panel.reference.project_id).is_some_and(|i| i.capability("pullRequestChecks"))
+            || !self.pull_request_info(&panel.reference).is_some_and(|i| i.capability("pullRequestChecks"))
         {
             return;
         }
@@ -668,6 +712,7 @@ impl Workspace {
                 let (close, middle, activate) = (reference.clone(), reference.clone(), reference.clone());
                 let (menu, dragged, onto) = (reference.clone(), reference.clone(), reference.clone());
                 let (close_key, activate_key) = (reference.clone(), reference.clone());
+                let (key_menu, key_view) = (reference.clone(), cx.weak_entity());
                 let [close_focus, title_focus] = self.pull_requests.tab_focus[&key].clone();
                 let close_visible = keyboard && close_focus.is_focused(window);
                 let (accent, foreground, muted) = (t.accent, t.foreground, t.muted);
@@ -759,6 +804,11 @@ impl Workspace {
                             this.open_pr_tab_menu(menu.clone(), event.position, window, cx);
                         }),
                     )
+                    // From the tab's title or close button, which take focus.
+                    .on_context_menu_key(move |position, window, cx| {
+                        let menu = key_menu.clone();
+                        let _ = key_view.update(cx, |this, cx| this.open_pr_tab_menu(menu, position, window, cx));
+                    })
                     .on_drag(TabDrag(dragged), |_, _, _, cx| cx.new(|_| Empty))
                     .drag_over::<TabDrag>(move |style, _, _, _| style.bg(Hsla { a: accent.a * 0.6, ..accent }))
                     .on_drop(cx.listener(move |this, drag: &TabDrag, _, cx| this.move_pr_tab(&drag.0, &onto, cx)))
@@ -857,6 +907,32 @@ fn page_panel_shortcut(command: &str, open: bool, shown: bool, has_url: bool) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tab_opened_offline_reads_on_the_next_socket_and_a_failure_stands_until_another() {
+        let reference = Reference {
+            environment_id: "env".into(),
+            project_id: "p".into(),
+            host: None,
+            repository: "o/r".into(),
+            number: 1,
+        };
+        let mut panel = Panel::new(reference, None);
+        let (first, second) = (RpcClient::unopened(), RpcClient::unopened());
+        assert!(panel.needs_detail_read(&first.socket_id()), "opened offline: nothing read yet");
+        assert!(!panel.needs_guide_read(&first.socket_id()), "the guide reads only while its tab shows");
+        panel.detail_loading = true;
+        panel.detail_read_on = Some(first.socket_id());
+        assert!(!panel.needs_detail_read(&first.socket_id()), "a read is running");
+        panel.detail_loading = false;
+        assert!(!panel.needs_detail_read(&first.socket_id()), "it failed: showing the tab again keeps the error");
+        assert!(panel.needs_detail_read(&second.socket_id()), "a reconnect reads again");
+        panel.tab = Tab::Guide;
+        assert!(panel.needs_guide_read(&first.socket_id()), "the Guide tab shows with no guide read");
+        panel.guide_read_on = Some(first.socket_id());
+        assert!(!panel.needs_guide_read(&first.socket_id()));
+        assert!(panel.needs_guide_read(&second.socket_id()));
+    }
 
     #[test]
     fn page_panel_shortcuts_act_only_on_a_panel_they_can_reach() {

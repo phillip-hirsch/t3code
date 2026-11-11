@@ -309,7 +309,8 @@ fn title_case(segment: &str) -> String {
         .join(" ")
 }
 
-const CORE_WHEN_VARIABLES: [&str; 6] = ["terminalFocus", "terminalOpen", "isWeb", "isDesktop", "true", "false"];
+const CORE_WHEN_VARIABLES: [&str; 7] =
+    ["terminalFocus", "terminalOpen", "previewOpen", "isWeb", "isDesktop", "true", "false"];
 const DEFAULT_WHEN_VARIABLE: &str = "terminalFocus";
 
 /// `buildWhenVariableOptions`: the core variables first, then every one the defaults use.
@@ -1952,9 +1953,10 @@ mod tests {
     #[test]
     fn when_variables_put_the_core_first() {
         let variables = when_variables();
-        assert_eq!(&variables[..6], CORE_WHEN_VARIABLES.map(String::from));
+        assert_eq!(&variables[..7], CORE_WHEN_VARIABLES.map(String::from));
         assert!(variables.iter().any(|v| v == "composerFocus"));
         assert_eq!(unknown_variables(parse_when("isDesktop && fooBar").as_ref()), ["fooBar"]);
+        assert!(unknown_variables(parse_when("previewOpen && !previewFocus").as_ref()).is_empty());
         assert_eq!(parse_when_draft("  "), Ok(None));
         assert!(parse_when_draft("a &&").is_err());
     }

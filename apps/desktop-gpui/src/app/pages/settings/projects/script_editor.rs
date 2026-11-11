@@ -21,6 +21,7 @@ use super::scripts::{
 };
 use crate::app::Workspace;
 use crate::app::pages::settings::connections::logic::SETTINGS_WRITE;
+use crate::model::ScopedId;
 use crate::theme::{self, Tokens};
 
 /// The chat's editor needs `orchestration:operate` (`ProjectScriptEditorDialog`'s default
@@ -37,7 +38,7 @@ pub(super) struct ScriptEditor {
     /// The grants when the editor opened; every action checks them again.
     can_edit: bool,
     can_write_settings: bool,
-    project_id: String,
+    project_key: ScopedId,
     script_id: Option<String>,
     /// The ids of the project's current scripts, to validate a new script's shortcut.
     script_ids: Vec<String>,
@@ -63,12 +64,12 @@ impl Workspace {
     /// Opens the editor for one of the project's scripts, or for a new one with `None`.
     pub(in crate::app) fn open_project_script_editor(
         &mut self,
-        project_id: &str,
+        project_key: &ScopedId,
         script_id: Option<&str>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(project) = self.shell.projects.iter().find(|p| p.id == project_id) else { return };
+        let Some(project) = self.shell.project(project_key) else { return };
         let initial = match script_id {
             None => ScriptInput::default(),
             Some(id) => {
@@ -79,19 +80,19 @@ impl Workspace {
                 }
             }
         };
-        self.open_script_editor_with(project_id, script_id, initial, None, window, cx);
+        self.open_script_editor_with(project_key, script_id, initial, None, window, cx);
     }
 
     pub(super) fn open_script_editor_with(
         &mut self,
-        project_id: &str,
+        project_key: &ScopedId,
         script_id: Option<&str>,
         initial: ScriptInput,
         error: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(project) = self.shell.projects.iter().find(|p| p.id == project_id) else { return };
+        let Some(project) = self.shell.project(project_key) else { return };
         let script_ids =
             resolve_project_scripts(&self.project_info(project).settings, project).into_iter().map(|s| s.id).collect();
         let environment = project.environment_id.clone();
@@ -104,7 +105,7 @@ impl Workspace {
         };
         let workspace = cx.weak_entity();
         let editor = cx.new(|cx| {
-            ScriptEditor::new(workspace, grants, project_id, script_id, script_ids, initial, error, window, cx)
+            ScriptEditor::new(workspace, grants, project_key, script_id, script_ids, initial, error, window, cx)
         });
         let title = if script_id.is_some() { "Edit Action" } else { "Add Action" };
         editor.update(cx, |editor, cx| editor.name.update(cx, |name, cx| name.focus(window, cx)));
@@ -129,7 +130,7 @@ impl ScriptEditor {
     fn new(
         workspace: WeakEntity<Workspace>,
         grants: Grants,
-        project_id: &str,
+        project_key: &ScopedId,
         script_id: Option<&str>,
         script_ids: Vec<String>,
         initial: ScriptInput,
@@ -166,7 +167,7 @@ impl ScriptEditor {
             edit_scope: grants.edit_scope,
             can_edit: grants.can_edit,
             can_write_settings: grants.can_write_settings,
-            project_id: project_id.to_owned(),
+            project_key: project_key.clone(),
             script_id: script_id.map(str::to_owned),
             script_ids,
             keybinding: initial_keybinding.clone().unwrap_or_default(),
@@ -263,10 +264,10 @@ impl ScriptEditor {
             auto_open_preview: preview_url.is_some() && self.auto_open_preview,
             preview_url,
         };
-        let (project_id, script_id) = (self.project_id.clone(), self.script_id.clone());
+        let (project_key, script_id) = (self.project_key.clone(), self.script_id.clone());
         let Ok(task) = self
             .workspace
-            .update(cx, |workspace, cx| workspace.save_project_script(&project_id, script_id.as_deref(), &input, cx))
+            .update(cx, |workspace, cx| workspace.save_project_script(&project_key, script_id.as_deref(), &input, cx))
         else {
             return;
         };
@@ -300,10 +301,10 @@ impl ScriptEditor {
             return;
         }
         let name = self.name.read(cx).value().to_string();
-        let (workspace, project_id) = (self.workspace.clone(), self.project_id.clone());
+        let (workspace, project_key) = (self.workspace.clone(), self.project_key.clone());
         let editor = cx.entity();
         window.open_alert_dialog(cx, move |alert, _, _| {
-            let (workspace, project_id, script_id) = (workspace.clone(), project_id.clone(), script_id.clone());
+            let (workspace, project_key, script_id) = (workspace.clone(), project_key.clone(), script_id.clone());
             let editor = editor.clone();
             alert
                 .title(format!("Delete action \"{name}\"?"))
@@ -320,7 +321,7 @@ impl ScriptEditor {
                     }
                     window.close_all_dialogs(cx);
                     let _ = workspace.update(cx, |workspace, cx| {
-                        let task = workspace.delete_project_script(&project_id, &script_id, cx);
+                        let task = workspace.delete_project_script(&project_key, &script_id, cx);
                         workspace.report_scripts_failure(task, window, cx);
                     });
                     false

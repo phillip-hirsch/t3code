@@ -24,6 +24,7 @@ use crate::theme::Tokens;
 
 /// `SERVER_PAGE_COUNT`.
 const PAGE: usize = 4;
+const STOP: &str = "preview.stopLocalServer";
 const SERVER_ROW_HEIGHT: f32 = 44.;
 const HEADING_HEIGHT: f32 = 36.;
 
@@ -126,13 +127,13 @@ impl Workspace {
     }
 
     fn open_server(&mut self, url: String, event: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(Target::Thread { id: thread_id, .. }) = self.target.clone() else { return };
+        let Some(thread) = self.preview_thread() else { return };
         let m = event.modifiers();
         if m.control || m.platform {
             let url = self.resolve_server_url(self.servers.environment.as_deref(), url);
             cx.open_url(&url);
         } else {
-            self.open_preview_tab(thread_id, Some(url), window, cx);
+            self.open_preview_tab(thread, Some(url), window, cx);
         }
     }
 
@@ -147,21 +148,27 @@ impl Workspace {
         }
     }
 
+    /// `stopLocalServer.permissionAtom` on the servers' environment.
+    fn can_stop_servers(&self) -> bool {
+        let environment = self.servers.environment.as_deref();
+        environment.is_some_and(|environment| self.env_permits(environment, STOP, &json!({})))
+    }
+
     /// `preview.stopLocalServer`.
     fn stop_server(&mut self, server: &LocalServer, window: &mut Window, cx: &mut Context<Self>) {
-        let client = self.servers.environment.as_deref().and_then(|environment| self.env_client(environment));
-        let (Some(pid), Some(client)) = (server.pid, client) else { return };
-        if self.servers.stopping.is_some() {
+        let Some(environment) = self.servers.environment.clone() else { return };
+        let (Some(pid), Some(client)) = (server.pid, self.env_client(&environment)) else { return };
+        let input = json!({"pid": pid, "port": server.port});
+        if self.servers.stopping.is_some() || !self.env_permits(&environment, STOP, &input) {
             return;
         }
         self.servers.stopping = Some(server.key());
-        let input = json!({"pid": pid, "port": server.port});
         cx.spawn_in(window, async move |this, cx| {
-            let result = client.request("preview.stopLocalServer", input).await;
+            let result = client.request(STOP, input).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.servers.stopping = None;
                 if let Err(error) = result {
-                    let toast = Notification::error(error.to_string()).title("Could not stop server");
+                    let toast = Notification::error(error.message()).title("Could not stop server");
                     window.push_notification(toast, cx);
                 }
                 cx.notify();
@@ -183,7 +190,7 @@ impl Workspace {
         if servers.is_empty() {
             return None;
         }
-        let can_stop = self.server_info().capability("localServerStop");
+        let can_stop = self.server_info().capability("localServerStop") && self.can_stop_servers();
         let visible = self.servers.visible.unwrap_or(PAGE);
         let hidden = servers.len().saturating_sub(visible);
         let rows: Vec<AnyElement> = servers

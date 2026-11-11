@@ -7,10 +7,11 @@
 
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::notification::Notification;
-use gpui_kit::{App, Context, FocusHandle, Focusable as _, KeystrokeEvent, Window};
+use gpui_kit::{App, Context, FocusHandle, Focusable as _, KeystrokeEvent, SharedString, Window};
 
 use super::keymap::{self, CAPTURE_CONTEXT};
 use super::{Target, Workspace, pages, palette, send, terminal};
+use crate::model::{ScopedId, ThreadRef};
 use crate::settings::ThemePreference;
 
 impl Workspace {
@@ -18,13 +19,14 @@ impl Workspace {
     /// then the composer's own keys. Returns whether the key was consumed.
     pub(super) fn on_keystroke(&mut self, event: &KeystrokeEvent, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let keystroke = &event.keystroke;
-        if self.snap_shot_record_key(keystroke, cx) {
+        if self.snap_shot_record_key(keystroke, window, cx) {
             return true;
         }
         if keymap::focus_in(&event.context_stack, CAPTURE_CONTEXT) || self.recording_shortcut(cx) {
             return false;
         }
-        if self.composer_menu_key(keystroke, window, cx)
+        if self.citation_key(keystroke, window, cx)
+            || self.composer_menu_key(keystroke, window, cx)
             || self.pr_completion_key(keystroke, window, cx)
             || self.palette_tab(keystroke, window, cx)
         {
@@ -57,14 +59,15 @@ impl Workspace {
             self.held_key = Some(keystroke.clone());
             return true;
         }
-        if self.pull_request_find_key(keystroke, window, cx) {
+        // Inside a diff, Mod+F opens the diff's own find, whose handler runs first on the web.
+        if !keymap::focus_in(&event.context_stack, "Diff") && self.pull_request_find_key(keystroke, window, cx) {
             return true;
         }
         self.composer_key(keystroke, &context, window, cx)
     }
 
     /// Runs `command`; `held` is a key repeat, which most commands swallow without acting.
-    fn run_command(
+    pub(super) fn run_command(
         &mut self,
         command: &str,
         held: bool,
@@ -123,6 +126,7 @@ impl Workspace {
             {
                 self.preview_command(command, window, cx);
             }
+            "view.reopenClosed" if chat_route && !palette_open => return self.reopen_closed_view(held, window, cx),
             "rightPanel.toggle" if chat => self.toggle_right_panel(window, cx),
             "rightPanel.new" if chat => return self.open_add_surface_menu(context.layer_open, held, cx),
             "rightPanel.toggleMaximized" if chat => return self.toggle_right_panel_maximized(cx),
@@ -160,7 +164,7 @@ impl Workspace {
                     && self.go_to_adjacent_thread(command == "thread.next", window, cx);
             }
             // The queue control's own guards decide; with nothing to act on the key falls through.
-            "thread.steerQueuedMessage" if chat => return held || self.steer_next_queued(cx),
+            "thread.steerQueuedMessage" if chat => return held || self.steer_next_queued(window, cx),
             "thread.editQueuedMessage" if chat => return held || self.edit_latest_queued(window, cx),
             "thread.stop" if chat => {
                 if !self.turn_running() {
@@ -171,21 +175,21 @@ impl Workspace {
                 }
             }
             "thread.settle" if chat => {
-                let Some(Target::Thread { id, .. }) = self.target.clone() else { return false };
-                let Some(thread) = self.shell.threads.iter().find(|t| t.id == id) else { return true };
+                let Some(key) = self.target.as_ref().and_then(Target::thread_key) else { return false };
+                let Some(thread) = self.shell.thread(&key) else { return true };
                 if thread.settled_override.as_deref() == Some("settled") {
-                    self.unsettle_thread(&id, cx);
+                    self.unsettle_thread(&key, cx);
                 } else {
-                    self.settle_thread(&id, true, window, cx);
+                    self.settle_thread(&key, true, window, cx);
                 }
             }
             "thread.pin" if chat => {
-                let Some(Target::Thread { id, .. }) = self.target.clone() else { return false };
-                let Some(thread) = self.shell.threads.iter().find(|t| t.id == id) else { return true };
+                let Some(key) = self.target.as_ref().and_then(Target::thread_key) else { return false };
+                let Some(thread) = self.shell.thread(&key) else { return true };
                 if thread.pinned_at.is_some() {
-                    self.unpin_thread(&id, window, cx);
+                    self.unpin_thread(&key, window, cx);
                 } else {
-                    self.pin_thread(&id, cx);
+                    self.pin_thread(&key, cx);
                 }
             }
             "thread.copyReference" if chat => {
@@ -291,19 +295,16 @@ impl Workspace {
 
     /// `thread.previous` / `thread.next` along the sidebar's order (`resolveAdjacentThreadId`).
     fn go_to_adjacent_thread(&mut self, next: bool, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let current = match &self.target {
-            Some(Target::Thread { id, .. }) => Some(id.as_str()),
-            _ => None,
-        };
-        let order: Vec<&str> = self.sidebar.ordered_thread_ids().collect();
-        let Some(id) = adjacent(&order, current, next).map(str::to_owned) else { return false };
-        self.select_thread(id, window, cx);
+        let order: Vec<ThreadRef> = self.sidebar.ordered_threads().map(ScopedId::pair).collect();
+        let Some((env, id)) = adjacent(&order, self.route_key(), next) else { return false };
+        let (env, id) = (SharedString::from(env.to_owned()), id.to_owned());
+        self.select_thread_in(env, id, window, cx);
         true
     }
 
     fn go_to_thread_at(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Some(id) = self.sidebar.ordered_thread_ids().nth(index).map(str::to_owned) else { return false };
-        self.select_thread(id, window, cx);
+        let Some(key) = self.sidebar.ordered_threads().nth(index).cloned() else { return false };
+        self.select_thread_in(key.env, key.id, window, cx);
         true
     }
 
@@ -436,6 +437,8 @@ impl Workspace {
         let areas = match self.page {
             // Usage is a modal with no areas of its own.
             Some(page) if page.is_modal() => return Vec::new(),
+            // The Welcome page has no sidebar.
+            Some(pages::Page::Welcome) => return Vec::new(),
             Some(pages::Page::PullRequests) => {
                 let list = !self.pull_request_panel_maximized();
                 vec![sidebar, (Area::Content, list), (Area::Panel, self.pull_request_panel_shown())]
@@ -487,7 +490,11 @@ impl Workspace {
 
     /// `moveWorkspaceFocus`: F6 moves focus to the next shown area; dialogs keep it.
     pub(super) fn move_workspace_focus(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if self.palette.is_some() || self.sidebar_open.sheet() || window.has_active_dialog(cx) {
+        if self.palette.is_some()
+            || self.sidebar_open.sheet()
+            || self.right_panel_sheet(window)
+            || window.has_active_dialog(cx)
+        {
             return;
         }
         let shown = self.shown_areas(window);
@@ -514,7 +521,7 @@ impl Workspace {
 }
 
 /// `resolveAdjacentThreadId`: no wrap; from no thread, the first (or last) one.
-fn adjacent<'a>(order: &[&'a str], current: Option<&str>, next: bool) -> Option<&'a str> {
+fn adjacent<T: PartialEq + Copy>(order: &[T], current: Option<T>, next: bool) -> Option<T> {
     let Some(current) = current else {
         return if next { order.first() } else { order.last() }.copied();
     };
@@ -565,6 +572,10 @@ mod tests {
         assert_eq!(adjacent(&order, None, true), Some("a"));
         assert_eq!(adjacent(&order, None, false), Some("c"));
         assert_eq!(adjacent(&order, Some("gone"), true), None);
-        assert_eq!(adjacent(&[], None, true), None);
+        assert_eq!(adjacent::<&str>(&[], None, true), None);
+        // The same id on two machines is two rows.
+        let scoped = [("env-a", "t"), ("env-b", "t")];
+        assert_eq!(adjacent(&scoped, Some(("env-a", "t")), true), Some(("env-b", "t")));
+        assert_eq!(adjacent(&scoped, Some(("env-b", "t")), false), Some(("env-a", "t")));
     }
 }
